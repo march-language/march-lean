@@ -241,12 +241,19 @@ inductive Pattern where
   deriving Repr, Inhabited
 
 /-- Term. Each node carries its resolved type `ty`. `var` and `field` also
-carry their `span` (for the instantiation join). -/
+carry their `span` (for the instantiation join).
+
+N-ARY (matches march — verified against real output): march's `EApp of expr *
+expr list` and `ELam`/`DFn` param LISTS carry their own resolved types and are
+NOT curried. Modelling `app`/`lam`/`dfn` as binary/single forces the decoder to
+invent intermediate nodes with no `resolved_ty` (→ `Ty.unsupported` → spurious
+skip on every arithmetic/comparison program). So: `app` takes `args : List
+Term`, `lam`/`dfn` take a param list. Do not curry. -/
 inductive Term where
   | lit (l : Lit) (ty : Ty)
   | var (name : String) (span : Span) (ty : Ty)
-  | app (fn : Term) (arg : Term) (ty : Ty)
-  | lam (param : String) (lin : Lin) (body : Term) (ty : Ty)
+  | app (fn : Term) (args : List Term) (ty : Ty)
+  | lam (params : List (String × Lin)) (body : Term) (ty : Ty)
   | let_ (name : String) (lin : Lin) (rhs : Term) (body : Term) (ty : Ty)
   | letfn (name : String) (param : String) (lin : Lin) (fnBody : Term) (body : Term) (ty : Ty)
   | ite (cond : Term) (then_ : Term) (else_ : Term) (ty : Ty)
@@ -258,9 +265,9 @@ inductive Term where
   | unsupported (ty : Ty)
   deriving Inhabited
 
-/-- The type annotation on a term node. -/
+/-- The type annotation on a term node. (n-ary: `app`/`lam` are 3-field.) -/
 def Term.ty : Term → Ty
-  | .lit _ t | .var _ _ t | .app _ _ t | .lam _ _ _ t | .let_ _ _ _ _ t
+  | .lit _ t | .var _ _ t | .app _ _ t | .lam _ _ t | .let_ _ _ _ _ t
   | .letfn _ _ _ _ _ t | .ite _ _ _ t | .con _ _ t | .tuple _ t
   | .record _ t | .field _ _ _ t | .match_ _ _ t | .unsupported t => t
 
@@ -281,8 +288,8 @@ partial def Term.hasUnsupported : Term → Bool
   | t =>
     t.ty.hasUnsupported ||
     (match t with
-     | .app f a _ => f.hasUnsupported || a.hasUnsupported
-     | .lam _ _ b _ => b.hasUnsupported
+     | .app f args _ => f.hasUnsupported || args.any Term.hasUnsupported
+     | .lam _ b _ => b.hasUnsupported
      | .let_ _ _ r b _ => r.hasUnsupported || b.hasUnsupported
      | .letfn _ _ _ fb b _ => fb.hasUnsupported || b.hasUnsupported
      | .ite c u v _ => c.hasUnsupported || u.hasUnsupported || v.hasUnsupported
@@ -309,7 +316,7 @@ inductive Decl where
   -- into nested `Term.lam` in `body` (0-param → `dlet`; if it can't be mapped
   -- cleanly, decode to `Decl.unsupported` so the file honest-skips, never a
   -- false accept).
-  | dfn (name : String) (param : String) (lin : Lin) (body : Term)
+  | dfn (name : String) (params : List (String × Lin)) (body : Term)  -- n-ary
   | dlet (name : String) (rhs : Term)
   | dtype (name : String) (params : List String) (ctors : List CtorSig)
   | unsupported
@@ -318,9 +325,10 @@ inductive Decl where
 /-- Whole-decl out-of-fragment check (used for module-level skip gating). -/
 def Decl.hasUnsupported : Decl → Bool
   | .unsupported => true
-  | .dfn _ _ _ body => body.hasUnsupported
+  | .dfn _ _ body => body.hasUnsupported
   | .dlet _ rhs => rhs.hasUnsupported
   | .dtype _ _ _ => false   -- carries no terms in the fragment
+                            -- (impl may also OR ctor arg/result Ty.hasUnsupported)
 
 structure Scheme where
   ids : List Int
@@ -798,14 +806,14 @@ open MarchLean.Syntax MarchLean.Check MarchLean.Linearity
 
 -- linear param used exactly once -> ok
 def linOnce : Module :=
-  { decls := [Decl.dfn "f" "x" Lin.linear
+  { decls := [Decl.dfn "f" [("x", Lin.linear)]
       (Term.var "x" ⟨"f",1,1,1,2⟩ (Ty.con "Int" []))],
     schemes := [], insts := [] }
 #eval checkLinearity linOnce  -- expected: CheckResult.ok
 
 -- linear param used twice -> reject
 def linTwice : Module :=
-  { decls := [Decl.dfn "f" "x" Lin.linear
+  { decls := [Decl.dfn "f" [("x", Lin.linear)]
       (Term.tuple [Term.var "x" ⟨"f",1,1,1,2⟩ (Ty.con "Int" []),
                    Term.var "x" ⟨"f",1,3,1,4⟩ (Ty.con "Int" [])] (Ty.tuple [Ty.con "Int" [], Ty.con "Int" []]))],
     schemes := [], insts := [] }
@@ -813,7 +821,7 @@ def linTwice : Module :=
 
 -- linear param never used -> reject
 def linNever : Module :=
-  { decls := [Decl.dfn "f" "x" Lin.linear (Term.lit (Lit.int 1) (Ty.con "Int" []))],
+  { decls := [Decl.dfn "f" [("x", Lin.linear)] (Term.lit (Lit.int 1) (Ty.con "Int" []))],
     schemes := [], insts := [] }
 #eval checkLinearity linNever -- expected: CheckResult.reject ...
 ```
@@ -825,7 +833,9 @@ Expected: FAIL — module doesn't exist.
 
 - [ ] **Step 3: Implement use-counting**
 
-Create `MarchLean/Linearity.lean`. Count free-variable occurrences of each linear/affine binder within its scope; enforce exactly-once (linear) / at-most-once (affine):
+Create `MarchLean/Linearity.lean`. Count free-variable occurrences of each linear/affine binder within its scope; enforce exactly-once (linear) / at-most-once (affine).
+
+**N-ARY (matches Task 2/4 as built):** `Term.app` is `(fn, args : List Term, ty)`, `Term.lam` is `(params : List (String × Lin), body, ty)`, `Decl.dfn` is `(name, params : List (String × Lin), body)`. So `uses` sums over the whole `args` list and treats a name as shadowed if it appears among `params`; `checkTerm`/`checkDecl` enforce EACH param in the list. The snippet below is n-ary — do not revert to a single `arg`/`param`.
 
 ```lean
 import MarchLean.Syntax
@@ -836,8 +846,8 @@ open MarchLean.Syntax MarchLean.Check
 /-- Count uses of `name` in a term (occurrences of `Term.var name`). -/
 partial def uses (name : String) : Term → Nat
   | .var n _ _ => if n == name then 1 else 0
-  | .app f a _ => uses name f + uses name a
-  | .lam p _ b _ => if p == name then 0 else uses name b       -- shadowed
+  | .app f args _ => uses name f + (args.map (uses name)).foldl (·+·) 0
+  | .lam ps b _ => if ps.any (fun (p, _) => p == name) then 0 else uses name b   -- shadowed
   | .let_ n _ r b _ => uses name r + (if n == name then 0 else uses name b)
   | .letfn n p _ fb b _ =>
       (if n == name || p == name then 0 else uses name fb) + (if n == name then 0 else uses name b)
@@ -856,10 +866,14 @@ def enforce (name : String) (l : Lin) (n : Nat) : CheckResult :=
   | .affine => if n <= 1 then .ok else .reject s!"affine '{name}' used {n} times (must be ≤ 1)"
   | .unrestricted => .ok
 
+/-- Enforce every param in a param list against `body`'s use counts. -/
+def enforceParams (ps : List (String × Lin)) (body : Term) : CheckResult :=
+  ps.foldl (fun acc (p, l) => match acc with | .ok => enforce p l (uses p body) | o => o) .ok
+
 /-- Walk a term enforcing every linear/affine binder it introduces. -/
 partial def checkTerm : Term → CheckResult
-  | .lam p l b _ =>
-      match enforce p l (uses p b) with
+  | .lam ps b _ =>
+      match enforceParams ps b with
       | .ok => checkTerm b
       | other => other
   | .let_ n l r b _ =>
@@ -872,7 +886,8 @@ partial def checkTerm : Term → CheckResult
       match enforce p l (uses p fb) with
       | .ok => match checkTerm fb with | .ok => checkTerm b | o => o
       | other => other
-  | .app f a _ => match checkTerm f with | .ok => checkTerm a | o => o
+  | .app f args _ =>
+      (f :: args).foldl (fun acc t => match acc with | .ok => checkTerm t | o => o) .ok
   | .ite c u v _ => match checkTerm c with | .ok => (match checkTerm u with | .ok => checkTerm v | o => o) | o => o
   | .con _ args _ => args.foldl (fun acc t => match acc with | .ok => checkTerm t | o => o) .ok
   | .tuple es _ => es.foldl (fun acc t => match acc with | .ok => checkTerm t | o => o) .ok
@@ -884,8 +899,8 @@ partial def checkTerm : Term → CheckResult
   | .lit _ _ | .var _ _ _ | .unsupported _ => .ok
 
 def checkDecl : Decl → CheckResult
-  | .dfn _ p l body =>
-      match enforce p l (uses p body) with
+  | .dfn _ ps body =>
+      match enforceParams ps body with
       | .ok => checkTerm body
       | other => other
   | .dlet _ body => checkTerm body
