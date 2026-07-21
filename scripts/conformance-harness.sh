@@ -9,10 +9,20 @@
 #   3. feeds that JSON to `march-lean-check` -> lean_verdict (accept/reject/skip/error)
 #   4. (cheap cross-check) compares the JSON's own "verdict" field against
 #      march_verdict, to catch march disagreeing with itself
+#   5. derives expected_verdict from the file's PARENT DIRECTORY (files
+#      under accept/ are expected to accept, files under reject/ are
+#      expected to reject — the corpus's own naming convention, see e.g.
+#      specs/lang/types/INDEX.md) and compares it against march_verdict, to
+#      catch march agreeing with itself and with Lean while both are simply
+#      wrong (e.g. march's type checker regressed and started accepting
+#      everything, or a missing external dependency like z3 silently
+#      disabled a class of checks) — a case plain MISMATCH can never catch,
+#      since at A0 the Lean side just echoes march's own verdict back
 #
-# and reports MATCH / MISMATCH / SKIP / ERROR / MARCH_SELF_INCONSISTENT
-# counts, plus the filenames in every non-MATCH category. Exits nonzero iff
-# any MISMATCH, ERROR, SKIP, or MARCH_SELF_INCONSISTENT occurred.
+# and reports MATCH / MISMATCH / SKIP / ERROR / MARCH_SELF_INCONSISTENT /
+# CORPUS_VIOLATION counts, plus the filenames in every non-MATCH category.
+# Exits nonzero iff any MISMATCH, ERROR, SKIP, MARCH_SELF_INCONSISTENT, or
+# CORPUS_VIOLATION occurred.
 #
 # Usage:
 #   scripts/conformance-harness.sh [options]
@@ -36,9 +46,10 @@
 #
 # Exit status:
 #   0  every file MATCHed (march's --check verdict agrees with the Lean
-#      re-check, and march's own two flags agree with each other)
-#   1  at least one MISMATCH, ERROR, SKIP, or MARCH_SELF_INCONSISTENT was
-#      recorded (see the printed summary for which)
+#      re-check, march's own two flags agree with each other, AND march's
+#      verdict agrees with the corpus's accept/reject placement)
+#   1  at least one MISMATCH, ERROR, SKIP, MARCH_SELF_INCONSISTENT, or
+#      CORPUS_VIOLATION was recorded (see the printed summary for which)
 #
 # Dependencies: bash, standard Unix tools (find, mktemp, wc), and jq (used
 # to pull the "verdict" field out of the --emit-core-ast JSON for the
@@ -111,6 +122,7 @@ mismatch_files=""
 error_files=""
 skip_files=""
 self_inconsistent_files=""
+corpus_violation_files=""
 
 json_tmp="$(mktemp)"
 trap 'rm -f "$json_tmp"' EXIT
@@ -118,6 +130,16 @@ trap 'rm -f "$json_tmp"' EXIT
 for f in "$corpus_dir"/accept/*.march "$corpus_dir"/reject/*.march; do
     [ -e "$f" ] || continue
     total=$((total + 1))
+
+    # expected_verdict comes solely from the file's parent directory name —
+    # the corpus's own naming convention (accept/ vs reject/) — independent
+    # of anything march or Lean report.
+    parent_dir="$(basename "$(dirname "$f")")"
+    case "$parent_dir" in
+        accept) expected_verdict="accept" ;;
+        reject) expected_verdict="reject" ;;
+        *) expected_verdict="unknown" ;;
+    esac
 
     if "$march_bin" --check "$f" >/dev/null 2>&1; then
         march_verdict="accept"
@@ -151,6 +173,21 @@ for f in "$corpus_dir"/accept/*.march "$corpus_dir"/reject/*.march; do
         self_inconsistent_files="$self_inconsistent_files$f (--check=$march_verdict, --emit-core-ast verdict field=$json_verdict)"$'\n'
     fi
 
+    # Corpus-placement check: does march's own --check verdict match what
+    # the file's directory (accept/ vs reject/) says it SHOULD be? This is
+    # independent of whether Lean agrees with march — it catches march
+    # regressing (or an external dependency like z3 silently disabling a
+    # class of checks) in a way that Lean, which at A0 merely echoes
+    # march's verdict, would rubber-stamp as a MATCH.
+    corpus_ok=1
+    if [ "$expected_verdict" = "unknown" ]; then
+        corpus_ok=0
+        corpus_violation_files="$corpus_violation_files$f (could not determine expected verdict from parent directory)"$'\n'
+    elif [ "$march_verdict" != "$expected_verdict" ]; then
+        corpus_ok=0
+        corpus_violation_files="$corpus_violation_files$f (march=$march_verdict, expected=$expected_verdict per corpus directory)"$'\n'
+    fi
+
     if [ "$lean_verdict" = "error" ]; then
         error_files="$error_files$f (lean_verdict=error, march_verdict=$march_verdict)"$'\n'
     elif [ "$lean_verdict" = "skip" ]; then
@@ -158,12 +195,14 @@ for f in "$corpus_dir"/accept/*.march "$corpus_dir"/reject/*.march; do
     elif [ "$march_verdict" != "$lean_verdict" ]; then
         mismatch_files="$mismatch_files$f (march=$march_verdict, lean=$lean_verdict)"$'\n'
     else
-        if [ "$self_consistent" -eq 1 ]; then
+        if [ "$self_consistent" -eq 1 ] && [ "$corpus_ok" -eq 1 ]; then
             match_count=$((match_count + 1))
         fi
-        # else: verdicts agree pairwise but march's own two flags disagree
-        # with each other; already recorded above as
-        # MARCH_SELF_INCONSISTENT and intentionally excluded from
+        # else: march_verdict == lean_verdict, but either march's own two
+        # flags disagree with each other (MARCH_SELF_INCONSISTENT, recorded
+        # above) or both march and lean agree yet disagree with the
+        # corpus's accept/reject placement (CORPUS_VIOLATION, recorded
+        # above); either way this is intentionally excluded from
         # match_count.
     fi
 done
@@ -172,6 +211,7 @@ mismatch_n=$(printf '%s' "$mismatch_files" | grep -c . || true)
 error_n=$(printf '%s' "$error_files" | grep -c . || true)
 skip_n=$(printf '%s' "$skip_files" | grep -c . || true)
 self_inconsistent_n=$(printf '%s' "$self_inconsistent_files" | grep -c . || true)
+corpus_violation_n=$(printf '%s' "$corpus_violation_files" | grep -c . || true)
 
 echo "==================================================================="
 echo "Conformance harness summary"
@@ -186,6 +226,7 @@ echo "MISMATCH:                 $mismatch_n"
 echo "ERROR:                    $error_n"
 echo "SKIP:                     $skip_n"
 echo "MARCH_SELF_INCONSISTENT:  $self_inconsistent_n"
+echo "CORPUS_VIOLATION:         $corpus_violation_n"
 echo "-------------------------------------------------------------------"
 
 if [ "$mismatch_n" -gt 0 ]; then
@@ -204,10 +245,14 @@ if [ "$self_inconsistent_n" -gt 0 ]; then
     echo "MARCH_SELF_INCONSISTENT files (--check disagrees with --emit-core-ast's own verdict field):"
     printf '%s' "$self_inconsistent_files" | sed '/^$/d;s/^/  - /'
 fi
+if [ "$corpus_violation_n" -gt 0 ]; then
+    echo "CORPUS_VIOLATION files (march's own --check verdict disagrees with the accept/reject directory it lives in):"
+    printf '%s' "$corpus_violation_files" | sed '/^$/d;s/^/  - /'
+fi
 
 echo "==================================================================="
 
-if [ "$mismatch_n" -gt 0 ] || [ "$error_n" -gt 0 ] || [ "$skip_n" -gt 0 ] || [ "$self_inconsistent_n" -gt 0 ]; then
+if [ "$mismatch_n" -gt 0 ] || [ "$error_n" -gt 0 ] || [ "$skip_n" -gt 0 ] || [ "$self_inconsistent_n" -gt 0 ] || [ "$corpus_violation_n" -gt 0 ]; then
     echo "RESULT: FAIL"
     exit 1
 else
