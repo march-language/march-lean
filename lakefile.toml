@@ -3,3 +3,7 @@ version = "0.1.0"
 
 [[lean_lib]]
 name = "MarchLean"
+
+[[lean_exe]]
+name = "march-lean-check"
+root = "MarchLeanCheck"
