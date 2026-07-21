@@ -14,6 +14,14 @@
 >   `specs/plans/`.)
 > - **march-lean side** — the elaboration checker that consumes it. (this
 >   repo, `specs/plans/`.)
+>
+> Hardened by an independent design-review pass against march source (verdict:
+> sound with fixes). Folded in: schemes recorded at the `instantiate`
+> chokepoint (uniformly covering builtin/stdlib/user schemes + their
+> constraints, closing the primitive-arithmetic coverage hole); `TRecord` in
+> the encoder + named-record canonicalization; `resolved_ty` key (distinct from
+> the surface `"ty"`); `name.span` joins for `EVar`/`EField`; whole-file skip
+> granularity; and the version-1→2 hard cutover (§7).
 
 ## 0. What A1 is (and is not)
 
@@ -67,13 +75,18 @@ These were settled during brainstorming; recording them so the plans don't
 relitigate them.
 
 1. **Seam = annotated AST, not a separate type side-channel.** march joins its
-   `type_map` onto the emitted `module` AST nodes inline (a `"ty"` field per
-   node), rather than shipping a parallel span→type table the Lean side must
-   re-join. Rationale: the span-keyed join is march's to do (it has the
-   authoritative `type_map` and the exact `desugared` value it was built
-   from); making Lean re-join by span would duplicate that logic and inherit
-   its lossiness (dummy/duplicate spans — see §5 caveat). One tree, one
-   contract.
+   `type_map` onto the emitted `module` AST nodes inline (a `"resolved_ty"`
+   field per node — a *distinct* key from the surface `"ty"` annotation
+   `ast_json` already emits on params/bindings/fields, to avoid a collision),
+   rather than shipping a parallel span→type table the Lean side must re-join.
+   Rationale: the span-keyed join is march's to do (it holds the authoritative
+   `type_map`); making Lean re-join by span would duplicate that logic and
+   inherit its lossiness (dummy/duplicate spans — see §5 caveat). One tree, one
+   contract. Note: the emitted `module` is `user_ast` (`bin/main.ml:1605`, the
+   desugared user subset, *before* stdlib/import decls are prepended), while
+   `type_map` was built over the full desugared module — the join still works
+   because user-node spans are physically identical in both, but see the
+   builtin/stdlib-scheme consequence in §2.
 
 2. **Keep full per-node annotations AND add poly witnesses** (the witness-scope
    decision). march dumps the full per-node type table *and* adds
@@ -118,66 +131,101 @@ A0's envelope (`format_version` 1):
 ```
 
 A1 bumps to `format_version` 2 and adds three things. **The envelope keys are
-unchanged; `module`'s node objects gain a `"ty"` field, and two new top-level
-witness tables appear.**
+unchanged; `module`'s node objects gain a `"resolved_ty"` field, and two new
+top-level witness tables appear.**
 
 ```json
 {
   "format_version": 2,
   "verdict": "accept"|"reject",
   "diagnostics": [...],
-  "module": { ...nodes now carry "ty"... },
-  "schemes": [ {"binder_span": <span>, "ids": [<int>...], "body": <ty-json>} ... ],
+  "module": { ...nodes now carry "resolved_ty"... },
+  "schemes": [ {"ids": [<int>...], "constraints": [<constraint-json>...], "body": <ty-json>,
+                "source": {"kind":"binder","span":<span>} | {"kind":"builtin","name":<str>}
+                         | {"kind":"stdlib","name":<str>}} ... ],
   "instantiations": [ {"use_span": <span>, "ids": [<int>...], "args": [<ty-json>...]} ... ]
 }
 ```
 
-- **`"ty"` on `module` nodes.** Each expression node (and binder/param/pattern
-  node that carries a type) gains `"ty": <ty-json>` — the resolved type from
-  `type_map`, or `null` where none was recorded. Uses a **new
-  `ty → JSON` encoder** (there is no existing internal-`ty` → surface-`Ast.ty`
-  reifier to reuse; `pp_ty` is lossy display, `surface_ty` goes the wrong
-  direction). The encoder must **deep-`repr`** recursively — top-level `repr`
-  only compresses one chain, nested `TCon`/`TArrow`/etc. args each need their
-  own resolution — and must pick an explicit encoding for **surviving
-  metavariables** (unbound `TVar`, e.g. polymorphic code whose binding scheme
-  is the real answer). It must handle the full internal `ty`: `TCon`, `TArrow`,
-  `TTuple`, `TVar`, `TLin`, `TNat`/`TNatOp`, `TChan(session_ty)`, `TRefine`,
-  `TError` sentinel. Out-of-fragment type constructors (sessions, refinements)
-  may serialize to an `{"kind":"unsupported", ...}` marker rather than a full
-  encoding — the Lean side treats any `unsupported` type as a skip trigger
-  (§4), so a faithful-but-opaque marker is enough.
+- **`"resolved_ty"` on `module` nodes.** Each expression node (and
+  binder/param/pattern node that carries a type) gains `"resolved_ty":
+  <ty-json>` — the resolved type from `type_map`, or `null` where none was
+  recorded. Distinct key from the surface `"ty"` annotation `ast_json` already
+  emits (`param`/`binding`/`field` nodes carry a surface `"ty"`; the resolved
+  type is additional). **`EVar`/`EField` have no node-level span** — their span
+  lives inside the nested `name` object (`span_of_expr (EVar) = name.span`), so
+  both the `resolved_ty` join and the instantiation `use_span` key off
+  `name.span`, not a fabricated node span. **Generalized let binders:** the
+  binder node's `resolved_ty` is the *monomorphic* rhs type recorded at
+  `name.span` (`type_map`, `typecheck.ml:3857`); the *polymorphic scheme* lives
+  in the `schemes` table, not on the node — Lean checks the binding via the
+  node annotation and checks uses via scheme+instantiation.
 
-- **`"schemes"` table** — one entry per generalization site. `binder_span`
-  keys it to the binder in `module`; `ids` is the ∀-quantified variable list
-  (march's `Poly (int list * constraint_ list * ty)` — the id list is
-  **already materialized** as `Poly`'s first field, no traversal); `body` is
-  the scheme body type. Feasibility confirmed: recorded via a `type_map`-style
-  `Hashtbl` at the generalize chokepoint, ~3–6 call sites (let-`PatVar`,
-  `letfn`, top-level `DFn`, plus interface/impl/module sites for completeness —
-  though those are out-of-fragment). Non-`PatVar` lets stay `Mono` and never
-  enter the table (no scheme), which is correct.
+  Uses a **new `ty → JSON` encoder** (no existing internal-`ty` →
+  surface-`Ast.ty` reifier to reuse; `pp_ty` is lossy display, `surface_ty`
+  goes the wrong direction). Requirements:
+  - **Deep-`repr` recursively** — top-level `repr` compresses one chain; nested
+    `TCon`/`TArrow`/`TTuple`/`TRecord` args each need their own resolution.
+  - **Full internal `ty` coverage:** `TCon`, `TArrow`, `TTuple`,
+    **`TRecord of (string*ty) list`** (records are in-fragment — omitting this
+    was a review finding; emit fields in march's canonical **sorted** order,
+    `typecheck.ml:86-91`, and Lean must not re-sort divergently), `TVar`,
+    `TLin`, `TNat`/`TNatOp`, `TChan(session_ty)`, `TError` sentinel.
+    `TRefine` is **not** reachable here — deep-`repr` strips it to its base
+    (`typecheck.ml:168`), so refinements are invisible in `resolved_ty` (§3);
+    the skip trigger for a refinement program comes from the **surface** AST
+    retaining refinement syntax, not from the resolved type.
+  - **Surviving metavariables:** an unbound `TVar` must serialize with its
+    **actual `id` int**, in the *same id-space* as `schemes.ids` /
+    `instantiations.ids` (scheme bodies are `ref (Unbound(id,0))` with exactly
+    those ids). Without the real id, `body[ids := args]` substitution can't
+    bind. Emit the id explicitly.
+  - **Out-of-fragment constructors** (`TChan` sessions) may serialize to an
+    `{"kind":"unsupported", ...}` marker; the Lean side treats any
+    `unsupported` type as a skip trigger (§4).
+
+- **`"schemes"` table** — one entry per *instantiated* scheme, recorded at the
+  **`instantiate` chokepoint** (deduped by `ids`), NOT at generalize sites.
+  This is the key correction from the review: recording at `instantiate`
+  captures **every** scheme that actually gets used — user binders,
+  **built-in primitives** (`+`/`==`/comparisons resolve to inline-constructed
+  `Poly([a],[CNum a],…)` schemes with no `binder_span`, `typecheck.ml:1198-1219`),
+  and **stdlib functions** (generalized in the prepended stdlib decls that are
+  *not* in `user_ast`) — uniformly, keyed by `ids`. Each entry carries `ids`
+  (the ∀-quantified list, already materialized as `Poly`'s first field —
+  `typecheck.ml:859` — no traversal), `constraints` (the scheme's constraint
+  list — `CNum`/`COrd`/`CEq` etc., appended to `pending_constraints` at
+  `instantiate` time, `typecheck.ml:894-901`; **emitted so Lean can verify
+  Num/Eq/Ord discharge**, which §0 puts in-fragment), `body`, and a `source`
+  tag (binder-span / builtin-name / stdlib-name — diagnostic only; the
+  functional join is `ids`). A scheme carrying a **`CInterface`** constraint
+  (user typeclass) is out-of-fragment → its presence is a skip trigger.
 
 - **`"instantiations"` table** — one entry per polymorphic use site. `use_span`
-  keys it to the `EVar`/`EField` node; `ids` is the scheme's id list (the
-  **join key** back to `"schemes"` — id-list equality); `args` is the
-  type-argument vector, positionally aligned to `ids`. Feasibility confirmed:
-  `instantiate` builds `subst = List.map (fun id -> (id, fresh_var level)) ids`;
-  the fresh vars are ordinary unification vars that resolve through `repr`
+  = the `EVar`/`EField` `name.span`; `ids` is the join key back to `schemes`
+  (id-list equality); `args` is the type-argument vector, positionally aligned
+  to `ids`. `instantiate` builds `subst = List.map (fun id -> (id, fresh_var
+  level)) ids` (`typecheck.ml:869`); the fresh vars resolve through `repr`
   after solving (same round-trip as `type_map`). Emit by threading a
   `?use_span` param into `instantiate` and recording `(ids, map snd subst)` at
-  the ~5 `EVar`/`EField` call sites, resolving args via `repr` at module end.
+  the `EVar`/`EField` call sites, resolving args via `repr` at module end.
+  Because schemes are recorded at this same chokepoint, **every** emitted
+  instantiation has a matching scheme entry — there is no "instantiation with
+  no scheme" case for Lean to handle.
 
 **Explicitly NOT emitted** (honoring decision #2): constructor instantiations
-(`ECon` uses a separate `instantiate_ctor` path; A1 doesn't need a witness —
-the node's result-type annotation plus the datatype's `DType` decl in `module`
-pin the instantiation, so Lean checks it forward), capability subsumption,
-refinement obligations, reuse/RC decisions.
+(`ECon` uses a separate `instantiate_ctor` path — `typecheck.ml:2404-2412` —
+that never builds a `Poly`; A1 needs no witness, since the node's
+`resolved_ty` plus the datatype's `DType` decl in `module` pin the
+instantiation, so Lean checks it forward), capability subsumption, refinement
+obligations, reuse/RC decisions.
 
-**march-side cost** (from feasibility investigation): 2 new `Hashtbl` fields on
-`env`, ~8–10 `Hashtbl.replace` calls at existing chokepoints, one optional
-param on `instantiate`, one new `ty → JSON` encoder, and the inline-join at the
-emit branch (`bin/main.ml`, where `type_map` is already in scope but currently
+**march-side cost** (from feasibility investigation, adjusted for the
+instantiate-time scheme recording): 2 new `Hashtbl` fields on `env` (schemes
+by ids, instantiations by span), recording at the single `instantiate`
+chokepoint plus the `EVar`/`EField` call sites, one optional `?use_span` param
+on `instantiate`, one new `ty → JSON` encoder, and the inline-join at the emit
+branch (`bin/main.ml`, where `type_map` is already in scope but currently
 unused). **No inference restructuring.**
 
 ## 3. What march does NOT hand Lean (Lean re-derives)
@@ -212,20 +260,40 @@ Remove the POC proof modules (decision #4). New structure:
   error (exit 3), consistent with A0's format-version discipline. (A0's
   `MarchLean/Json.lean` verdict parser is updated to accept version 2.)
 - **`Typing/Check.lean`** — bidirectional, syntax-directed check over the
-  annotated AST. Verifies: each node's `"ty"` is consistent with its
-  subterms' annotations and the datatype/decl environment; each `EVar`/`EField`
-  use with an `instantiations` entry is a valid instantiation of its
-  `schemes` entry **by substitution + equality only** (substitute `args` for
-  `ids` in `body`, check it equals the use-site annotation — no unification, no
-  matching). Any `unsupported` node/type ⇒ skip.
+  annotated AST. Verifies:
+  - each node's `resolved_ty` is consistent with its subterms' annotations and
+    the datatype/decl environment;
+  - each `EVar`/`EField` use with an `instantiations` entry is a valid
+    instantiation of its `schemes` entry (joined by `ids`) **by substitution +
+    equality only** — substitute `args` for `ids` in the scheme `body`, check
+    it equals the use-site `resolved_ty`; no unification, no matching;
+  - each scheme's `constraints` are satisfied by the corresponding `args` for
+    the classes A1 models (`Num`/`Eq`/`Ord` over primitive types — §0
+    in-fragment). A scheme carrying a `CInterface` (user-typeclass) constraint
+    ⇒ skip.
+  - **Type equality is not raw structural equality.** Lean must canonicalize
+    before comparing: a named record `TCon("Foo",[])` and its structural
+    `TRecord{…}` form denote the same type but `repr` does *not* expand names
+    (`typecheck.ml:158-169`; expansion is on-demand via `expand_record`,
+    `:2418`). Lean canonicalizes by expanding named records through the `DType`
+    environment (present in `module`) before equality — otherwise the same type
+    appearing in both forms across two nodes is a spurious MISMATCH. Record
+    fields are compared in march's canonical sorted order (§2).
 - **`Typing/Linearity.lean`** — independent executable use-counting:
   exactly-once (linear), at-most-once (affine), must-consume-before-scope-close,
-  field-level tracking. Re-derived purely from qualifiers + term structure.
+  field-level tracking. Re-derived purely from the serialized qualifiers
+  (`param_lin`/`bind_lin`/`fld_lin` → `"lin"` in `ast_json`, plus surface
+  `TyLinear`) + term structure — confirmed all present in the emitted `module`.
 - **`MarchLeanCheck` main** — control flow:
-  1. parse envelope; malformed ⇒ exit 3.
+  1. parse envelope; malformed / `format_version` ≠ 2 ⇒ exit 3.
   2. `verdict == "reject"` ⇒ exit 2 (skip; A1 doesn't model reject).
   3. `verdict == "accept"` ⇒ decode `module` + witnesses.
-  4. any `unsupported` construct encountered (decode or check) ⇒ exit 2 (skip).
+  4. **any `unsupported` construct anywhere in the file (a node, a subterm, a
+     type, or a `CInterface`-bearing scheme) ⇒ exit 2 (whole-file skip).** Skip
+     granularity is per-file, not per-node: partial checking of a file with an
+     out-of-fragment subterm risks false accepts, and the corpus is structured
+     one-feature-per-file (INDEX.md), so whole-file skip aligns with how the
+     corpus isolates features. The ledger (§5) records the triggering construct.
   5. run `Typing/Check` + `Typing/Linearity`; all pass ⇒ exit 0; a modeled
      check fails ⇒ exit 1 (this is the MISMATCH the harness catches).
 
@@ -264,11 +332,20 @@ skip was structurally impossible). A1 makes skip **expected and frequent**
 - **Span-join lossiness** *(contained)* — march does the join inline (decision
   #1), so Lean never joins by span. Where march's own join is lossy
   (dummy/duplicate spans from desugaring), the affected node carries
-  `"ty": null` and Lean treats a needed-but-absent annotation as a skip, not a
-  false accept.
+  `"resolved_ty": null` and Lean treats a needed-but-absent annotation as a
+  skip, not a false accept.
+- **Builtin/stdlib schemes** *(retired by the §2 correction)* — recording
+  schemes at the `instantiate` chokepoint (not generalize sites) means
+  primitive and stdlib polymorphic uses carry a matching scheme entry, so
+  arithmetic/comparison programs — the common case — are checkable rather than
+  falling into a no-scheme hole.
 - **Metavariables survive in annotations** *(handled)* — the `ty → JSON`
-  encoder deep-`repr`s and emits an explicit encoding for unbound `TVar`; the
-  binding's scheme witness is the authoritative answer for polymorphic nodes.
+  encoder deep-`repr`s and emits unbound `TVar`s with their real `id` (same
+  id-space as the witness tables); the binding's scheme witness is the
+  authoritative answer for polymorphic nodes.
+- **Constraint discharge invisible** *(retired)* — the scheme witness carries
+  its `constraints`, so march's `Num`/`Eq`/`Ord` discharge is independently
+  checkable rather than structurally invisible to A1.
 - **Linearity has no certificate** *(by design)* — Lean re-derives it; that's
   the point of the milestone, not a gap.
 - **Spurious mismatches from Lean-model gaps** *(acknowledged)* — a MISMATCH is
@@ -278,15 +355,33 @@ skip was structurally impossible). A1 makes skip **expected and frequent**
   triaged, and a genuine model gap either gets fixed in the Lean rules or the
   construct moves to the skip-ledger with a recorded reason.
 
-## 7. Deliverables
+## 7. Version cutover
+
+`format_version` 1 → 2 is a **hard cutover, no negotiation.** march
+unconditionally emits version 2; the Lean side requires version 2 and returns
+exit 3 on any version-1 payload (consistent with A0's format-version
+discipline). This is safe because `march-lean-check` is the *only* consumer of
+`--emit-core-ast` output, and it's updated in lockstep. Consequences:
+
+- A0's golden fixtures (march M3: `test/emit_core_ast/fixtures/*.expected.json`)
+  are **version-1 documents and will all break** under the version-2 emitter —
+  they must be regenerated as part of the march-side plan, and re-pinned to
+  include `resolved_ty` + the witness tables. This is expected fixture churn,
+  not a regression.
+- A0's `MarchLean/Json.lean` verdict parser (which currently hard-requires
+  version 1) is bumped to require version 2.
+
+## 8. Deliverables
 
 Two implementation plans (written next, via `writing-plans`):
 
-1. **march `format_version` 2 emitter** — `ty → JSON` encoder; inline `"ty"`
-   annotations; `schemes` + `instantiations` tables; golden-test update.
+1. **march `format_version` 2 emitter** — `ty → JSON` encoder (incl. `TRecord`,
+   metavar ids); `resolved_ty` inline annotations; `schemes` (instantiate-time,
+   with `constraints`) + `instantiations` tables; regenerate M3 golden fixtures.
 2. **march-lean A1 checker** — remove POC proofs; `Syntax`/`Elab`/`Typing`
-   modules; `MarchLeanCheck` control flow; `Json.lean` version bump; harness
-   skip-ledger + forced-relaxation test; CI repin.
+   modules (incl. named-record canonicalization + constraint checking);
+   `MarchLeanCheck` whole-file-skip control flow; `Json.lean` version bump;
+   harness skip-ledger + forced-relaxation test; CI repin.
 
 Each plan carries its own task breakdown, per-task briefs, and review gates,
 following the A0 plans' structure.
