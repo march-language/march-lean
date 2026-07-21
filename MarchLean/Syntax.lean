@@ -110,8 +110,8 @@ carry their `span` (for the instantiation join). -/
 inductive Term where
   | lit (l : Lit) (ty : Ty)
   | var (name : String) (span : Span) (ty : Ty)
-  | app (fn : Term) (arg : Term) (ty : Ty)
-  | lam (param : String) (lin : Lin) (body : Term) (ty : Ty)
+  | app (fn : Term) (args : List Term) (ty : Ty)
+  | lam (params : List (String × Lin)) (body : Term) (ty : Ty)
   | let_ (name : String) (lin : Lin) (rhs : Term) (body : Term) (ty : Ty)
   | letfn (name : String) (param : String) (lin : Lin) (fnBody : Term) (body : Term) (ty : Ty)
   | ite (cond : Term) (then_ : Term) (else_ : Term) (ty : Ty)
@@ -125,7 +125,7 @@ inductive Term where
 
 /-- The type annotation on a term node. -/
 def Term.ty : Term → Ty
-  | .lit _ t | .var _ _ t | .app _ _ t | .lam _ _ _ t | .let_ _ _ _ _ t
+  | .lit _ t | .var _ _ t | .app _ _ t | .lam _ _ t | .let_ _ _ _ _ t
   | .letfn _ _ _ _ _ t | .ite _ _ _ t | .con _ _ t | .tuple _ t
   | .record _ t | .field _ _ _ t | .match_ _ _ t | .unsupported t => t
 
@@ -135,8 +135,8 @@ partial def Term.hasUnsupported : Term → Bool
   | t =>
     t.ty.hasUnsupported ||
     (match t with
-     | .app f a _ => f.hasUnsupported || a.hasUnsupported
-     | .lam _ _ b _ => b.hasUnsupported
+     | .app f args _ => f.hasUnsupported || args.any Term.hasUnsupported
+     | .lam _ b _ => b.hasUnsupported
      | .let_ _ _ r b _ => r.hasUnsupported || b.hasUnsupported
      | .letfn _ _ _ fb b _ => fb.hasUnsupported || b.hasUnsupported
      | .ite c u v _ => c.hasUnsupported || u.hasUnsupported || v.hasUnsupported
@@ -156,16 +156,16 @@ structure CtorSig where
 
 /-- Declaration (only what the fragment checks; others → `unsupported`). -/
 inductive Decl where
-  /-- Single-parameter function. March's `DFn` carries `params : List` (a
-  clause's full parameter list); the Task-3 decoder maps that list onto this
-  single-`param` shape by currying: 0 params decodes to `dlet` (or a
-  zero-param `dfn` with a synthetic unused param, decoder's choice), 1 param
-  maps directly, and 2+ params curry the extras into nested `Term.lam` nodes
-  in `body` (so `fn(x, y) = e` becomes `dfn fn x _ (lam y _ e _)`). If the
-  decoder can't perform this currying faithfully (e.g. multiple clauses with
-  differing arity, or non-trivial guards), it should fall back to
-  `Decl.unsupported` rather than misrepresent the function. -/
-  | dfn (name : String) (param : String) (lin : Lin) (body : Term)
+  /-- Function declaration, modeled N-ARILY to match march's `DFn` faithfully
+  (`params : List`, a clause's full parameter list). No currying — the whole
+  param list is carried directly, so no synthetic intermediate nodes with
+  unknown types are invented. A 0-param clause decodes to `dlet` instead. If
+  the decoder can't represent a clause faithfully (multiple clauses, non-plain
+  params, or a guard), it falls back to `Decl.unsupported`. The emitter attaches
+  `resolved_ty` only to the *body* expression, not to the function itself, so a
+  `dfn` carries no arrow type of its own; params' types (when needed) come from
+  the enclosing context, not from a node field. -/
+  | dfn (name : String) (params : List (String × Lin)) (body : Term)
   | dlet (name : String) (rhs : Term)
   | dtype (name : String) (params : List String) (ctors : List CtorSig)
   | unsupported
@@ -176,7 +176,7 @@ inductive Decl where
 out-of-fragment types, so those are checked too. -/
 def Decl.hasUnsupported : Decl → Bool
   | .unsupported => true
-  | .dfn _ _ _ body => body.hasUnsupported
+  | .dfn _ _ body => body.hasUnsupported
   | .dlet _ body => body.hasUnsupported
   | .dtype _ _ ctors =>
       ctors.any (fun c => c.argTys.any Ty.hasUnsupported || c.resultTy.hasUnsupported)

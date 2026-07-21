@@ -18,24 +18,30 @@ never by re-running unification/inference.
 ## Design (mirrors the A1 elaboration-checker design doc)
 
 1. **Whole-file skip gate.** If ANY decl `.hasUnsupported` (Task 2: covers
-   unsupported nodes/subterms/patterns/types — including the `Ty.unsupported`
-   the Task-3 decoder attaches to intermediate curried `app`/`lam` nodes whose
-   type the emitter never records), OR any scheme carries a `CInterface` whose
-   name is NOT `Num`/`Eq`/`Ord`, the whole module is `.skip`. Consequence: any
-   decl containing a 2+-argument application (curried to `Ty.unsupported`
-   intermediates) skips — honest, since we can't see those nodes' types.
+   unsupported nodes/subterms/patterns/types), OR any scheme carries a
+   `CInterface` whose name is NOT `Num`/`Eq`/`Ord`, the whole module is `.skip`.
+   (Application and lambda are now modeled N-ARILY — matching march's `EApp of
+   expr * expr list` and `ELam`/`DFn` param lists — so no synthetic intermediate
+   nodes with `Ty.unsupported` are invented; a 2-arg application no longer trips
+   this gate.)
 
    A crucial invariant falls out of this gate: **by the time `checkTerm` runs,
    every node in every decl is free of `Ty.unsupported`** — so the structural
    rules below never meet an unknown type and never need defensive skips for it.
 
 2. **Instantiation checking.** For each `EVar`/`EField` use with an
-   `instantiations` entry (joined to its `schemes` entry by `ids` equality):
-   `substTy (ids.zip args) scheme.body` must equal the use-site node's
-   `resolved_ty` under CANONICAL equality (§4). The join + constraint + arity
-   validation lives in `checkInstantiations`; the use-site *equality* lives in
-   `checkTerm`'s `var` arm (where the annotation is in scope). No scheme for an
-   instantiation's ids ⇒ `.skip` (defensive; the emitter guarantees pairing).
+   `instantiations` entry (joined to its `schemes` entry by `ids` equality),
+   `substTy (ids.zip args) scheme.body` is the identifier's authoritative
+   monomorphic type. The join + constraint + arity validation lives in
+   `checkInstantiations`; the use-site *type* is verified where the identifier is
+   used: if it is the callee of an application, its substituted scheme body is
+   peeled against the argument list (app arm) — this is the authoritative path,
+   because the emitter annotates an *operator* callee node with the application's
+   RESULT type (e.g. `n > m`'s `>` node carries `Bool`, not `Int → Int → Bool`),
+   so the callee node's own `resolved_ty` is NOT reliably the function type. A
+   var used in non-callee position (a polymorphic value) is checked in the `var`
+   arm by `substTy body == node.ty`. No scheme for an instantiation's ids ⇒
+   `.skip` (defensive; the emitter guarantees pairing).
 
 3. **Constraint checking by interface NAME.** march emits the primitive
    `Num`/`Eq`/`Ord` constraints as `CInterface "Num"/"Eq"/"Ord"` (there is NO
@@ -52,8 +58,10 @@ never by re-running unification/inference.
    nested types normalize, and variant ADTs stay nominal, compared by name+args.)
 
 5. **Per-node structural rules (bidirectional).** Each node's `resolved_ty` must
-   be consistent with its subterms: app (fn is an arrow whose dom == arg.ty and
-   cod == node.ty), ite (cond == Bool, both branches == node.ty), con (node.ty
+   be consistent with its subterms: app (peel the callee's arrow chain — its
+   substituted scheme body when instantiated, else its `resolved_ty` — against
+   the args list: each domain == the matching arg's ty, final codomain == node.ty),
+   ite (cond == Bool, both branches == node.ty), con (node.ty
    is the ctor's datatype applied, declared arg types matched under the derived
    param substitution), tuple/record/field (componentwise), lam/let/letfn/match
    (recurse + result-type agreement), lit (no sub-check).
@@ -131,6 +139,29 @@ partial def asArrow (env : TyEnv) (t : Ty) : Option (Ty × Ty) :=
   | .lin _ inner => asArrow env inner
   | _ => none
 
+/-- Peel `fty`'s arrow chain against an N-ary application's `args` left-to-right:
+each successive domain must `tyEq` the corresponding arg's ty, and the final
+codomain (after all args) must `tyEq` the node's `expected` result type. -/
+partial def checkAppChain (env : TyEnv) (expected : Ty) : Ty → List Term → CheckResult
+  | fty, [] =>
+      if tyEq env fty expected then .ok
+      else .reject s!"application result type {repr (canon env fty)} ≠ node type {repr (canon env expected)}"
+  | fty, a :: rest =>
+      match asArrow env fty with
+      | some (dom, cod) =>
+          if tyEq env dom a.ty then checkAppChain env expected cod rest
+          else .reject s!"application argument type mismatch: fn expects {repr (canon env dom)} but arg is {repr (canon env a.ty)}"
+      | none => .reject s!"applying a non-function of type {repr (canon env fty)}"
+
+/-- Peel exactly `n` arrows off `t`, returning the remaining codomain. Used to
+recover a lambda's body type from its N-ary function `resolved_ty`. -/
+partial def peelArrows (env : TyEnv) : Nat → Ty → Option Ty
+  | 0, t => some t
+  | n + 1, t =>
+      match asArrow env t with
+      | some (_, cod) => peelArrows env n cod
+      | none => none
+
 /-- `Num`: satisfied by numeric primitives (or a still-free var). -/
 def numOk (env : TyEnv) (t : Ty) : Option (Sum String String) :=
   match canon env t with
@@ -201,6 +232,10 @@ on real resolved types. -/
 partial def checkTerm (env : TyEnv) (m : Module) (insts : List Instantiation) : Term → CheckResult
   | .lit _ _ => .ok
   | .var _ span ty =>
+      -- Reached for a var in NON-callee position (a polymorphic *value*). A var
+      -- in callee position is handled inline by the `app` arm, which uses the
+      -- substituted scheme body rather than this node's `resolved_ty` (unreliable
+      -- for operators — see design §2).
       match insts.find? (fun i => i.useSpan == span) with
       | none => .ok   -- monomorphic use: the annotation stands on its own
       | some inst =>
@@ -210,22 +245,35 @@ partial def checkTerm (env : TyEnv) (m : Module) (insts : List Instantiation) : 
           let expected := substTy (sch.ids.zip inst.args) sch.body
           if tyEq env expected ty then .ok
           else .reject s!"instantiation type mismatch at {repr span}: witness gives {repr (canon env expected)} but node is annotated {repr (canon env ty)}"
-  | .app f a ty =>
-      (checkTerm env m insts f).andThen fun _ =>
-      (checkTerm env m insts a).andThen fun _ =>
-        match asArrow env f.ty with
-        | some (dom, cod) =>
-            if !(tyEq env dom a.ty) then .reject s!"application domain mismatch: fn expects {repr (canon env dom)} but arg is {repr (canon env a.ty)}"
-            else if !(tyEq env cod ty) then .reject s!"application result mismatch: fn returns {repr (canon env cod)} but node is {repr (canon env ty)}"
-            else .ok
-        | none => .reject s!"applying a non-function of type {repr (canon env f.ty)}"
-  | .lam _ _ body ty =>
+  | .app f args ty =>
+      (firstBad (args.map (checkTerm env m insts))).andThen fun _ =>
+        -- The function type to peel against `args`. When the callee is an
+        -- identifier WITH an instantiation, its authoritative monomorphic type
+        -- is the witness-substituted scheme body — NOT the fn node's own
+        -- `resolved_ty`, which the emitter fills with the *result* type for
+        -- operator applications (e.g. `n > m`'s `>` node is annotated `Bool`,
+        -- not `Int → Int → Bool`). Instantiation constraints are validated
+        -- globally in `checkInstantiations`. For a non-identifier callee we
+        -- recurse and use its real (arrow) `resolved_ty`.
+        match f with
+        | .var _ span _ =>
+            match insts.find? (fun i => i.useSpan == span) with
+            | some inst =>
+                match m.schemes.find? (fun s => s.ids == inst.ids) with
+                | some sch => checkAppChain env ty (substTy (sch.ids.zip inst.args) sch.body) args
+                | none => .skip s!"no scheme for instantiation at {repr span}"
+            | none => checkAppChain env ty f.ty args   -- monomorphic identifier: rty is the arrow
+        | _ =>
+            (checkTerm env m insts f).andThen fun _ =>
+              checkAppChain env ty f.ty args
+  | .lam params body ty =>
       (checkTerm env m insts body).andThen fun _ =>
-        match asArrow env ty with
-        | some (_dom, cod) =>
+        -- One arrow per param off the node's own type; body.ty == the remainder.
+        match peelArrows env params.length ty with
+        | some cod =>
             if tyEq env body.ty cod then .ok
             else .reject s!"lambda body type {repr (canon env body.ty)} ≠ codomain {repr (canon env cod)}"
-        | none => .skip s!"lambda node type not an arrow: {repr (canon env ty)}"
+        | none => .skip s!"lambda node type not an arrow chain of length {params.length}: {repr (canon env ty)}"
   | .let_ _ _ rhs body ty =>
       (checkTerm env m insts rhs).andThen fun _ =>
       (checkTerm env m insts body).andThen fun _ =>
@@ -300,7 +348,7 @@ per constructor — no catch-all. -/
 def checkDecl (env : TyEnv) (m : Module) (insts : List Instantiation) : Decl → CheckResult
   | .dtype _ _ _ => .ok
   | .dlet _ body => checkTerm env m insts body
-  | .dfn _ _ _ body => checkTerm env m insts body
+  | .dfn _ _ body => checkTerm env m insts body
   | .unsupported => .skip "unsupported decl"
 
 /-- Whole-module check. -/

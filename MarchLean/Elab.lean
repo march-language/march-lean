@@ -211,33 +211,6 @@ partial def decodeSurfaceTy (paramNames : List String) (j : Json) : Except Strin
       .ok (Ty.natOp op (← decodeSurfaceTy paramNames (← field j "lhs")) (← decodeSurfaceTy paramNames (← field j "rhs")))
   | _ => .ok Ty.unsupported   -- TyChan (session type), TyRefine (refinement) — out of fragment
 
-/-- Curry an n-ary `EApp`'s arg list onto `Term.app`'s single-arg shape.
-Only the *last* application's type is known (the node's own `resolved_ty`);
-the emitter attaches no type to the intermediate partial applications, so
-those get `Ty.unsupported` — correctly forcing a downstream skip on any
-term that inspects an intermediate node's type, never a false accept. -/
-def buildApp (fn : Term) (args : List Term) (finalTy : Ty) : Term :=
-  match args with
-  | [] => fn
-  | [a] => Term.app fn a finalTy
-  | a :: rest => buildApp (Term.app fn a Ty.unsupported) rest finalTy
-
-/-- Curry an n-ary `ELam`'s param list onto `Term.lam`'s single-param shape.
-The outermost lambda's type is the `ELam` node's own `resolved_ty` (the
-whole arrow type); each inner lambda's type is obtained by peeling one
-`Ty.arrow` layer off the enclosing type. `none` only when `params = []`
-(an `ELam` with zero params isn't representable as a `Term.lam` at all). -/
-def buildLam (params : List (String × Lin)) (body : Term) (wholeTy : Ty) : Option Term :=
-  match params with
-  | [] => none
-  | [(n, lin)] => some (Term.lam n lin body wholeTy)
-  | (n, lin) :: rest =>
-      let innerTy := match wholeTy with
-        | Ty.arrow _ to => to
-        | _ => Ty.unsupported
-      match buildLam rest body innerTy with
-      | some inner => some (Term.lam n lin inner wholeTy)
-      | none => none
 
 mutual
 
@@ -264,23 +237,26 @@ partial def decodeTerm (j : Json) : Except String Term := do
       let (txt, sp) ← decodeName (← field j "name")
       .ok (Term.var txt sp ty)
   | "EApp" =>
+      -- N-ary: march's `EApp` is one node `fn` + `args` list, carrying a real
+      -- `resolved_ty`. Model it directly — no currying into synthetic nodes.
       let fn ← decodeTerm (← field j "fn")
       let args ← (← (← field j "args").getArr?.mapError (fun _ => "args")).toList.mapM decodeTerm
-      .ok (buildApp fn args ty)
+      .ok (Term.app fn args ty)
   | "ECon" =>
       let (name, _) ← decodeName (← field j "name")
       let args ← (← (← field j "args").getArr?.mapError (fun _ => "args")).toList.mapM decodeTerm
       .ok (Term.con name args ty)
   | "ELam" =>
+      -- N-ary: march's `ELam` carries a `params` list (each param object has a
+      -- `name` and a `lin`) and a `body`, with the node's own `resolved_ty` the
+      -- whole (possibly multi-arrow) function type. Model directly — no currying.
       let paramsJ ← (← field j "params").getArr?.mapError (fun _ => "params")
       let params ← paramsJ.toList.mapM (fun p => do
         let (n, _) ← decodeName (← field p "name")
         let lin ← decodeLin (← field p "lin")
         pure (n, lin))
       let body ← decodeTerm (← field j "body")
-      match buildLam params body ty with
-      | some t => .ok t
-      | none => .ok (Term.unsupported ty)
+      .ok (Term.lam params body ty)
   | "EBlock" =>
       let exprsJ ← (← field j "exprs").getArr?.mapError (fun _ => "exprs")
       decodeBlockStmts exprsJ.toList ty
@@ -412,22 +388,13 @@ partial def decodeDecl (j : Json) : Except String Decl := do
             match paramsOpt with
             | none => .ok Decl.unsupported
             | some [] =>
+                -- 0-param clause: a plain value binding.
                 let body ← decodeTerm bodyJ
                 .ok (Decl.dlet name body)
-            | some ((p, lin) :: rest) => do
+            | some params =>
+                -- N-ary: carry the whole param list directly (no currying).
                 let body ← decodeTerm bodyJ
-                match rest with
-                | [] => .ok (Decl.dfn name p lin body)
-                | _ =>
-                    -- 2+ params: curry the extras into nested `Term.lam`.
-                    -- The fn's own arrow type is never attached to any JSON
-                    -- node here (only the clause *body*'s `resolved_ty`
-                    -- is), so the synthesized inner lambdas get
-                    -- `Ty.unsupported` — an honest "we don't know this
-                    -- type", which correctly forces a downstream skip.
-                    match buildLam rest body Ty.unsupported with
-                    | some inner => .ok (Decl.dfn name p lin inner)
-                    | none => .ok Decl.unsupported
+                .ok (Decl.dfn name params body)
       | _ => .ok Decl.unsupported   -- 0 or 2+ clauses: multi-clause fns unsupported
   | "DLet" => do
       let binding ← field j "binding"
