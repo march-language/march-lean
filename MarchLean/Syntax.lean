@@ -96,6 +96,15 @@ inductive Pattern where
   | unsupported
   deriving Repr, Inhabited
 
+/-- Does this pattern contain an `unsupported` node anywhere? -/
+partial def Pattern.hasUnsupported : Pattern → Bool
+  | .unsupported => true
+  | .con _ args => args.any Pattern.hasUnsupported
+  | .tuple ps => ps.any Pattern.hasUnsupported
+  | .record fs => fs.any (fun (_, p) => p.hasUnsupported)
+  | .as _ p => p.hasUnsupported
+  | .wild | .var _ _ | .lit _ => false
+
 /-- Term. Each node carries its resolved type `ty`. `var` and `field` also
 carry their `span` (for the instantiation join). -/
 inductive Term where
@@ -135,7 +144,7 @@ partial def Term.hasUnsupported : Term → Bool
      | .tuple es _ => es.any Term.hasUnsupported
      | .record fs _ => fs.any (fun (_, e) => e.hasUnsupported)
      | .field r _ _ _ => r.hasUnsupported
-     | .match_ s arms _ => s.hasUnsupported || arms.any (fun (_, e) => e.hasUnsupported)
+     | .match_ s arms _ => s.hasUnsupported || arms.any (fun (p, e) => p.hasUnsupported || e.hasUnsupported)
      | _ => false)
 
 /-- Datatype constructor signature (from a `DType` decl). -/
@@ -147,11 +156,30 @@ structure CtorSig where
 
 /-- Declaration (only what the fragment checks; others → `unsupported`). -/
 inductive Decl where
+  /-- Single-parameter function. March's `DFn` carries `params : List` (a
+  clause's full parameter list); the Task-3 decoder maps that list onto this
+  single-`param` shape by currying: 0 params decodes to `dlet` (or a
+  zero-param `dfn` with a synthetic unused param, decoder's choice), 1 param
+  maps directly, and 2+ params curry the extras into nested `Term.lam` nodes
+  in `body` (so `fn(x, y) = e` becomes `dfn fn x _ (lam y _ e _)`). If the
+  decoder can't perform this currying faithfully (e.g. multiple clauses with
+  differing arity, or non-trivial guards), it should fall back to
+  `Decl.unsupported` rather than misrepresent the function. -/
   | dfn (name : String) (param : String) (lin : Lin) (body : Term)
   | dlet (name : String) (rhs : Term)
   | dtype (name : String) (params : List String) (ctors : List CtorSig)
   | unsupported
   deriving Inhabited
+
+/-- Is this declaration (or any term/type it carries) out of fragment?
+`dtype` carries no terms, but its constructor signatures may reference
+out-of-fragment types, so those are checked too. -/
+def Decl.hasUnsupported : Decl → Bool
+  | .unsupported => true
+  | .dfn _ _ _ body => body.hasUnsupported
+  | .dlet _ body => body.hasUnsupported
+  | .dtype _ _ ctors =>
+      ctors.any (fun c => c.argTys.any Ty.hasUnsupported || c.resultTy.hasUnsupported)
 
 structure Scheme where
   ids : List Int
@@ -182,4 +210,32 @@ open MarchLean.Syntax
 example : Ty.hasUnsupported (Ty.con "Int" []) = false := by native_decide
 -- unsupported propagates through structure.
 example : Ty.hasUnsupported (Ty.arrow Ty.unsupported (Ty.con "Int" [])) = true := by native_decide
+
+-- Regression for the false-accept bug where `Term.hasUnsupported`'s
+-- `match_` arm discarded the `Pattern` component of each arm, so an
+-- `unsupported` pattern nested in a match arm was invisible.
+private def intTy : Ty := Ty.con "Int" []
+private def dummySpan : Span := ⟨"f", 0, 0, 0, 0⟩
+private def okScrut : Term := Term.lit (Lit.int 0) intTy
+private def okArm : Pattern × Term := (Pattern.wild, Term.lit (Lit.int 1) intTy)
+private def badArm : Pattern × Term := (Pattern.unsupported, Term.lit (Lit.int 1) intTy)
+-- Nested inside a `con` pattern too, not just at the top level of the arm.
+private def badNestedArm : Pattern × Term :=
+  (Pattern.con "Some" [Pattern.unsupported], Term.lit (Lit.int 1) intTy)
+
+-- A match with only clean patterns/arms is in-fragment.
+example : Term.hasUnsupported (Term.match_ okScrut [okArm] intTy) = false := by native_decide
+-- A match with an `unsupported` pattern directly in an arm must be flagged
+-- (this is exactly what the old code missed: `fun (_, e) => e.hasUnsupported`
+-- ignored the pattern).
+example : Term.hasUnsupported (Term.match_ okScrut [okArm, badArm] intTy) = true := by native_decide
+-- Same, but the `unsupported` is nested inside a constructor pattern.
+example : Term.hasUnsupported (Term.match_ okScrut [okArm, badNestedArm] intTy) = true := by native_decide
+-- `Pattern.hasUnsupported` itself, standalone: top-level and nested.
+example : Pattern.hasUnsupported Pattern.wild = false := by native_decide
+example : Pattern.hasUnsupported Pattern.unsupported = true := by native_decide
+example : Pattern.hasUnsupported (Pattern.tuple [Pattern.wild, Pattern.unsupported]) = true := by
+  native_decide
+example : Pattern.hasUnsupported (Pattern.as "x" Pattern.unsupported) = true := by native_decide
+
 end MarchLean.Syntax.Test
