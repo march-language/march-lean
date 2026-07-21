@@ -1,7 +1,7 @@
 name: Conformance
 
-# A0 conformance gate: build march-lean-check (this repo) and march (from the
-# companion --emit-core-ast branch, see TODO below), then run
+# A0 conformance gate: build march-lean-check (this repo) and march (pinned
+# to a main SHA, see the checkout step below), then run
 # scripts/conformance-harness.sh over march's static-semantics corpus and
 # fail the job on any MISMATCH/ERROR/SKIP/MARCH_SELF_INCONSISTENT.
 on:
@@ -37,15 +37,15 @@ jobs:
         with:
           use-mathlib-cache: false
 
-      # TODO: repin to a main SHA once the --emit-core-ast PR merges to
-      # march main — this currently points at a feature branch
-      # (claude/emit-core-ast-a0) because --emit-core-ast does not exist on
-      # march's main yet.
-      - name: Checkout march (emit-core-ast-a0 feature branch)
+      # Pinned to a march main SHA (not the branch) for reproducibility.
+      # --emit-core-ast merged to march main via #55 (merge commit 04d3960d)
+      # on 2026-07-21; this pin is main's tip as of the 0.1.1 version bump,
+      # a few commits later. Bump periodically; no need to chase every push.
+      - name: Checkout march (main, pinned)
         uses: actions/checkout@v4
         with:
           repository: march-language/march
-          ref: claude/emit-core-ast-a0
+          ref: ef18e6d808cc9937709518eb60e63f437c7a6f8a
           path: march-checkout
 
       # --- Mirror of march's own .github/workflows/ci.yml `build` job ---
@@ -66,12 +66,9 @@ jobs:
           # PATH (lib/refine/solver.ml). Without it, refinement checks
           # silently no-op — no build failure, just reject/t71-t73 silently
           # stop being rejected on a runner that lacks z3 (ubuntu-24.04
-          # doesn't ship it by default). Matches march's own main-branch
-          # ci.yml fix (commit 5f4d7dd9, "install z3 so refinement
-          # conformance corpus is checked on Linux") — not yet present on
-          # the claude/emit-core-ast-a0 branch's own ci.yml (it branched
-          # before that fix landed on main), but the dependency is real
-          # regardless of which ci.yml revision we're nominally mirroring.
+          # doesn't ship it by default). Matches march's own ci.yml fix
+          # (commit 5f4d7dd9, "install z3 so refinement conformance corpus
+          # is checked on Linux"), already present at the pinned SHA above.
           sudo apt-get install -y libbrotli-dev libzstd-dev llvm-dev z3
           # libblake3-dev is not available in Ubuntu 24.04; build from source
           # (matches march's own ci.yml recipe verbatim).
