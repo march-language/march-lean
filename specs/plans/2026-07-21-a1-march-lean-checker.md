@@ -113,10 +113,22 @@ At the bottom of the new `MarchLean/Syntax.lean`, include:
 ```lean
 namespace MarchLean.Syntax.Test
 open MarchLean.Syntax
--- A literal-int term annotated Int must be constructible and flagged clean.
-example : Ty.hasUnsupported (Ty.con "Int" []) = false := by decide
--- unsupported propagates through structure.
-example : Ty.hasUnsupported (Ty.arrow Ty.unsupported (Ty.con "Int" [])) = true := by decide
+-- `Ty.hasUnsupported` (`partial def` ⇒ use `native_decide`, not `decide`).
+example : Ty.hasUnsupported (Ty.con "Int" []) = false := by native_decide
+example : Ty.hasUnsupported (Ty.arrow Ty.unsupported (Ty.con "Int" [])) = true := by native_decide
+-- REGRESSION: an unsupported PATTERN in a match arm must be caught by
+-- `Term.hasUnsupported` (the pattern half of every arm is inspected).
+example :
+    Term.hasUnsupported
+      (Term.match_ (Term.lit (Lit.int 1) (Ty.con "Int" []))
+        [(Pattern.unsupported, Term.lit (Lit.int 0) (Ty.con "Int" []))]
+        (Ty.con "Int" [])) = true := by native_decide
+-- A clean match arm is in-fragment.
+example :
+    Term.hasUnsupported
+      (Term.match_ (Term.lit (Lit.int 1) (Ty.con "Int" []))
+        [(Pattern.wild, Term.lit (Lit.int 0) (Ty.con "Int" []))]
+        (Ty.con "Int" [])) = false := by native_decide
 end MarchLean.Syntax.Test
 ```
 
@@ -252,7 +264,18 @@ def Term.ty : Term → Ty
   | .letfn _ _ _ _ _ t | .ite _ _ _ t | .con _ _ t | .tuple _ t
   | .record _ t | .field _ _ _ t | .match_ _ _ t | .unsupported t => t
 
-/-- Is this term (or any subterm/type) out of fragment? -/
+/-- Is this pattern (or any nested sub-pattern) out of fragment? Needed so a
+`Pattern.unsupported` in a match arm cannot slip past `Term.hasUnsupported`
+(that would be a false-accept — the exact bug the escape design prevents). -/
+partial def Pattern.hasUnsupported : Pattern → Bool
+  | .unsupported => true
+  | .con _ args => args.any Pattern.hasUnsupported
+  | .tuple elems => elems.any Pattern.hasUnsupported
+  | .record fs => fs.any (fun (_, p) => p.hasUnsupported)
+  | .as _ p => p.hasUnsupported
+  | .wild | .var _ _ | .lit _ => false
+
+/-- Is this term (or any subterm / sub-pattern / type) out of fragment? -/
 partial def Term.hasUnsupported : Term → Bool
   | .unsupported _ => true
   | t =>
@@ -267,7 +290,9 @@ partial def Term.hasUnsupported : Term → Bool
      | .tuple es _ => es.any Term.hasUnsupported
      | .record fs _ => fs.any (fun (_, e) => e.hasUnsupported)
      | .field r _ _ _ => r.hasUnsupported
-     | .match_ s arms _ => s.hasUnsupported || arms.any (fun (_, e) => e.hasUnsupported)
+     -- BOTH halves of each arm: the pattern AND the body.
+     | .match_ s arms _ =>
+         s.hasUnsupported || arms.any (fun (p, e) => p.hasUnsupported || e.hasUnsupported)
      | _ => false)
 
 /-- Datatype constructor signature (from a `DType` decl). -/
@@ -279,11 +304,23 @@ structure CtorSig where
 
 /-- Declaration (only what the fragment checks; others → `unsupported`). -/
 inductive Decl where
+  -- NOTE decode convention: march's `DFn` carries `params : List`. Map it onto
+  -- this single-`param` shape in the Task-3 decoder by currying extra params
+  -- into nested `Term.lam` in `body` (0-param → `dlet`; if it can't be mapped
+  -- cleanly, decode to `Decl.unsupported` so the file honest-skips, never a
+  -- false accept).
   | dfn (name : String) (param : String) (lin : Lin) (body : Term)
   | dlet (name : String) (rhs : Term)
   | dtype (name : String) (params : List String) (ctors : List CtorSig)
   | unsupported
   deriving Inhabited
+
+/-- Whole-decl out-of-fragment check (used for module-level skip gating). -/
+def Decl.hasUnsupported : Decl → Bool
+  | .unsupported => true
+  | .dfn _ _ _ body => body.hasUnsupported
+  | .dlet _ rhs => rhs.hasUnsupported
+  | .dtype _ _ _ => false   -- carries no terms in the fragment
 
 structure Scheme where
   ids : List Int
