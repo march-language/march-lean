@@ -1,0 +1,104 @@
+name: Conformance
+
+# A0 conformance gate: build march-lean-check (this repo) and march (from the
+# companion --emit-core-ast branch, see TODO below), then run
+# scripts/conformance-harness.sh over march's static-semantics corpus and
+# fail the job on any MISMATCH/ERROR/SKIP/MARCH_SELF_INCONSISTENT.
+on:
+  push:
+    branches: [main]
+    # Also trigger on tag pushes (any ref under refs/tags/) so the
+    # tag-triggered release-asset-upload step below is actually reachable —
+    # `branches` and `tags` filters on the same `push` trigger are
+    # effectively OR'd (a given push is to either a branch or a tag ref, so
+    # this doesn't broaden when the `branches: [main]` job steps 1-4 run,
+    # only adds tag pushes as an additional trigger).
+    tags: ["*"]
+  pull_request:
+
+jobs:
+  conformance:
+    runs-on: ubuntu-24.04
+    # contents: write is only needed for the tag-triggered release-asset
+    # upload step at the end (softprops/action-gh-release); everything else
+    # in this job only reads.
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout march-lean
+        uses: actions/checkout@v4
+
+      # Installs elan + the toolchain pinned in lean-toolchain, then runs
+      # `lake build` (auto-detected; this repo has no Mathlib dependency, so
+      # `use-mathlib-cache: false` skips the (inapplicable) cache-restore
+      # step rather than silently no-op'ing through auto-detection).
+      - name: Install Lean toolchain and build march-lean-check
+        uses: leanprover/lean-action@v1
+        with:
+          use-mathlib-cache: false
+
+      # TODO: repin to a main SHA once the --emit-core-ast PR merges to
+      # march main — this currently points at a feature branch
+      # (claude/emit-core-ast-a0) because --emit-core-ast does not exist on
+      # march's main yet.
+      - name: Checkout march (emit-core-ast-a0 feature branch)
+        uses: actions/checkout@v4
+        with:
+          repository: march-language/march
+          ref: claude/emit-core-ast-a0
+          path: march-checkout
+
+      # --- Mirror of march's own .github/workflows/ci.yml `build` job ---
+      # (one matrix combo — ubuntu-24.04 / ocaml 5.3.0 — is enough here; the
+      # full OS/OCaml matrix is march's own CI's job, not ours).
+      - name: Set up OCaml
+        uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: 5.3.0
+
+      - name: Install march system dependencies
+        working-directory: march-checkout
+        run: |
+          sudo apt-get install -y libbrotli-dev libzstd-dev llvm-dev
+          # libblake3-dev is not available in Ubuntu 24.04; build from source
+          # (matches march's own ci.yml recipe verbatim).
+          git clone --depth 1 https://github.com/BLAKE3-team/BLAKE3.git /tmp/blake3
+          cd /tmp/blake3/c
+          gcc -O2 -shared -fPIC -o libblake3.so \
+            blake3.c blake3_dispatch.c blake3_portable.c \
+            blake3_sse2_x86-64_unix.S blake3_sse41_x86-64_unix.S \
+            blake3_avx2_x86-64_unix.S blake3_avx512_x86-64_unix.S
+          sudo cp libblake3.so /usr/local/lib/libblake3.so
+          sudo cp blake3.h /usr/local/include/blake3.h
+          sudo ldconfig
+
+      - name: Install march OCaml dependencies
+        working-directory: march-checkout
+        run: opam install --deps-only --with-test -y .
+
+      - name: Build march
+        working-directory: march-checkout
+        run: |
+          eval $(opam env)
+          dune build
+
+      - name: Run conformance harness
+        run: |
+          scripts/conformance-harness.sh \
+            --march-bin "$GITHUB_WORKSPACE/march-checkout/_build/default/bin/main.exe" \
+            --corpus-dir "$GITHUB_WORKSPACE/march-checkout/specs/lang/types" \
+            --march-lean-check-bin "$GITHUB_WORKSPACE/.lake/build/bin/march-lean-check"
+
+      # Best-effort: publish the built checker as a release asset on tag
+      # push. Not part of the conformance gate itself (steps above already
+      # ran and passed by the time this executes). Uses
+      # softprops/action-gh-release rather than `gh release upload` because
+      # the latter only uploads to an *existing* release and fails outright
+      # if the pushed tag has no release object yet; this action creates the
+      # release for the tag if needed, which is more robust for a plain tag
+      # push with no separate "cut a release" step in this repo.
+      - name: Upload march-lean-check binary as a release asset
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ github.workspace }}/.lake/build/bin/march-lean-check
