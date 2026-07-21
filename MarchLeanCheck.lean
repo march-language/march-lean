@@ -1,25 +1,41 @@
 import MarchLean.Json
+import MarchLean.Elab
+import MarchLean.Check
+import MarchLean.Linearity
+import Lean.Data.Json
 
 /-!
-# `march-lean-check`
+# `march-lean-check` (A1)
 
-A0's executable entry point: read march's `--emit-core-ast` JSON envelope
-from stdin, echo back its verdict as a process exit code.
+Read march's `--emit-core-ast` `format_version` 2 envelope from stdin and
+independently re-check the accept verdict for the A1 fragment.
 
-Exit code contract (parent plan §5, do not deviate):
-- `0` = accept
-- `1` = reject
-- `2` = skip (unmodeled construct) — **unreachable at A0**: this checker
-  never inspects the AST, so it has no basis on which to produce a skip.
-  Reserved for A1/A2.
-- `3` = internal error (malformed JSON, missing/wrong `format_version`,
-  missing/invalid `verdict`); the error message is written to stderr.
+Exit: 0=accept, 1=reject (a real A1 disagreement), 2=skip (reject-side or
+out-of-fragment), 3=internal error (malformed JSON / wrong version).
 -/
+open Lean (Json)
+
+def run (input : String) : IO UInt32 := do
+  match Json.parse input with
+  | .error e => IO.eprintln s!"invalid JSON: {e}"; pure 3
+  | .ok envelope =>
+    -- version + verdict gate (reuses A0's parser, now requiring version 2)
+    match MarchLean.Json.parseVerdict input with
+    | .error msg => IO.eprintln msg; pure 3
+    | .ok .reject => pure 2                     -- reject side: skip
+    | .ok .accept =>
+      match MarchLean.Elab.decodeModule envelope with
+      | .error e => IO.eprintln s!"decode error: {e}"; pure 3
+      | .ok m =>
+        match MarchLean.Check.checkModule m with
+        | .skip r => IO.eprintln s!"skip: {r}"; pure 2
+        | .reject r => IO.eprintln s!"MISMATCH (types): {r}"; pure 1
+        | .ok =>
+          match MarchLean.Linearity.checkLinearity m with
+          | .skip r => IO.eprintln s!"skip: {r}"; pure 2
+          | .reject r => IO.eprintln s!"MISMATCH (linearity): {r}"; pure 1
+          | .ok => pure 0
 
 def main : IO UInt32 := do
-  let stdin ← IO.getStdin
-  let input ← stdin.readToEnd
-  match MarchLean.Json.parseVerdict input with
-  | .ok .accept => pure 0
-  | .ok .reject => pure 1
-  | .error msg => IO.eprintln msg *> pure 3
+  let input ← (← IO.getStdin).readToEnd
+  run input
