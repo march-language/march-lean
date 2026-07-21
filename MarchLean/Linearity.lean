@@ -43,6 +43,22 @@ namespace MarchLean.Linearity
 
 open MarchLean.Syntax MarchLean.Check
 
+/-- Every name a pattern binds (recursively through `con`/`tuple`/`record`/`as`),
+used by `uses`'s `match_` arm to detect when an arm's pattern SHADOWS the name
+being counted (so uses of that name inside the arm body belong to the
+pattern's own binder, not the outer one). Declared with an explicit `_root_`
+path (rather than plain `Pattern.boundNames`, which — inside this file's
+`namespace MarchLean.Linearity` — would land at `MarchLean.Linearity.Pattern.boundNames`
+and NOT be found by dot notation on a `MarchLean.Syntax.Pattern` value) so
+`p.boundNames` resolves everywhere below. -/
+partial def _root_.MarchLean.Syntax.Pattern.boundNames : Pattern → List String
+  | .var n _ => [n]
+  | .as n p => n :: p.boundNames
+  | .con _ args => args.foldl (fun acc p => acc ++ p.boundNames) []
+  | .tuple elems => elems.foldl (fun acc p => acc ++ p.boundNames) []
+  | .record fs => fs.foldl (fun acc (_, p) => acc ++ p.boundNames) []
+  | .wild | .lit _ | .unsupported => []
+
 /-- Count uses of `name` in a term (occurrences of `Term.var name`). -/
 partial def uses (name : String) : Term → Nat
   | .var n _ _ => if n == name then 1 else 0
@@ -56,7 +72,15 @@ partial def uses (name : String) : Term → Nat
   | .tuple es _ => (es.map (uses name)).foldl (·+·) 0
   | .record fs _ => (fs.map (fun (_, e) => uses name e)).foldl (·+·) 0
   | .field r _ _ _ => uses name r
-  | .match_ s arms _ => uses name s + (arms.map (fun (_, e) => uses name e)).foldl (·+·) 0
+  -- Match arms are mutually exclusive: along any single execution path a
+  -- variable is used (scrutinee count) + (that ONE taken arm's count), so
+  -- linear enforcement must take the MAX over arms, not the sum (a linear var
+  -- used once in each of N arms is valid, not N uses). An arm whose pattern
+  -- SHADOWS `name` (binds it itself) contributes 0 — inner uses there belong
+  -- to the pattern's own binder, not this outer one.
+  | .match_ s arms _ =>
+      uses name s + (arms.map (fun (p, e) =>
+        if (Pattern.boundNames p).contains name then 0 else uses name e)).foldl Nat.max 0
   | .lit _ _ | .unsupported _ => 0
 
 /-- Enforce a binder's linearity given its use count. -/
@@ -136,6 +160,33 @@ def linNever : Module :=
   { decls := [Decl.dfn "f" [("x", Lin.linear)] (Term.lit (Lit.int 1) (Ty.con "Int" []))],
     schemes := [], insts := [] }
 #eval (repr (checkLinearity linNever)) -- expected: CheckResult.reject ...
+
+-- Regression (coordinator review): linear param used once in EACH of two
+-- mutually-exclusive match arms -> ok. Proves the MAX-over-arms fix: along
+-- any single execution path only one arm runs, so this is exactly one use,
+-- not two. Summing (the pre-fix behaviour) would wrongly reject this.
+def linMatchBalanced : Module :=
+  { decls := [Decl.dfn "f" [("x", Lin.linear)]
+      (Term.match_ (Term.lit (Lit.bool true) (Ty.con "Bool" []))
+        [(Pattern.wild, Term.var "x" ⟨"f",1,1,1,2⟩ (Ty.con "Int" [])),
+         (Pattern.wild, Term.var "x" ⟨"f",1,3,1,4⟩ (Ty.con "Int" []))]
+        (Ty.con "Int" []))],
+    schemes := [], insts := [] }
+#eval (repr (checkLinearity linMatchBalanced)) -- expected: CheckResult.ok
+
+-- Regression (coordinator review): a match arm's pattern SHADOWS the outer
+-- linear param `x` (rebinds the same name), and the outer `x` is never used
+-- anywhere else -> the outer binder is genuinely unused -> reject. Proves the
+-- shadow fix: without it, the arm body's use of the shadowing (inner) `x`
+-- would be misattributed to the outer linear param, masking the real
+-- unused-linear-binder bug.
+def linMatchShadowed : Module :=
+  { decls := [Decl.dfn "f" [("x", Lin.linear)]
+      (Term.match_ (Term.lit (Lit.int 0) (Ty.con "Int" []))
+        [(Pattern.var "x" Lin.unrestricted, Term.var "x" ⟨"f",1,1,1,2⟩ (Ty.con "Int" []))]
+        (Ty.con "Int" []))],
+    schemes := [], insts := [] }
+#eval (repr (checkLinearity linMatchShadowed)) -- expected: CheckResult.reject "linear 'x' used 0 times ..."
 
 end MarchLean.Linearity.Test
 
