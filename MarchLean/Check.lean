@@ -141,17 +141,28 @@ partial def asArrow (env : TyEnv) (t : Ty) : Option (Ty × Ty) :=
 
 /-- Peel `fty`'s arrow chain against an N-ary application's `args` left-to-right:
 each successive domain must `tyEq` the corresponding arg's ty, and the final
-codomain (after all args) must `tyEq` the node's `expected` result type. -/
-partial def checkAppChain (env : TyEnv) (expected : Ty) : Ty → List Term → CheckResult
+codomain (after all args) must `tyEq` the node's `expected` result type.
+
+`nonArrowSkip` controls the "callee type is not an arrow" outcome: when the
+callee's type comes from an authoritative instantiation witness (a real function
+type) a non-arrow is a genuine disagreement (`.reject`); but when the callee type
+is a node's own `resolved_ty` and there is NO witness, a non-arrow is exactly the
+operator-result-type quirk (the emitter annotates an operator callee with the
+application's RESULT type), which we cannot verify without a witness → `.skip`,
+never a false `.reject`. Domain/codomain `tyEq` mismatches always `.reject`. -/
+partial def checkAppChain (env : TyEnv) (expected : Ty) (nonArrowSkip : Bool) : Ty → List Term → CheckResult
   | fty, [] =>
       if tyEq env fty expected then .ok
       else .reject s!"application result type {repr (canon env fty)} ≠ node type {repr (canon env expected)}"
   | fty, a :: rest =>
       match asArrow env fty with
       | some (dom, cod) =>
-          if tyEq env dom a.ty then checkAppChain env expected cod rest
+          if tyEq env dom a.ty then checkAppChain env expected nonArrowSkip cod rest
           else .reject s!"application argument type mismatch: fn expects {repr (canon env dom)} but arg is {repr (canon env a.ty)}"
-      | none => .reject s!"applying a non-function of type {repr (canon env fty)}"
+      | none =>
+          if nonArrowSkip then
+            .skip s!"callee has a non-arrow (result-type) annotation {repr (canon env fty)} and no instantiation witness; cannot verify"
+          else .reject s!"applying a non-function of type {repr (canon env fty)}"
 
 /-- Peel exactly `n` arrows off `t`, returning the remaining codomain. Used to
 recover a lambda's body type from its N-ary function `resolved_ty`. -/
@@ -260,12 +271,15 @@ partial def checkTerm (env : TyEnv) (m : Module) (insts : List Instantiation) : 
             match insts.find? (fun i => i.useSpan == span) with
             | some inst =>
                 match m.schemes.find? (fun s => s.ids == inst.ids) with
-                | some sch => checkAppChain env ty (substTy (sch.ids.zip inst.args) sch.body) args
+                -- Authoritative witness type: a non-arrow here is a genuine disagreement.
+                | some sch => checkAppChain env ty false (substTy (sch.ids.zip inst.args) sch.body) args
                 | none => .skip s!"no scheme for instantiation at {repr span}"
-            | none => checkAppChain env ty f.ty args   -- monomorphic identifier: rty is the arrow
+            -- No witness: the callee's own `resolved_ty` is unreliable for operators
+            -- (result-type quirk), so a non-arrow head is skip-not-reject.
+            | none => checkAppChain env ty true f.ty args
         | _ =>
             (checkTerm env m insts f).andThen fun _ =>
-              checkAppChain env ty f.ty args
+              checkAppChain env ty true f.ty args
   | .lam params body ty =>
       (checkTerm env m insts body).andThen fun _ =>
         -- One arrow per param off the node's own type; body.ty == the remainder.
