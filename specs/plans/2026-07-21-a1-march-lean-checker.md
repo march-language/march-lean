@@ -856,8 +856,24 @@ partial def uses (name : String) : Term → Nat
   | .tuple es _ => (es.map (uses name)).foldl (·+·) 0
   | .record fs _ => (fs.map (fun (_, e) => uses name e)).foldl (·+·) 0
   | .field r _ _ _ => uses name r
-  | .match_ s arms _ => uses name s + (arms.map (fun (_, e) => uses name e)).foldl (·+·) 0
+  -- Match arms are mutually exclusive (per-path), and an arm's PATTERN can
+  -- shadow `name`. So: skip an arm whose pattern binds `name`, and take MAX
+  -- (not sum) over arms — a linear var used once per branch is valid, and max
+  -- avoids false-rejecting it. (Under-counting a branch-unbalanced misuse is
+  -- harmless on A1's accept-only side.)
+  | .match_ s arms _ =>
+      uses name s + (arms.map (fun (p, e) =>
+        if (Pattern.boundNames p).contains name then 0 else uses name e)).foldl Nat.max 0
   | .lit _ _ | .unsupported _ => 0
+
+/-- Names a pattern binds (for shadowing in `uses`). -/
+partial def Pattern.boundNames : Pattern → List String
+  | .var n _ => [n]
+  | .as n p => n :: p.boundNames
+  | .con _ args => args.foldl (fun acc p => acc ++ p.boundNames) []
+  | .tuple elems => elems.foldl (fun acc p => acc ++ p.boundNames) []
+  | .record fs => fs.foldl (fun acc (_, p) => acc ++ p.boundNames) []
+  | .wild | .lit _ | .unsupported => []
 
 /-- Enforce a binder's linearity given its use count. -/
 def enforce (name : String) (l : Lin) (n : Nat) : CheckResult :=
