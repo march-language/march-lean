@@ -147,12 +147,17 @@ top-level witness tables appear.**
 }
 ```
 
-- **`"resolved_ty"` on `module` nodes.** Each expression node (and
-  binder/param/pattern node that carries a type) gains `"resolved_ty":
-  <ty-json>` — the resolved type from `type_map`, or `null` where none was
-  recorded. Distinct key from the surface `"ty"` annotation `ast_json` already
-  emits (`param`/`binding`/`field` nodes carry a surface `"ty"`; the resolved
-  type is additional). **`EVar`/`EField` have no node-level span** — their span
+- **`"resolved_ty"` on `module` nodes.** Each **expression** node gains
+  `"resolved_ty": <ty-json>` — the resolved type from `type_map`, or `null`
+  where none was recorded. Distinct key from the surface `"ty"` annotation
+  `ast_json` already emits. **As built, `resolved_ty` is attached to
+  expression nodes only — NOT to `param`/`pattern`/`binding` nodes** (those
+  carry only their surface `"ty"`, often absent). This is sufficient: the
+  consumer reads a lambda parameter's type from the domain of the enclosing
+  lambda node's `resolved_ty` (a `TArrow`), and a `let`-binder's monomorphic
+  type from its rhs expression's `resolved_ty`; a polymorphic binder's scheme
+  is in the `schemes` table. The Lean checker must derive binder types this
+  way rather than expecting a field on the pattern/param. **`EVar`/`EField` have no node-level span** — their span
   lives inside the nested `name` object (`span_of_expr (EVar) = name.span`), so
   both the `resolved_ty` join and the instantiation `use_span` key off
   `name.span`, not a fabricated node span. **Generalized let binders:** the
@@ -194,12 +199,19 @@ top-level witness tables appear.**
   *not* in `user_ast`) — uniformly, keyed by `ids`. Each entry carries `ids`
   (the ∀-quantified list, already materialized as `Poly`'s first field —
   `typecheck.ml:859` — no traversal), `constraints` (the scheme's constraint
-  list — `CNum`/`COrd`/`CEq` etc., appended to `pending_constraints` at
-  `instantiate` time, `typecheck.ml:894-901`; **emitted so Lean can verify
-  Num/Eq/Ord discharge**, which §0 puts in-fragment), `body`, and a `source`
-  tag (binder-span / builtin-name / stdlib-name — diagnostic only; the
-  functional join is `ids`). A scheme carrying a **`CInterface`** constraint
-  (user typeclass) is out-of-fragment → its presence is a skip trigger.
+  list, appended to `pending_constraints` at `instantiate` time; **emitted so
+  Lean can verify Num/Eq/Ord discharge**, which §0 puts in-fragment), `body`,
+  and a `source` tag (binder-span / builtin-name / stdlib-name — diagnostic
+  only; the functional join is `ids`).
+  **Constraint taxonomy — verified against the real emitter (do not assume):**
+  march's `constraint_` type is `CNum | COrd | CInterface(name,ty) | CADTBound
+  | CTNatBound` — there is **no `CEq`**, and in practice the primitive
+  numeric/equality/ordering constraints are emitted as **`CInterface "Num"` /
+  `CInterface "Eq"` / `CInterface "Ord"`**, not as `CNum`/`COrd`. So "in
+  fragment" is determined by the CInterface *name*: `Num`/`Eq`/`Ord` are the
+  in-fragment primitive classes; a `CInterface` with any OTHER name is a
+  genuine user typeclass and IS the skip trigger. A blanket "any `CInterface`
+  ⇒ skip" is wrong and would gut the arithmetic/comparison fragment.
 
 - **`"instantiations"` table** — one entry per polymorphic use site. `use_span`
   = the `EVar`/`EField` `name.span`; `ids` is the join key back to `schemes`
@@ -268,9 +280,11 @@ Remove the POC proof modules (decision #4). New structure:
     equality only** — substitute `args` for `ids` in the scheme `body`, check
     it equals the use-site `resolved_ty`; no unification, no matching;
   - each scheme's `constraints` are satisfied by the corresponding `args` for
-    the classes A1 models (`Num`/`Eq`/`Ord` over primitive types — §0
-    in-fragment). A scheme carrying a `CInterface` (user-typeclass) constraint
-    ⇒ skip.
+    the classes A1 models. These arrive as `CInterface "Num"|"Eq"|"Ord"` (see
+    §2 — march has no `CEq` and emits primitives via `CInterface`), which are
+    in-fragment and checked over primitive types; a `CInterface` with any
+    OTHER name is a genuine user typeclass ⇒ skip. (Do NOT blanket-skip on
+    `CInterface`.)
   - **Type equality is not raw structural equality.** Lean must canonicalize
     before comparing: a named record `TCon("Foo",[])` and its structural
     `TRecord{…}` form denote the same type but `repr` does *not* expand names
@@ -289,7 +303,8 @@ Remove the POC proof modules (decision #4). New structure:
   2. `verdict == "reject"` ⇒ exit 2 (skip; A1 doesn't model reject).
   3. `verdict == "accept"` ⇒ decode `module` + witnesses.
   4. **any `unsupported` construct anywhere in the file (a node, a subterm, a
-     type, or a `CInterface`-bearing scheme) ⇒ exit 2 (whole-file skip).** Skip
+     type, or a scheme carrying a non-`Num`/`Eq`/`Ord` `CInterface`) ⇒ exit 2
+     (whole-file skip).** Skip
      granularity is per-file, not per-node: partial checking of a file with an
      out-of-fragment subterm risks false accepts, and the corpus is structured
      one-feature-per-file (INDEX.md), so whole-file skip aligns with how the

@@ -21,7 +21,7 @@
 
 - **Exit contract (unchanged from A0):** 0=accept, 1=reject, 2=skip, 3=error. A1 makes 1 and 2 reachable.
 - **`format_version` hard cutover:** require version `2`; any other version → exit 3. (Update A0's `Json.lean` accordingly.)
-- **Whole-file skip granularity:** *any* `unsupported` construct anywhere (node, subterm, type, or a `CInterface`-bearing scheme) ⇒ exit 2 for the whole file. Never partially check.
+- **Whole-file skip granularity:** *any* `unsupported` construct anywhere (node, subterm, type, or a scheme carrying a `CInterface` whose name is NOT one of the in-fragment primitive classes `Num`/`Eq`/`Ord`) ⇒ exit 2 for the whole file. Never partially check. NOTE: `CInterface "Num"|"Eq"|"Ord"` are IN fragment (march emits primitive numeric/eq/ord discharge this way — there is no `CNum`/`COrd`/`CEq` on the wire for these) and must NOT trigger a skip.
 - **Reject side = skip:** `verdict == "reject"` ⇒ exit 2, unconditionally (A1 does not model rejection).
 - **No Mathlib dependency** — keep `lakefile.toml` free of it so CI needs no Mathlib cache.
 - **The JSON shape is defined by the emitter plan Task 1** (`ty` encoding: `TCon`/`TArrow`/`TTuple`/`TRecord`/`TVar`/`TLin`/`TNat`/`TNatOp`/`unsupported`/`TError`; scheme = `{ids,constraints,body}`; instantiation = `{use_span,ids,args}`). Decode it verbatim.
@@ -489,7 +489,9 @@ git commit -m "feat(marchlean): format_version 2 envelope decoder (A1 Task 3)"
 
 **Interfaces:**
 - Consumes: `Syntax.*`.
-- Produces: `MarchLean.Check.checkModule : Syntax.Module → CheckResult` where `inductive CheckResult | ok | reject (msg : String) | skip (reason : String)`. `skip` fires on any `unsupported` construct or `CInterface` constraint; `reject` is a genuine A1 disagreement (→ exit 1); `ok` → exit 0.
+- Produces: `MarchLean.Check.checkModule : Syntax.Module → CheckResult` where `inductive CheckResult | ok | reject (msg : String) | skip (reason : String)`. `skip` fires on any `unsupported` construct or a `CInterface` constraint whose name is NOT `Num`/`Eq`/`Ord` (those three are in-fragment — see `checkConstraint`); `reject` is a genuine A1 disagreement (→ exit 1); `ok` → exit 0.
+
+- **Binder/param types are read from the enclosing expression, not a node field.** The emitter attaches `resolved_ty` only to *expression* nodes, not to `param`/`pattern`/`binding` nodes (those carry only the surface `"ty"` annotation, often absent). So when `Check`/`Linearity` needs a binder's type: a lambda parameter's type is the domain of the enclosing `ELam`/lambda node's `resolved_ty` (a `TArrow`); a `let`-binder's monomorphic type is its rhs expression's `resolved_ty`; a polymorphic `let`-binder's scheme is in the `schemes` table. Do NOT expect a `resolved_ty` on a pattern/param — decode it as absent and derive it from the enclosing expr.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -589,20 +591,35 @@ def tyEq (env : TyEnv) (a b : Ty) : Bool := (canon env a).beq (canon env b)
 
 /-- Constraint check for the classes A1 models. Returns none if satisfied,
 some skip-reason if the constraint is out-of-fragment, some reject-reason if
-violated. -/
+violated.
+
+CRITICAL (verified against the real emitter — see design §2 note): march does
+NOT emit a distinct `CEq`, and it emits the primitive `Num`/`Eq`/`Ord`
+constraints as `CInterface "Num"` / `CInterface "Eq"` / `CInterface "Ord"`,
+NOT as `CNum`/`COrd`. So the `.interface` arm MUST switch on the class name:
+`"Num"`/`"Eq"`/`"Ord"` are the in-fragment primitive classes (check them);
+only a `CInterface` with some OTHER name is a genuine user typeclass →
+whole-file skip. A blanket "any `.interface` ⇒ skip" would spuriously skip
+almost every arithmetic/comparison/equality program — gutting the fragment. -/
+def numOk (env : TyEnv) (t : Ty) : Option (Sum String String) :=
+  match canon env t with
+  | .con "Int" [] | .con "Float" [] | .var _ => none
+  | other => some (.inr s!"Num not satisfied by {repr other}")
+def ordOk (env : TyEnv) (t : Ty) : Option (Sum String String) :=
+  match canon env t with
+  | .con "Int" [] | .con "Float" [] | .con "String" [] | .var _ => none
+  | other => some (.inr s!"Ord not satisfied by {repr other}")
+
 def checkConstraint (env : TyEnv) : Constraint → Option (Sum String String)
   -- Sum.inl = skip reason, Sum.inr = reject reason
+  | .interface "Num" t => numOk env t
+  | .interface "Ord" t => ordOk env t
+  | .interface "Eq" _ => none            -- Eq over primitives: accept
   | .interface n _ => some (.inl s!"CInterface {n} (user typeclass) out of fragment")
   | .unsupported => some (.inl "unsupported constraint")
-  | .num t =>
-      match canon env t with
-      | .con "Int" [] | .con "Float" [] | .var _ => none
-      | other => some (.inr s!"Num not satisfied by {repr other}")
-  | .ord t =>
-      match canon env t with
-      | .con "Int" [] | .con "Float" [] | .con "String" [] | .var _ => none
-      | other => some (.inr s!"Ord not satisfied by {repr other}")
-  | .eqC _ => none      -- Eq over primitives: accept (refine as needed)
+  | .num t => numOk env t                -- CNum, if march ever emits it directly
+  | .ord t => ordOk env t                -- COrd, likewise
+  | .eqC _ => none
   | .adtBound _ _ | .tnatBound _ => none
 
 /-- Validate every instantiation against its scheme (joined by ids) and its
