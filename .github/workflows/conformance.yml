@@ -59,7 +59,20 @@ jobs:
       - name: Install march system dependencies
         working-directory: march-checkout
         run: |
-          sudo apt-get install -y libbrotli-dev libzstd-dev llvm-dev
+          # z3: the refinement-type conformance corpus (@types-check, i.e.
+          # exactly the specs/lang/types/{accept,reject} corpus this
+          # workflow's harness runs over) discharges pre/postcondition +
+          # division-safety verification conditions via the `z3` binary on
+          # PATH (lib/refine/solver.ml). Without it, refinement checks
+          # silently no-op — no build failure, just reject/t71-t73 silently
+          # stop being rejected on a runner that lacks z3 (ubuntu-24.04
+          # doesn't ship it by default). Matches march's own main-branch
+          # ci.yml fix (commit 5f4d7dd9, "install z3 so refinement
+          # conformance corpus is checked on Linux") — not yet present on
+          # the claude/emit-core-ast-a0 branch's own ci.yml (it branched
+          # before that fix landed on main), but the dependency is real
+          # regardless of which ci.yml revision we're nominally mirroring.
+          sudo apt-get install -y libbrotli-dev libzstd-dev llvm-dev z3
           # libblake3-dev is not available in Ubuntu 24.04; build from source
           # (matches march's own ci.yml recipe verbatim).
           git clone --depth 1 https://github.com/BLAKE3-team/BLAKE3.git /tmp/blake3
