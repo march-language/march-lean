@@ -158,60 +158,84 @@ partial def eqvTy (bij : IO.Ref (List (Nat × Int))) (env : TyEnv)
           pure (ra && rb)
     | _, _ => pure false
 
+/-- Is `t` (after canon-normalizing and peeling any leading `.lin`
+qualifiers, same normalization `eqvTy` itself applies) an arrow type at
+the top? Used to shape-condition the callee exclusion below — checking
+the ALREADY-canon/peeled shape, not the raw `Ty`, so a `TLin`-wrapped or
+named-record-aliased arrow is still recognized as an arrow. -/
+def isArrowShaped (env : TyEnv) (t : Ty) : Bool :=
+  match unwrapLinTy (canon env t) with
+  | .arrow _ _ => true
+  | _ => false
+
 /-- Every `(span, ty)` pair carried by a `var`/`field` node reachable from
 `t` — the only two `Term` constructors carrying a span (mirrors what
 `Infer.infer` itself records into `ctx.acc`, so this list and A2's
 recorded output are keyed the same way).
 
 `isCallee` marks whether `t` is sitting in the direct callee (`fn`) slot
-of an `EApp`. **Real-sample finding (spurious mismatch fixed before
-committing):** march's emitter annotates a callee `var`/`field` node with
-the APPLICATION's RESULT type, not the callee's own (arrow) type — e.g.
-`p.x + p.y`'s `+` node is annotated `Int` (the sum's type), not
-`Int → Int → Int`, and `n > m`'s `>` node is annotated `Bool`, not
-`Int → Int → Bool` (confirmed directly against `accept_record.json`'s
-`t09_record_literal_field.march` and `accept_if_ord.json`'s `t04_if.march`
-samples). `Check.lean`'s A1 checker already documents and works around
-this exact quirk (design §2: "the callee node's own `resolved_ty` is NOT
-reliably the function type"), always treating an un-witnessed callee's
-non-arrow annotation as `.skip`, never `.reject`. A2 has no instantiation
-witness concept at all in this comparison, so the faithful mirror is: a
-callee-position `var`/`field` span is never a reliable cross-check target
-— it is excluded from the comparison table entirely (not merely
-defaulted to "equal", to keep the intent explicit at the traversal that
-produces the table, rather than folding it into `eqvTy`'s already-distinct
-"no cross-check target" `Ty.unsupported` case). Every other position
-(arguments, branches, bodies, record/tuple elements, ...) is unaffected. -/
-partial def termSpanTys (isCallee : Bool) : Term → List (Span × Ty)
+of an `EApp`. **Real-sample finding, and the fix's shape (tightened after
+review):** march's emitter annotates an OPERATOR's callee `var` node
+(`+`, `>`, `==`, …) with the APPLICATION's RESULT type, not the callee's
+own arrow type — e.g. `p.x + p.y`'s `+` node is annotated `Int` (the
+sum's type), not `Int → Int → Int`, and `n > m`'s `>` node is annotated
+`Bool`, not `Int → Int → Bool` (confirmed directly against
+`accept_record.json`'s `t09_record_literal_field.march` and
+`accept_if_ord.json`'s `t04_if.march` samples). `Check.lean`'s A1 checker
+already documents and works around this exact quirk (design §2: "the
+callee node's own `resolved_ty` is NOT reliably the function type"),
+treating an un-witnessed callee's non-arrow annotation as `.skip`, never
+`.reject`.
+
+An EARLIER version of this fix excluded EVERY callee-position span
+unconditionally — that over-corrected: regular function callees
+(`println`, `int_to_string`, a let-bound polymorphic identifier, a
+user-defined `dfn`) carry a CORRECT `TArrow` `resolved_ty` and are a
+perfectly good cross-check target; blanket-excluding them measured at
+only 16 of 38 real-sample var/field spans (42%) actually being compared,
+thinning the very per-node signal Task 6 exists to provide. The fix is
+now SHAPE-CONDITIONED instead of position-blanket: a callee-position span
+is excluded ONLY when its own `resolved_ty` (canon+`.lin`-peeled,
+`isArrowShaped`) is NOT an arrow — i.e. only the genuine operator-quirk
+case (`Int`/`Bool`/etc. where an arrow was expected) is dropped; a callee
+whose annotation IS an arrow is kept and compared exactly like any other
+occurrence. Every non-callee position (arguments, branches, bodies,
+record/tuple elements, ...) was never affected either way. -/
+partial def termSpanTys (env : TyEnv) (isCallee : Bool) : Term → List (Span × Ty)
   | .lit _ _ => []
-  | .var _ span ty => if isCallee then [] else [(span, ty)]
-  | .app fn args _ => termSpanTys true fn ++ (args.map (termSpanTys false)).foldl (· ++ ·) []
-  | .lam _ body _ => termSpanTys false body
-  | .let_ _ _ rhs body _ => termSpanTys false rhs ++ termSpanTys false body
-  | .letfn _ _ _ fnBody body _ => termSpanTys false fnBody ++ termSpanTys false body
-  | .ite c t e _ => termSpanTys false c ++ termSpanTys false t ++ termSpanTys false e
-  | .con _ args _ => (args.map (termSpanTys false)).foldl (· ++ ·) []
-  | .tuple es _ => (es.map (termSpanTys false)).foldl (· ++ ·) []
-  | .record fs _ => (fs.map (fun (_, e) => termSpanTys false e)).foldl (· ++ ·) []
+  | .var _ span ty =>
+      if isCallee && !isArrowShaped env ty then [] else [(span, ty)]
+  | .app fn args _ =>
+      termSpanTys env true fn ++ (args.map (termSpanTys env false)).foldl (· ++ ·) []
+  | .lam _ body _ => termSpanTys env false body
+  | .let_ _ _ rhs body _ => termSpanTys env false rhs ++ termSpanTys env false body
+  | .letfn _ _ _ fnBody body _ => termSpanTys env false fnBody ++ termSpanTys env false body
+  | .ite c t e _ => termSpanTys env false c ++ termSpanTys env false t ++ termSpanTys env false e
+  | .con _ args _ => (args.map (termSpanTys env false)).foldl (· ++ ·) []
+  | .tuple es _ => (es.map (termSpanTys env false)).foldl (· ++ ·) []
+  | .record fs _ => (fs.map (fun (_, e) => termSpanTys env false e)).foldl (· ++ ·) []
   | .field r _ span ty =>
-      (if isCallee then [] else [(span, ty)]) ++ termSpanTys false r
+      (if isCallee && !isArrowShaped env ty then [] else [(span, ty)]) ++ termSpanTys env false r
   | .match_ scrut arms _ =>
-      termSpanTys false scrut ++ (arms.map (fun (_, body) => termSpanTys false body)).foldl (· ++ ·) []
+      termSpanTys env false scrut ++
+        (arms.map (fun (_, body) => termSpanTys env false body)).foldl (· ++ ·) []
   | .unsupported _ => []
 
 /-- `termSpanTys`, dispatched over one declaration (`dtype` carries no
 terms). A decl's own top-level body is never itself a callee. -/
-def declSpanTys : Decl → List (Span × Ty)
+def declSpanTys (env : TyEnv) : Decl → List (Span × Ty)
   | .dtype .. => []
-  | .dlet _ body => termSpanTys false body
-  | .dfn _ _ body => termSpanTys false body
+  | .dlet _ body => termSpanTys env false body
+  | .dfn _ _ body => termSpanTys env false body
   | .unsupported => []
 
 /-- Every `(span, resolved_ty)` pair for every `var`/`field` node in the
 whole module — the lookup table `inferModule` diffs A2's recorded
-`(span, MTy)` output against. -/
-def moduleSpanTys (m : Module) : List (Span × Ty) :=
-  (m.decls.map declSpanTys).foldl (· ++ ·) []
+`(span, MTy)` output against. `env` is the module's datatype environment
+(the same one `inferModule` already builds via `buildTyEnv`, passed in
+rather than recomputed). -/
+def moduleSpanTys (env : TyEnv) (m : Module) : List (Span × Ty) :=
+  (m.decls.map (declSpanTys env)).foldl (· ++ ·) []
 
 /-- `inferModule m`: A2's independent-inference replacement for A1's
 `Check.checkModule`. `IO CheckResult` (not a pure `CheckResult`) because
@@ -249,7 +273,7 @@ def inferModule (m : Module) : IO CheckResult := do
   | .ok recorded =>
     -- (3) cross-check every recorded var/field node against march's resolved_ty.
     let env := buildTyEnv m.decls
-    let spanTys := moduleSpanTys m
+    let spanTys := moduleSpanTys env m
     for (span, mty) in recorded do
       match spanTys.find? (fun p => p.1 == span) with
       | none => pure ()   -- defensive: no module node carries this span
