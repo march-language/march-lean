@@ -90,12 +90,15 @@ effort.)
    does its own generalization/instantiation). Rationale: no producer change is
    needed, and using the witnesses as inputs would defeat the independence.
 
-5. **Mirror march's defaulting inside the engine.** march defaults unresolved
-   primitive constraints at generalization boundaries (e.g. an unconstrained
-   `Num` metavar → `Int`). A2's engine applies the *same* defaulting policy
-   during inference, so residual inferred types line up with march's rather
-   than being reconciled only at comparison time. Rationale: doing it in the
-   engine keeps the up-to-equivalence comparison simpler and reduces the
+5. **Mirror march's defaulting inside the engine.** A2's engine applies march's
+   *exact* defaulting policy so residual inferred types line up with march's
+   rather than being reconciled only at comparison time. **Verified against
+   march source** (`typecheck.ml` `discharge_constraints`, ~4953–4970): march
+   defaults ONLY an unresolved `Num` metavar → `Int`; an unresolved `Ord`/`Eq`
+   metavar is **left polymorphic** (`COrd unresolved — leave polymorphic`).
+   A blanket "default Num/Ord/Eq all to Int" would be WRONG and would cause
+   spurious mismatches on `Ord`/`Eq`-polymorphic programs. Rationale: doing it
+   in the engine keeps the up-to-equivalence comparison simpler and reduces the
    spurious-diff surface at its source. (Comparison still tolerates metavar
    renaming and record canonicalization; defaulting is handled upstream.)
 
