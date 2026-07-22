@@ -498,6 +498,355 @@ def defaultResiduals (s : Supply) (t : MTy) : InferM Unit := do
   let zt ← zonk s t
   defaultWalk s zt
 
+/-! ## `infer` — Hindley–Milner inference over the whole Core fragment (Task 5)
+
+The engine's payoff: `infer` walks a bare `Syntax.Term` (ignoring march's
+`resolved_ty` annotations entirely — A2 re-derives types independently) and
+produces an inferred `MTy` for each node, destructively solving
+metavariables through `unify` as it goes. `inferModule'` sets up the
+datatype + built-in-operator environment, folds `infer` over the module's
+declarations, and returns the per-`var`/`field`-node `(Span × MTy)` records
+that Task 6 (`Compare`) diffs against march's own computed types.
+
+### Built-in operator/primitive environment
+
+march encodes `+`/`<`/`==`/… and stdlib prelude functions as ordinary
+variables carrying a scheme (`lib/typecheck/typecheck.ml:1195-1290`). Since
+A2 does its own inference it needs the same signatures. The exact names and
+types below are transcribed from that source (not guessed): arithmetic is
+`Num`-constrained (`poly1_num`), ordering/equality use march's interface
+constraints `Ord`/`Eq` (`poly1_iface`, which A2 models with `Class.ord`/
+`Class.eq` — `primSatisfies` already matches march's Int/Float/String and
+Int/Float/String/Bool impl sets), and the prelude conversions/`println` are
+monomorphic. `Unit` is `TTuple []` in march (`t_unit = TTuple []`), so it's
+`MTy.tuple []` here. A `var` whose name is neither a user binder nor a
+built-in `throw`s — that surfaces as an inference failure Task 6 maps to a
+skip (out of fragment), never a false accept. -/
+
+/-- A term-variable environment entry: `let`/`dfn`-bound names carry a
+generalized `Scheme` (instantiated fresh per use); lambda/pattern-bound
+names carry a monotype `MTy` (shared across uses). -/
+inductive EnvEntry where
+  | scheme (sch : Scheme)
+  | mono (t : MTy)
+
+/-- The inference context threaded through `infer`. `term` is the
+term-variable environment (most-recent binding first, so `find?` gives
+shadowing for free); `ctors` maps every constructor name to its `CtorSig`
+(built from the module's `DType` decls); `level` is the current binding
+level (bumped when entering a `let`/`dfn` right-hand side, for level-based
+generalization); `acc` accumulates `(span, MTy)` records for every
+`var`/`field` node (the only `Term` nodes carrying a span); `pending`
+collects `(class, mvar)` constraints raised at each scheme instantiation,
+discharged at module end (mirroring march's `pending_constraints` /
+`discharge_constraints` per-declaration constraint solving). -/
+structure Ctx where
+  term    : List (String × EnvEntry)
+  ctors   : List (String × CtorSig)
+  level   : Nat
+  acc     : IO.Ref (List (Span × MTy))
+  pending : IO.Ref (List (Class × MTy))
+
+def Ctx.lookup (ctx : Ctx) (n : String) : Option EnvEntry :=
+  (ctx.term.find? (fun p => p.1 == n)).map (·.2)
+
+def Ctx.addMono (ctx : Ctx) (n : String) (t : MTy) : Ctx :=
+  { ctx with term := (n, .mono t) :: ctx.term }
+
+def Ctx.addScheme (ctx : Ctx) (n : String) (sch : Scheme) : Ctx :=
+  { ctx with term := (n, .scheme sch) :: ctx.term }
+
+/-- The `MTy` of a literal (march resolves value literals to their primitive
+`TCon`; `Unit` is `TTuple []`). Shared by the `lit` term arm and the `lit`
+pattern arm. -/
+def litMTy : Lit → MTy
+  | .int _   => .con "Int" []
+  | .float _ => .con "Float" []
+  | .str _   => .con "String" []
+  | .bool _  => .con "Bool" []
+  | .unit    => .tuple []
+
+/-- Collect every `Ty.var` id appearing in a resolved type (a `DType`
+constructor signature's type-parameter references). Written as an explicit
+`foldl` accumulation rather than `flatMap` to avoid depending on a specific
+core-library argument order. -/
+partial def tyVars : Ty → List Int
+  | .var i => [i]
+  | .con _ args => args.foldl (fun acc t => acc ++ tyVars t) []
+  | .arrow a b => tyVars a ++ tyVars b
+  | .tuple ts => ts.foldl (fun acc t => acc ++ tyVars t) []
+  | .record fs => fs.foldl (fun acc (_, t) => acc ++ tyVars t) []
+  | .lin _ t => tyVars t
+  | .natOp _ a b => tyVars a ++ tyVars b
+  | .nat _ | .err | .unsupported => []
+
+/-- Translate a `Syntax.Ty` (a `DType` ctor signature's declared type) into
+an `MTy`, replacing each type-parameter `Ty.var i` with its fresh
+metavariable from `subst`. `Ty.err`/`Ty.unsupported` `throw` — an
+out-of-fragment ctor type must fail inference (Task 6 skip), never bind. -/
+partial def tyToMTy (s : Supply) (subst : List (Int × MTy)) : Ty → InferM MTy
+  | .con n args => do pure (.con n (← args.mapM (tyToMTy s subst)))
+  | .arrow a b => do pure (.arrow (← tyToMTy s subst a) (← tyToMTy s subst b))
+  | .tuple ts => do pure (.tuple (← ts.mapM (tyToMTy s subst)))
+  | .record fs => do pure (.record (← fs.mapM (fun (n, t) => do pure (n, ← tyToMTy s subst t))))
+  | .var i =>
+    match subst.find? (fun p => p.1 == i) with
+    | some (_, m) => pure m
+    | none => throw s!"infer: constructor type references unbound type var {i}"
+  | .lin l t => do pure (.lin l (← tyToMTy s subst t))
+  | .nat n => pure (.nat n)
+  | .natOp op a b => do pure (.natOp op (← tyToMTy s subst a) (← tyToMTy s subst b))
+  | .err => throw "infer: constructor type contains a TError"
+  | .unsupported => throw "infer: constructor type is out of fragment"
+
+/-- Instantiate a constructor signature at `level`: allocate one fresh
+metavariable per distinct type-parameter id used across the ctor's argument
+and result types, then translate both under that substitution. Returns the
+(fresh) declared argument types and the (fresh) result type — used by both
+the `con` term arm (unify args, return result) and the `con` pattern arm
+(unify result with the scrutinee, bind the arg patterns). -/
+def instCtor (s : Supply) (level : Nat) (sig : CtorSig) : InferM (List MTy × MTy) := do
+  let ids := (sig.argTys.foldl (fun acc t => acc ++ tyVars t) []) ++ tyVars sig.resultTy
+  let idsU := ids.foldl (fun acc i => if acc.contains i then acc else acc ++ [i]) []
+  let subst ← idsU.mapM (fun i => do pure (i, ← freshMVar s level))
+  let argMTys ← sig.argTys.mapM (tyToMTy s subst)
+  let resMTy ← tyToMTy s subst sig.resultTy
+  pure (argMTys, resMTy)
+
+/-- Like `instantiate`, but also registers each fresh class-constrained
+metavariable onto `ctx.pending` so the constraint is discharged at module
+end (march's `pending_constraints`). This is how operator class constraints
+(`Num`/`Ord`/`Eq`) actually get *checked*: `unify`'s `bindMVar` deliberately
+drops a cell's class list when solving it (that's the Linearity-pass-style
+separation baked into Task 3), so a bare `unify` never rejects `Num Bool`.
+Collecting the instantiated constrained mvars and re-running `requireClass`
+on them after all unification (when they've been solved to concrete types)
+recovers the check exactly where march performs it. -/
+def instantiateRec (s : Supply) (ctx : Ctx) (sch : Scheme) : InferM MTy := do
+  let subst ← sch.vars.mapM (fun id => do
+    let classes := (sch.classes.filter (fun p => p.1 == id)).map (·.2)
+    let fresh ← freshMVar s ctx.level classes
+    for c in classes do ctx.pending.modify (fun l => (c, fresh) :: l)
+    pure (id, fresh))
+  instSubst s subst sch.body
+
+/-- Infer the bindings a pattern introduces, unifying the pattern's implied
+shape against the `expected` scrutinee/sub-term type. `Pattern.var` binds a
+fresh monotype (the `expected` slot); `Pattern.con` looks up the ctor sig,
+instantiates it fresh, unifies its result with `expected`, and recurses into
+the argument patterns against the (fresh) declared argument types;
+`Pattern.unsupported` `throw`s. Returns the accumulated `(name, MTy)`
+bindings for the arm body's environment. -/
+partial def inferPattern (s : Supply) (ctx : Ctx) : Pattern → MTy → InferM (List (String × MTy))
+  | .wild, _ => pure []
+  | .var name _, expected => pure [(name, expected)]
+  | .as name p, expected => do
+      let b ← inferPattern s ctx p expected
+      pure ((name, expected) :: b)
+  | .lit l, expected => do
+      unify s expected (litMTy l)
+      pure []
+  | .con name args, expected => do
+      match ctx.ctors.find? (fun p => p.1 == name) with
+      | none => throw s!"infer: unknown constructor pattern `{name}`"
+      | some (_, sig) => do
+        let (argMTys, resMTy) ← instCtor s ctx.level sig
+        unify s expected resMTy
+        if argMTys.length != args.length then
+          throw s!"infer: constructor pattern `{name}` arity mismatch"
+        let bindss ← (args.zip argMTys).mapM (fun (p, m) => inferPattern s ctx p m)
+        pure (bindss.foldl (· ++ ·) [])
+  | .tuple ps, expected => do
+      let ms ← ps.mapM (fun _ => freshMVar s ctx.level)
+      unify s expected (.tuple ms)
+      let bindss ← (ps.zip ms).mapM (fun (p, m) => inferPattern s ctx p m)
+      pure (bindss.foldl (· ++ ·) [])
+  | .record fs, expected => do
+      let fms ← fs.mapM (fun (n, p) => do pure (n, p, ← freshMVar s ctx.level))
+      unify s expected (.record (fms.map (fun (n, _, m) => (n, m))))
+      let bindss ← fms.mapM (fun (_, p, m) => inferPattern s ctx p m)
+      pure (bindss.foldl (· ++ ·) [])
+  | .unsupported, _ => throw "infer: unsupported pattern (should have been skip-gated)"
+
+/-- Infer the type of a `Term`, threading the arena `s` and context `ctx`.
+One explicit arm per constructor (no wildcard); `.unsupported` `throw`s
+defensively (Task 6's gate removes such nodes before inference runs). Every
+`var`/`field` node records `(span, its inferred MTy)` into `ctx.acc`. -/
+partial def infer (s : Supply) (ctx : Ctx) : Term → InferM MTy
+  | .lit l _ => pure (litMTy l)
+  | .var name span _ => do
+      match ctx.lookup name with
+      | some (.scheme sch) => do
+          let t ← instantiateRec s ctx sch
+          ctx.acc.modify (fun l => (span, t) :: l)
+          pure t
+      | some (.mono t) => do
+          ctx.acc.modify (fun l => (span, t) :: l)
+          pure t
+      | none => throw s!"infer: unbound variable `{name}`"
+  | .app fn args _ => do
+      let fnTy ← infer s ctx fn
+      let argTys ← args.mapM (infer s ctx)
+      let rho ← freshMVar s ctx.level
+      unify s fnTy (argTys.foldr MTy.arrow rho)
+      pure rho
+  | .lam params body _ => do
+      let paramMTys ← params.mapM (fun _ => freshMVar s ctx.level)
+      let ctx' := (params.zip paramMTys).foldl (fun c ((n, _), m) => c.addMono n m) ctx
+      let bTy ← infer s ctx' body
+      pure (paramMTys.foldr MTy.arrow bTy)
+  | .let_ name _ rhs body _ => do
+      -- level-based let-polymorphism: infer the rhs one level deeper, then
+      -- generalize back to the current level (any mvar minted at level+1 is
+      -- quantified; `instantiate` makes fresh copies per use, so nothing
+      -- later mutates the scheme's quantified vars — no generalize-aliasing).
+      let rhsTy ← infer s { ctx with level := ctx.level + 1 } rhs
+      let sch ← generalize s ctx.level rhsTy
+      infer s (ctx.addScheme name sch) body
+  | .letfn name param _ fnBody body _ => do
+      -- march's `ELetFn`: a recursive single-parameter function let. Never
+      -- decodes in practice (A1 confirmed), so this arm is faithful but
+      -- untested. Bind `name` recursively (fresh mvar) and `param` fresh at
+      -- an inner level, infer the arrow, unify with the recursive mvar,
+      -- generalize, then infer the body under the generalized scheme.
+      let lvl := ctx.level + 1
+      let recTy ← freshMVar s lvl
+      let paramTy ← freshMVar s lvl
+      let ctxIn := (ctx.addMono name recTy).addMono param paramTy
+      let fnBodyTy ← infer s { ctxIn with level := lvl } fnBody
+      unify s recTy (.arrow paramTy fnBodyTy)
+      let sch ← generalize s ctx.level recTy
+      infer s (ctx.addScheme name sch) body
+  | .ite c t e _ => do
+      let ct ← infer s ctx c
+      unify s ct (.con "Bool" [])
+      let tt ← infer s ctx t
+      let et ← infer s ctx e
+      unify s tt et
+      pure tt
+  | .con name args _ => do
+      match ctx.ctors.find? (fun p => p.1 == name) with
+      | none => throw s!"infer: unknown constructor `{name}`"
+      | some (_, sig) => do
+        let (argMTys, resMTy) ← instCtor s ctx.level sig
+        if argMTys.length != args.length then
+          throw s!"infer: constructor `{name}` arity mismatch"
+        let inferred ← args.mapM (infer s ctx)
+        (argMTys.zip inferred).forM (fun (d, i) => unify s d i)
+        pure resMTy
+  | .tuple es _ => do pure (.tuple (← es.mapM (infer s ctx)))
+  | .record fs _ => do
+      let fs' ← fs.mapM (fun (n, e) => do pure (n, ← infer s ctx e))
+      pure (.record fs')
+  | .field r name span _ => do
+      let rt ← infer s ctx r
+      match ← reprUnwrap s rt with
+      | .record fs =>
+        match fs.find? (fun p => p.1 == name) with
+        | some (_, ft) => do ctx.acc.modify (fun l => (span, ft) :: l); pure ft
+        | none => throw s!"infer: record has no field `{name}`"
+      | _ => throw s!"infer: field access `.{name}` on a non-record type"
+  | .match_ scrut arms _ => do
+      let scrutTy ← infer s ctx scrut
+      let resTy ← freshMVar s ctx.level
+      for (pat, body) in arms do
+        let binds ← inferPattern s ctx pat scrutTy
+        let ctx' := binds.foldl (fun c (n, m) => c.addMono n m) ctx
+        let bt ← infer s ctx' body
+        unify s resTy bt
+      pure resTy
+  | .unsupported _ => throw "infer: unsupported node (should have been skip-gated)"
+
+/-- Build one poly-1 scheme `∀a[:cls]. build a` by minting a fresh
+metavariable for the quantified var (carrying its class), used for the
+`Num`/`Ord`/`Eq` operator built-ins. -/
+def mkPoly1 (s : Supply) (cls : List Class) (build : MTy → MTy) : InferM Scheme := do
+  let a ← freshMVar s 0 cls
+  let aid := match a with | .mvar i => i | _ => 0
+  pure { vars := [aid], classes := cls.map (fun c => (aid, c)), body := build a }
+
+/-- The built-in operator/prelude environment (see the section doc). Names
+and signatures transcribed from march's `typecheck.ml` builtin env. -/
+def builtins (s : Supply) : InferM (List (String × EnvEntry)) := do
+  let i := MTy.con "Int" []
+  let f := MTy.con "Float" []
+  let b := MTy.con "Bool" []
+  let str := MTy.con "String" []
+  let u := MTy.tuple []
+  let mono (n : String) (t : MTy) : String × EnvEntry := (n, .mono t)
+  let arr := MTy.arrow
+  -- Num-constrained arithmetic: ∀a:Num. a→a→a  (and negate: a→a)
+  let mut out : List (String × EnvEntry) := []
+  for name in ["+", "-", "*", "/"] do
+    out := (name, .scheme (← mkPoly1 s [Class.num] (fun a => arr a (arr a a)))) :: out
+  out := ("negate", .scheme (← mkPoly1 s [Class.num] (fun a => arr a a))) :: out
+  -- Ord-constrained comparisons: ∀a:Ord. a→a→Bool
+  for name in ["<", ">", "<=", ">="] do
+    out := (name, .scheme (← mkPoly1 s [Class.ord] (fun a => arr a (arr a b)))) :: out
+  -- Eq-constrained equality: ∀a:Eq. a→a→Bool
+  for name in ["==", "!="] do
+    out := (name, .scheme (← mkPoly1 s [Class.eq] (fun a => arr a (arr a b)))) :: out
+  pure <| out ++ [
+    -- Monomorphic operators / prelude functions.
+    mono "%"  (arr i (arr i i)),
+    mono "+." (arr f (arr f f)), mono "-." (arr f (arr f f)),
+    mono "*." (arr f (arr f f)), mono "/." (arr f (arr f f)),
+    mono "&&" (arr b (arr b b)), mono "||" (arr b (arr b b)),
+    mono "not" (arr b b),
+    mono "++" (arr str (arr str str)), mono "string_concat" (arr str (arr str str)),
+    mono "string_length" (arr str i),
+    mono "print" (arr str u), mono "println" (arr str u),
+    mono "print_int" (arr i u), mono "print_float" (arr f u),
+    mono "int_to_string" (arr i str), mono "float_to_string" (arr f str),
+    mono "bool_to_string" (arr b str)
+  ]
+
+/-- Infer every declaration of a module, returning the `(span, MTy)` record
+for each `var`/`field` node (Task 6 diffs these against march's computed
+types). Constructors from all `DType` decls are gathered first (so ctor
+references resolve regardless of decl order); the built-in env seeds the
+term environment; then `dfn`/`dlet` decls are folded in order, each binding
+its generalized scheme for later decls. A `dfn` binds its own name
+recursively (self-recursion); a `dlet` value binds non-recursively (march
+value bindings aren't self-referential). At the end, pending class
+constraints are discharged (`requireClass`) and residual `Num` mvars are
+defaulted before zonking the recorded types. -/
+def inferModule' (s : Supply) (m : Module) : InferM (List (Span × MTy)) := do
+  let acc ← IO.mkRef ([] : List (Span × MTy))
+  let pending ← IO.mkRef ([] : List (Class × MTy))
+  let ctors := m.decls.foldl (fun cs d =>
+    match d with
+    | .dtype _ _ cts => cs ++ cts.map (fun c => (c.name, c))
+    | _ => cs) []
+  let bs ← builtins s
+  let mut ctx : Ctx := { term := bs, ctors, level := 0, acc, pending }
+  for d in m.decls do
+    match d with
+    | .dtype .. => pure ()
+    | .dlet name rhs => do
+        let t ← infer s { ctx with level := ctx.level + 1 } rhs
+        let sch ← generalize s ctx.level t
+        ctx := ctx.addScheme name sch
+    | .dfn name params body => do
+        let lvl := ctx.level + 1
+        let recTy ← freshMVar s lvl
+        let paramMTys ← params.mapM (fun _ => freshMVar s lvl)
+        let ctxIn := (params.zip paramMTys).foldl
+          (fun c ((n, _), mt) => c.addMono n mt) (ctx.addMono name recTy)
+        let bodyTy ← infer s { ctxIn with level := lvl } body
+        unify s recTy (paramMTys.foldr MTy.arrow bodyTy)
+        let sch ← generalize s ctx.level recTy
+        ctx := ctx.addScheme name sch
+    | .unsupported => throw "infer: unsupported declaration (should have been skip-gated)"
+  -- Discharge pending class constraints against their now-solved mvars.
+  let pend ← pending.get
+  for (c, t) in pend do requireClass s c t
+  -- Default residual Num mvars, then zonk each recorded node type.
+  let recorded ← acc.get
+  for (_, t) in recorded do defaultResiduals s t
+  let out ← recorded.mapM (fun (sp, t) => do pure (sp, ← zonk s t))
+  pure out.reverse
+
 namespace Test
 open MarchLean.Infer
 
@@ -644,6 +993,114 @@ def runOk (act : InferM Unit) : IO Bool := do
   | .ok stillVar => IO.println s!"default-ord-stays-poly: {stillVar}"
   | .error e => IO.println s!"default-ord-ERROR: {e}"
 -- expected: default-ord-stays-poly: true
+
+/-! ### `infer` hand-built term tests (Task 5)
+
+Committed tests use hand-built `Term`s only — no `IO.FS.readFile` of the
+gitignored `samples/` dir (that broke fresh-checkout CI; see A1 #4). The
+real-sample infer gate runs from the (uncommitted) conformance harness. -/
+
+private def dSpan : Span := ⟨"t", 0, 0, 0, 0⟩
+private def dTy : Ty := Ty.con "Int" []  -- filler; `infer` ignores the `ty` field
+private def freshCtx (s : Supply) (ctors : List (String × CtorSig) := []) : IO Ctx := do
+  pure { term := (← (builtins s).run).toOption.getD [], ctors, level := 0,
+         acc := (← IO.mkRef []), pending := (← IO.mkRef []) }
+
+/- Identity lambda `λx.x` infers to an arrow `?a → ?a` (same mvar both sides). -/
+#eval show IO Unit from do
+  let s ← Supply.new
+  let ctx ← freshCtx s
+  let idLam := Term.lam [("x", .unrestricted)] (Term.var "x" dSpan dTy) dTy
+  match ← (infer s ctx idLam).run with
+  | .ok (.arrow (.mvar a) (.mvar b)) => IO.println s!"id-lam: {a == b}"
+  | .ok _ => IO.println "id-lam-FAIL: wrong shape"
+  | .error e => IO.println s!"id-lam-ERROR: {e}"
+-- expected: id-lam: true
+
+/- Application `(λx.x) 1` infers to `Int`. -/
+#eval show IO Unit from do
+  let s ← Supply.new
+  let ctx ← freshCtx s
+  let idLam := Term.lam [("x", .unrestricted)] (Term.var "x" dSpan dTy) dTy
+  let app := Term.app idLam [Term.lit (.int 1) dTy] dTy
+  match ← (do let t ← infer s ctx app; zonk s t).run with
+  | .ok (.con "Int" []) => IO.println "app-int: true"
+  | .ok _ => IO.println "app-int-FAIL: wrong shape"
+  | .error e => IO.println s!"app-int-ERROR: {e}"
+-- expected: app-int: true
+
+/- Let-poly `let id = λx.x in (id 1, id true)` infers to `(Int, Bool)` —
+`id` is used at two distinct types, which only typechecks if `let`
+generalizes it. -/
+#eval show IO Unit from do
+  let s ← Supply.new
+  let ctx ← freshCtx s
+  let idLam := Term.lam [("x", .unrestricted)] (Term.var "x" dSpan dTy) dTy
+  let useInt := Term.app (Term.var "id" dSpan dTy) [Term.lit (.int 1) dTy] dTy
+  let useBool := Term.app (Term.var "id" dSpan dTy) [Term.lit (.bool true) dTy] dTy
+  let body := Term.tuple [useInt, useBool] dTy
+  let letId := Term.let_ "id" .unrestricted idLam body dTy
+  match ← (do let t ← infer s ctx letId; zonk s t).run with
+  | .ok (.tuple [.con "Int" [], .con "Bool" []]) => IO.println "let-poly: true"
+  | .ok _ => IO.println "let-poly-FAIL: wrong shape"
+  | .error e => IO.println s!"let-poly-ERROR: {e}"
+-- expected: let-poly: true
+
+/- ADT match: `match Red with Red => 1 | Green => 2` over `Color = Red | Green`
+infers to `Int`. -/
+#eval show IO Unit from do
+  let s ← Supply.new
+  let redSig : CtorSig := { name := "Red", argTys := [], resultTy := .con "Color" [] }
+  let greenSig : CtorSig := { name := "Green", argTys := [], resultTy := .con "Color" [] }
+  let ctx ← freshCtx s [("Red", redSig), ("Green", greenSig)]
+  let m := Term.match_ (Term.con "Red" [] dTy)
+    [(Pattern.con "Red" [], Term.lit (.int 1) dTy),
+     (Pattern.con "Green" [], Term.lit (.int 2) dTy)] dTy
+  match ← (do let t ← infer s ctx m; zonk s t).run with
+  | .ok (.con "Int" []) => IO.println "adt-match: true"
+  | .ok _ => IO.println "adt-match-FAIL: wrong shape"
+  | .error e => IO.println s!"adt-match-ERROR: {e}"
+-- expected: adt-match: true
+
+/- ADT match with a constructor argument binder: `Box(a) = Box(a)`,
+`match Box(1) with Box(n) => n` infers to `Int` (the bound `n` has the
+constructor's instantiated argument type). -/
+#eval show IO Unit from do
+  let s ← Supply.new
+  let boxSig : CtorSig := { name := "Box", argTys := [.var 0], resultTy := .con "Box" [.var 0] }
+  let ctx ← freshCtx s [("Box", boxSig)]
+  let m := Term.match_ (Term.con "Box" [Term.lit (.int 1) dTy] dTy)
+    [(Pattern.con "Box" [Pattern.var "n" .unrestricted], Term.var "n" dSpan dTy)] dTy
+  match ← (do let t ← infer s ctx m; zonk s t).run with
+  | .ok (.con "Int" []) => IO.println "adt-bind: true"
+  | .ok _ => IO.println "adt-bind-FAIL: wrong shape"
+  | .error e => IO.println s!"adt-bind-ERROR: {e}"
+-- expected: adt-bind: true
+
+/- Record + field access: `{x = 1, y = "hi"}.x` infers to `Int`. -/
+#eval show IO Unit from do
+  let s ← Supply.new
+  let ctx ← freshCtx s
+  let recd := Term.record [("x", Term.lit (.int 1) dTy), ("y", Term.lit (.str "hi") dTy)] dTy
+  let fld := Term.field recd "x" dSpan dTy
+  match ← (do let t ← infer s ctx fld; zonk s t).run with
+  | .ok (.con "Int" []) => IO.println "record-field: true"
+  | .ok _ => IO.println "record-field-FAIL: wrong shape"
+  | .error e => IO.println s!"record-field-ERROR: {e}"
+-- expected: record-field: true
+
+/- Operator built-in with class enforcement: `1 + 2` infers to `Int`, and
+the pending `Num` constraint discharged via a module-style flow succeeds
+(Num Int). Modeled as a mini `dlet` so `inferModule'`'s discharge runs. -/
+#eval show IO Unit from do
+  let s ← Supply.new
+  let plus := Term.app (Term.var "+" dSpan dTy)
+    [Term.lit (.int 1) dTy, Term.lit (.int 2) dTy] dTy
+  let m : Module := { decls := [.dlet "r" plus], schemes := [], insts := [] }
+  match ← (inferModule' s m).run with
+  | .ok _ => IO.println "op-num-ok: true"
+  | .error e => IO.println s!"op-num-ok-FAIL: {e}"
+-- expected: op-num-ok: true
 
 end Test
 end MarchLean.Infer
