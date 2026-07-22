@@ -521,7 +521,27 @@ Int/Float/String/Bool impl sets), and the prelude conversions/`println` are
 monomorphic. `Unit` is `TTuple []` in march (`t_unit = TTuple []`), so it's
 `MTy.tuple []` here. A `var` whose name is neither a user binder nor a
 built-in `throw`s — that surfaces as an inference failure Task 6 maps to a
-skip (out of fragment), never a false accept. -/
+skip (out of fragment), never a false accept.
+
+### `SKIP:`-marked throws (Task 8b: coverage-gap vs. genuine-mismatch)
+
+`Compare.inferModule` (Task 6/8b) needs to tell apart two different reasons
+`infer` can fail on a march-accepted module: (a) the engine genuinely
+disagrees with march about a type (a real `MISMATCH`), vs. (b) the engine
+simply doesn't model some NAME or CONSTRUCT at all — an unbound identifier
+(a stdlib/cross-module reference this fragment's `builtins` env doesn't
+carry, e.g. `Array.empty`, `List.range`, a qualified `Module.member`) or an
+unknown constructor (e.g. `None`, or any ADT ctor not decoded into
+`ctx.ctors` — always a `DType` gap, never a march type error) — which is a
+coverage gap, not a disagreement, and should `.skip` rather than falsely
+`.reject`. The convention: a throw whose message is prefixed with the
+literal marker `"SKIP: "` is a coverage gap; every other throw is a genuine
+type error and stays a `MISMATCH`. Exactly three sites carry the marker —
+the `var` arm's unbound-variable throw (`infer`) and the two unknown-
+constructor throws (`inferPattern`'s `.con` arm, `infer`'s `.con` arm).
+Every other throw in this file (unify mismatches, arity, occurs-check,
+field-not-found, `requireClass` violations, internal-invariant throws)
+is deliberately left unmarked — see each site's own doc comment. -/
 
 /-- A term-variable environment entry: `let`/`dfn`-bound names carry a
 generalized `Scheme` (instantiated fresh per use); lambda/pattern-bound
@@ -634,9 +654,13 @@ def instantiateRec (s : Supply) (ctx : Ctx) (sch : Scheme) : InferM MTy := do
 shape against the `expected` scrutinee/sub-term type. `Pattern.var` binds a
 fresh monotype (the `expected` slot); `Pattern.con` looks up the ctor sig,
 instantiates it fresh, unifies its result with `expected`, and recurses into
-the argument patterns against the (fresh) declared argument types;
-`Pattern.unsupported` `throw`s. Returns the accumulated `(name, MTy)`
-bindings for the arm body's environment. -/
+the argument patterns against the (fresh) declared argument types — an
+unknown constructor name is a coverage gap, not a type error, so that throw
+carries the `SKIP:` marker (see the module doc, "Task 8b"), routed by
+`Compare.inferModule` to `.skip` rather than `.reject`; `Pattern.unsupported`
+`throw`s (unmarked — defensively unreachable, already skip-gated upstream).
+Returns the accumulated `(name, MTy)` bindings for the arm body's
+environment. -/
 partial def inferPattern (s : Supply) (ctx : Ctx) : Pattern → MTy → InferM (List (String × MTy))
   | .wild, _ => pure []
   | .var name _, expected => pure [(name, expected)]
@@ -648,7 +672,7 @@ partial def inferPattern (s : Supply) (ctx : Ctx) : Pattern → MTy → InferM (
       pure []
   | .con name args, expected => do
       match ctx.ctors.find? (fun p => p.1 == name) with
-      | none => throw s!"infer: unknown constructor pattern `{name}`"
+      | none => throw s!"SKIP: unknown constructor pattern `{name}`"
       | some (_, sig) => do
         let (argMTys, resMTy) ← instCtor s ctx.level sig
         unify s expected resMTy
@@ -671,7 +695,11 @@ partial def inferPattern (s : Supply) (ctx : Ctx) : Pattern → MTy → InferM (
 /-- Infer the type of a `Term`, threading the arena `s` and context `ctx`.
 One explicit arm per constructor (no wildcard); `.unsupported` `throw`s
 defensively (Task 6's gate removes such nodes before inference runs). Every
-`var`/`field` node records `(span, its inferred MTy)` into `ctx.acc`. -/
+`var`/`field` node records `(span, its inferred MTy)` into `ctx.acc`. The
+`var` arm's unbound-name throw and the `con` arm's unknown-constructor throw
+carry the `SKIP:` marker (module doc, "Task 8b") — an unmodeled name/ctor is
+a coverage gap, not a type disagreement, so `Compare.inferModule` routes it
+to `.skip` instead of `.reject`. -/
 partial def infer (s : Supply) (ctx : Ctx) : Term → InferM MTy
   | .lit l _ => pure (litMTy l)
   | .var name span _ => do
@@ -683,7 +711,7 @@ partial def infer (s : Supply) (ctx : Ctx) : Term → InferM MTy
       | some (.mono t) => do
           ctx.acc.modify (fun l => (span, t) :: l)
           pure t
-      | none => throw s!"infer: unbound variable `{name}`"
+      | none => throw s!"SKIP: unbound variable `{name}`"
   | .app fn args _ => do
       let fnTy ← infer s ctx fn
       let argTys ← args.mapM (infer s ctx)
@@ -743,7 +771,7 @@ partial def infer (s : Supply) (ctx : Ctx) : Term → InferM MTy
       pure tt
   | .con name args _ => do
       match ctx.ctors.find? (fun p => p.1 == name) with
-      | none => throw s!"infer: unknown constructor `{name}`"
+      | none => throw s!"SKIP: unknown constructor `{name}`"
       | some (_, sig) => do
         let (argMTys, resMTy) ← instCtor s ctx.level sig
         if argMTys.length != args.length then

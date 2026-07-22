@@ -236,6 +236,12 @@ rather than recomputed). -/
 def moduleSpanTys (env : TyEnv) (m : Module) : List (Span × Ty) :=
   (m.decls.map (declSpanTys env)).foldl (· ++ ·) []
 
+/-- The Task 8b coverage-gap marker: `Infer.lean` prefixes exactly its
+unbound-variable and unknown-constructor throws with this literal string
+(see `Infer`'s module doc, "Task 8b"). Any other inference throw is a
+genuine type disagreement and does not carry it. -/
+def skipMarker : String := "SKIP: "
+
 /-- `inferModule m`: A2's independent-inference replacement for A1's
 `checkModule`. `IO CheckResult` (not a pure `CheckResult`) because
 `Infer.inferModule'` runs in `IO` (the `Supply` metavariable arena is
@@ -248,9 +254,16 @@ with `checkModule` / `Linearity.checkLinearity`.
    or any scheme carrying a `CInterface` constraint that is not
    `Num`/`Eq`/`Ord` (`Result.constraintOutOfFragment` — same judgment call
    A1 used, shared rather than re-derived).
-2. Run `Infer.inferModule'` in `IO`; a `throw` (a genuine inference
-   failure — march accepted this AST but A2's independent engine cannot
-   type it) is `.reject`.
+2. Run `Infer.inferModule'` in `IO`; a `throw` is either a genuine
+   inference failure (march accepted this AST but A2's independent engine
+   disagrees on a TYPE — `.reject`) or a coverage gap (the engine simply
+   doesn't model some NAME or CONSTRUCT the module references — `.skip`,
+   never a false `MISMATCH`). The two are told apart by the `SKIP:` marker
+   prefix `Infer.lean` puts on exactly its unbound-variable and unknown-
+   constructor throws (Task 8b; see `Infer`'s module doc, "Task 8b" — every
+   other throw there, e.g. a `unify` shape clash, arity mismatch, occurs
+   check, or `requireClass` violation, is a genuine type error and stays
+   unmarked).
 3. For every recorded `(span, MTy)`, look up that node's `resolved_ty`
    (`moduleSpanTys`) and `eqvTy` them (fresh per-node bijection); any
    disagreement is `.reject`.
@@ -268,7 +281,13 @@ def inferModule (m : Module) : IO CheckResult := do
   -- (2) run the independent inference engine.
   let s ← Supply.new
   match ← (inferModule' s m).run with
-  | .error e => return .reject s!"MISMATCH (infer): {e}"
+  | .error e =>
+    -- (2b) Task 8b: an unmodeled name/constructor is a coverage gap, not a
+    -- type disagreement — route it to `.skip` instead of a false `.reject`.
+    if e.startsWith skipMarker then
+      return .skip s!"out of modeled fragment: {e}"
+    else
+      return .reject s!"MISMATCH (infer): {e}"
   | .ok recorded =>
     -- (3) cross-check every recorded var/field node against march's resolved_ty.
     let env := buildTyEnv m.decls
@@ -363,5 +382,52 @@ private def mRejectInfer : Module := { decls := [.dlet "z" badAppTerm], schemes 
   let r ← inferModule mRejectInfer
   IO.println s!"reject-infer-case: {repr r}"
 -- expected: reject-infer-case: CheckResult.reject "MISMATCH (infer): ..."
+
+/-! ### Task 8b: unmodeled name/constructor ⇒ `.skip`, genuine type error ⇒ `.reject`
+
+The exploratory corpus run found several march-accepted files where A2's
+`infer` throws not because it disagrees with march about a type, but
+because the engine simply doesn't model some referenced NAME (a stdlib/
+cross-module identifier like `Array.empty` or `List.range`) or CONSTRUCT
+(an unknown constructor like `None`). Those are engine coverage gaps, not
+real disagreements, and must `.skip` rather than falsely `.reject`. The two
+tests below pin both sides of that classification using hand-built modules
+(no `IO.FS.readFile` of the gitignored `samples/` dir): an unbound-variable
+reference must `.skip`; `mRejectInfer` above (applying a non-function)
+already pins that a genuine type error still `.reject`s — the second test
+below adds a distinct genuine-type-error shape (a `let` annotation that
+contradicts its rhs) for extra coverage of that side of the boundary. -/
+
+/-- `z = undefinedName` — `undefinedName` is neither a user binder nor a
+built-in, so `infer`'s `var` arm throws its `SKIP:`-marked "unbound
+variable" error. `Compare.inferModule` must route this to `.skip`
+("out of modeled fragment: ..."), NOT `.reject` — march may well have
+accepted this program via a stdlib/cross-module name A2 simply has no
+model for; that's a coverage gap, not a disagreement. -/
+private def unboundVarTerm : Term := Term.var "undefinedName" dSpan dTy0
+private def mSkipUnbound : Module :=
+  { decls := [.dlet "z" unboundVarTerm], schemes := [], insts := [] }
+
+#eval show IO Unit from do
+  let r ← inferModule mSkipUnbound
+  IO.println s!"skip-unbound-case: {repr r}"
+-- expected: skip-unbound-case: CheckResult.skip "out of modeled fragment: SKIP: unbound variable `undefinedName`"
+
+/-- `let x : Int = true in x` — a genuine type error: the binding
+annotation `Int` contradicts the rhs literal `true : Bool`, so `infer`'s
+`let_` arm's `unify (rhsTy) (annotTy)` throws an UNMARKED (no `SKIP:`
+prefix) unification-mismatch error. This must stay `.reject
+"MISMATCH (infer): ..."` — it is a real disagreement about a type, not an
+unmodeled name/constructor, and must never be misclassified as a skip. -/
+private def badAnnotLet : Term :=
+  Term.let_ "x" .unrestricted (some (Ty.con "Int" []))
+    (Term.lit (.bool true) dTy0) (Term.var "x" dSpan dTy0) dTy0
+private def mRejectAnnotMismatch : Module :=
+  { decls := [.dlet "z" badAnnotLet], schemes := [], insts := [] }
+
+#eval show IO Unit from do
+  let r ← inferModule mRejectAnnotMismatch
+  IO.println s!"reject-annot-mismatch-case: {repr r}"
+-- expected: reject-annot-mismatch-case: CheckResult.reject "MISMATCH (infer): ..."
 
 end MarchLean.Compare.Test
