@@ -64,7 +64,9 @@ never by re-running unification/inference.
    ite (cond == Bool, both branches == node.ty), con (node.ty
    is the ctor's datatype applied, declared arg types matched under the derived
    param substitution), tuple/record/field (componentwise), lam/let/letfn/match
-   (recurse + result-type agreement), lit (no sub-check).
+   (recurse + result-type agreement), lit (conservative primitive-vs-annotation
+   check — rejects only a definitive primitive contradiction, e.g. int lit
+   annotated Bool; ambiguous/var/unsupported types pass).
 -/
 
 namespace MarchLean.Check
@@ -480,41 +482,9 @@ def sNumBad : Module :=
 end MarchLean.Check.Test
 
 -- THE REAL GATE: decode each committed emitter sample and run `checkModule`.
--- Every ACCEPT sample must be `.ok` or `.skip` — NEVER `.reject` (a well-typed
--- accept program producing a MISMATCH would be a checker false-mismatch bug).
-namespace MarchLean.Check.RealGate
-open Lean MarchLean.Elab MarchLean.Syntax MarchLean.Check
-
-def sampleDir : String := ".superpowers/sdd/samples/"
-
-def acceptSamples : List String := [
-  "accept_literals", "accept_poly", "accept_if_ord", "accept_adt",
-  "accept_record", "accept_linear_let", "accept_linear_param" ]
-
-def checkSampleFile (name : String) : IO CheckResult := do
-  let contents ← IO.FS.readFile (sampleDir ++ name ++ ".json")
-  match Json.parse contents with
-  | .error e => pure (.reject s!"invalid JSON in {name}: {e}")
-  | .ok j =>
-    match decodeModule j with
-    | .error e => pure (.reject s!"decode error in {name}: {e}")
-    | .ok m => pure (checkModule m)
-
-/-- Run the checker on every accept sample and assert none `.reject`s. -/
-def runAcceptGate : IO Unit := do
-  for name in acceptSamples do
-    let r ← checkSampleFile name
-    let tag := match r with
-      | .ok => "OK"
-      | .skip why => s!"SKIP ({why})"
-      | .reject why => s!"REJECT !!! FALSE-MISMATCH BUG: {why}"
-    IO.println s!"{name}: {tag}"
-
-#eval runAcceptGate
-
--- The march-rejected sample, for completeness (not part of the accept gate).
-#eval do
-  let r ← checkSampleFile "reject_int_str"
-  IO.println s!"reject_int_str: {repr r}"
-
-end MarchLean.Check.RealGate
+-- Real-sample accept-gate coverage (every accept sample must be `.ok`/`.skip`,
+-- never `.reject`) lives in `scripts/conformance-harness.sh`, which runs the
+-- whole corpus through the built binary. Build-time `IO.FS.readFile` of the
+-- gitignored sample dir was removed (it broke CI on a fresh checkout). The
+-- synthetic `#eval`s above (sOk/sBad/sSkip/sUserClass/sNumBad) keep the
+-- can-accept / can-reject / can-skip properties covered at build time.

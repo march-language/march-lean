@@ -190,38 +190,9 @@ def linMatchShadowed : Module :=
 
 end MarchLean.Linearity.Test
 
--- THE REAL GATE: decode the two committed linear-use samples and run
--- `checkLinearity`. Both are ACCEPTED march programs whose single linear
--- binder (a `let` in `accept_linear_let`, a fn param in `accept_linear_param`)
--- is used exactly once — so both MUST be `.ok`. A `.reject` here would be a
--- false mismatch (a checker bug), not a genuine finding.
-namespace MarchLean.Linearity.RealGate
-open Lean MarchLean.Elab MarchLean.Syntax MarchLean.Check MarchLean.Linearity
-
-def sampleDir : String := ".superpowers/sdd/samples/"
-
-def linearSamples : List String := ["accept_linear_let", "accept_linear_param"]
-
-def checkSampleFile (name : String) : IO CheckResult := do
-  let contents ← IO.FS.readFile (sampleDir ++ name ++ ".json")
-  match Json.parse contents with
-  | .error e => pure (.reject s!"invalid JSON in {name}: {e}")
-  | .ok j =>
-    match decodeModule j with
-    | .error e => pure (.reject s!"decode error in {name}: {e}")
-    | .ok m => pure (checkLinearity m)
-
-/-- Run the linearity checker on every real linear-use sample and assert
-none `.reject`s. -/
-def runLinearGate : IO Unit := do
-  for name in linearSamples do
-    let r ← checkSampleFile name
-    let tag := match r with
-      | .ok => "OK"
-      | .skip why => s!"SKIP ({why})"
-      | .reject why => s!"REJECT !!! FALSE-MISMATCH BUG: {why}"
-    IO.println s!"{name}: {tag}"
-
-#eval runLinearGate
-
-end MarchLean.Linearity.RealGate
+-- Real linear-use-sample coverage (both accepted single-use linear programs
+-- must be `.ok`) lives in `scripts/conformance-harness.sh` over the full
+-- corpus. Build-time `IO.FS.readFile` of the gitignored sample dir was removed
+-- (it broke CI on a fresh checkout). The synthetic `#eval`s above
+-- (linOnce/linTwice/linNever/linMatchBalanced/linMatchShadowed) keep the
+-- exactly-once / per-branch / shadowing properties covered at build time.
