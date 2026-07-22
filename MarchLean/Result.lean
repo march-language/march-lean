@@ -3,11 +3,11 @@ import MarchLean.Syntax
 /-!
 # `MarchLean.Result`
 
-Shared result type and type-level helpers used by both `MarchLean.Check` (A1's
-verification checker) and `MarchLean.Linearity` (independent use-counting).
-Salvaged out of `Check.lean` so these survive A1's `checkModule` being retired
-in a later task: they depend only on `Syntax`, never on `Check`'s own
-verification logic.
+Shared result type and type-level helpers, originally salvaged out of A1's
+`Check.lean` (now retired) so they would survive `checkModule`'s removal:
+they depend only on `Syntax`, never on `Check`'s own verification logic.
+Used today by `MarchLean.Compare` (A2's inference oracle) and
+`MarchLean.Linearity` (independent use-counting).
 -/
 
 namespace MarchLean.Result
@@ -75,5 +75,15 @@ def ordOk (env : TyEnv) (t : Ty) : Option (Sum String String) :=
   match canon env t with
   | .con "Int" [] | .con "Float" [] | .con "String" [] | .con "Bool" [] | .var _ => none
   | other => some (.inr s!"Ord not satisfied by {repr other}")
+
+/-- Is this scheme constraint out of the checked fragment (a user `CInterface`
+whose name is not `Num`/`Eq`/`Ord`, or an `unsupported` constraint)? Used by
+the whole-file skip gate — shared by A1's `Check.checkModule` and A2's
+`Compare.inferModule`, which apply the same judgment call. -/
+def constraintOutOfFragment : Constraint → Bool
+  | .interface "Num" _ | .interface "Ord" _ | .interface "Eq" _ => false
+  | .interface _ _ => true
+  | .unsupported => true
+  | _ => false
 
 end MarchLean.Result

@@ -1,7 +1,6 @@
 import MarchLean.Syntax
 import MarchLean.Result
 import MarchLean.Infer
-import MarchLean.Check
 
 /-!
 # `MarchLean.Compare`
@@ -9,8 +8,8 @@ import MarchLean.Check
 Up-to-equivalence comparison of A2's independently-inferred types
 (`Infer.MTy`, from `Infer.inferModule'`) against march's own per-node
 `resolved_ty` (`Syntax.Ty`), plus `inferModule : Module → IO CheckResult`,
-the A2 replacement for A1's `Check.checkModule` (Task 7's `main` composes
-directly with this, exactly as it already does with `Check.checkModule` /
+the A2 replacement for A1's `checkModule` (Task 7's `main` composes
+directly with this, exactly as it already did with `checkModule` /
 `Linearity.checkLinearity`).
 
 ## Design
@@ -238,17 +237,17 @@ def moduleSpanTys (env : TyEnv) (m : Module) : List (Span × Ty) :=
   (m.decls.map (declSpanTys env)).foldl (· ++ ·) []
 
 /-- `inferModule m`: A2's independent-inference replacement for A1's
-`Check.checkModule`. `IO CheckResult` (not a pure `CheckResult`) because
+`checkModule`. `IO CheckResult` (not a pure `CheckResult`) because
 `Infer.inferModule'` runs in `IO` (the `Supply` metavariable arena is
 backed by `IO.Ref`s) — this composes directly with `MarchLeanCheck`'s
-already-`IO` `main` (Task 7), exactly as that `main` already composes
-with `Check.checkModule` / `Linearity.checkLinearity` today.
+already-`IO` `main` (Task 7), exactly as that `main` already composed
+with `checkModule` / `Linearity.checkLinearity`.
 
 1. Whole-file skip gate: any out-of-fragment construct in a declaration
    (`Decl.hasUnsupported`, transitively covers every subterm/pattern/type),
    or any scheme carrying a `CInterface` constraint that is not
-   `Num`/`Eq`/`Ord` (reusing A1's `Check.constraintOutOfFragment` — same
-   judgment call, no need to re-derive it).
+   `Num`/`Eq`/`Ord` (`Result.constraintOutOfFragment` — same judgment call
+   A1 used, shared rather than re-derived).
 2. Run `Infer.inferModule'` in `IO`; a `throw` (a genuine inference
    failure — march accepted this AST but A2's independent engine cannot
    type it) is `.reject`.
@@ -264,7 +263,7 @@ def inferModule (m : Module) : IO CheckResult := do
   if m.decls.any Decl.hasUnsupported then
     return .skip "out-of-fragment construct in a declaration"
   -- (1b) skip gate: a scheme carrying a non-Num/Eq/Ord CInterface (as A1).
-  if m.schemes.any (fun sch => sch.constraints.any MarchLean.Check.constraintOutOfFragment) then
+  if m.schemes.any (fun sch => sch.constraints.any constraintOutOfFragment) then
     return .skip "scheme carries an out-of-fragment constraint"
   -- (2) run the independent inference engine.
   let s ← Supply.new
