@@ -226,6 +226,24 @@ git commit -m "feat(infer): MTy + metavars + repr/zonk (A2 Task 2)"
 
 ---
 
+> **⚠️ REPRESENTATION CORRECTION (applies to Tasks 3–6 — read before implementing them).**
+> Task 2's `MTy.mvar (r : IO.Ref MVar)` was found NOT to kernel-check: an
+> inductive cannot hold an `IO.Ref` of itself (strict positivity), and `unsafe`
+> would poison `march-lean-check`. As built (commit `b21465c`), the engine uses
+> the metavar-**arena** technique (the same as Lean's own `Expr.mvar`):
+> - `MTy.mvar (id : Nat)` — a plain id, NOT a ref.
+> - `MVar := unbound (id) (level) (classes) | link (t : MTy)`.
+> - `structure Supply` holds the arena `IO.Ref (Array MVar)` + id counter;
+>   `Supply.new : IO Supply`; `getMVar s id` / `setMVar s id v` read/write it.
+> - **`freshMVar`, `repr`, `zonk` — and therefore `unify`, `generalize`,
+>   `instantiate`, `infer`, and everything downstream — take an explicit
+>   `(s : Supply)` argument** and mutate via `getMVar`/`setMVar` rather than
+>   `r.get`/`r.set`. The code snippets in Tasks 3–6 below were written against
+>   the old `IO.Ref MVar`-in-`MTy` shape; translate each `r.get`→`getMVar s id`,
+>   `r.set v`→`setMVar s id v`, and thread `s` through every signature.
+> **`MarchLean/Infer.lean` in the worktree is the source of truth for the exact
+> API** — read it before writing each task's code.
+
 ## Task 3: `unify` + occurs-check
 
 **Files:**
