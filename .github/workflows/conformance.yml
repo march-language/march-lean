@@ -1,9 +1,15 @@
 name: Conformance
 
-# A0 conformance gate: build march-lean-check (this repo) and march (pinned
+# A1 conformance gate: build march-lean-check (this repo) and march (pinned
 # to a main SHA, see the checkout step below), then run
 # scripts/conformance-harness.sh over march's static-semantics corpus and
-# fail the job on any MISMATCH/ERROR/SKIP/MARCH_SELF_INCONSISTENT.
+# fail the job on any MISMATCH/ERROR/MARCH_SELF_INCONSISTENT/
+# CORPUS_VIOLATION/SKIP-LEDGER-MISMATCH. SKIP itself is expected and
+# frequent at A1 (march-lean-check only independently checks a modeled
+# fragment; scripts/expected-skips.txt tracks exactly which accept-side
+# corpus files are expected to skip, and the harness fails if the observed
+# skip set drifts from it — see that file's header and the harness's own
+# comments for the full rationale).
 on:
   push:
     branches: [main]
@@ -42,14 +48,15 @@ jobs:
           use-mathlib-cache: false
 
       # Pinned to a march main SHA (not the branch) for reproducibility.
-      # --emit-core-ast merged to march main via #55 (merge commit 04d3960d)
-      # on 2026-07-21; this pin is main's tip as of the 0.1.1 version bump,
-      # a few commits later. Bump periodically; no need to chase every push.
+      # v2 emitter (--emit-core-ast's typed-envelope format the A1 checker
+      # decodes) merged to march main via #63 (merge commit 733e7a0b) on
+      # 2026-07-21; this pin is that merge commit itself. Bump periodically;
+      # no need to chase every push.
       - name: Checkout march (main, pinned)
         uses: actions/checkout@v4
         with:
           repository: march-language/march
-          ref: ef18e6d808cc9937709518eb60e63f437c7a6f8a
+          ref: 733e7a0ba80d1bd7626beb5540555bad36047e8b
           path: march-checkout
 
       # --- Mirror of march's own .github/workflows/ci.yml `build` job ---

@@ -6,12 +6,18 @@ import Lean.Data.Json
 A0's verdict-echo parser: reads march's `--emit-core-ast` JSON envelope
 
 ```json
-{"format_version":1,"verdict":"accept"|"reject","diagnostics":[...],"module":{...}}
+{"format_version":2,"verdict":"accept"|"reject","diagnostics":[...],"module":{...}}
 ```
 
 and extracts *only* `format_version` and `verdict`. This module intentionally
-never inspects `"diagnostics"` or `"module"` — those matter for later
-milestones (A1/A2), not A0, which is pure plumbing to prove the pipe works.
+never inspects `"diagnostics"` or `"module"` — those matter for the A1
+checker (see `MarchLean.Elab`'s `decodeModule`), not this module, which is
+pure plumbing to prove the pipe works.
+
+`format_version` must be exactly `2` — the emitter's real `--emit-core-ast`
+output (as of march PR #63) bumped from `1` to `2` when it started attaching
+`resolved_ty`/`schemes`/`instantiations` HM-witness data, which `MarchLean.Elab`
+depends on; a `1`-tagged envelope predates that data and is rejected here.
 -/
 
 namespace MarchLean.Json
@@ -32,7 +38,7 @@ Parse march's `--emit-core-ast` JSON envelope and extract the verdict.
 
 - Fails with `"invalid JSON: ..."` if `input` isn't valid JSON.
 - Fails with `"missing format_version"` / `"unsupported format_version: ..."`
-  if the `format_version` field is absent, not a number, or not equal to `1`.
+  if the `format_version` field is absent, not a number, or not equal to `2`.
 - Fails with `"missing verdict"` / `"unexpected verdict: ..."` if the
   `verdict` field is absent, not a string, or not exactly `"accept"` or
   `"reject"`.
@@ -46,7 +52,7 @@ def parseVerdict (input : String) : Except String Verdict := do
   let version ← match versionJson.getNat? with
     | .ok n => pure n
     | .error _ => throw s!"unsupported format_version: {versionJson.compress}"
-  if version ≠ 1 then
+  if version ≠ 2 then
     throw s!"unsupported format_version: {version}"
   let verdictJson ← match json.getObjVal? "verdict" with
     | .ok v => pure v
@@ -73,31 +79,31 @@ def render : Except String Verdict → String
   | .error e => s!"error {e}"
 
 -- valid accept
-#eval render <| parseVerdict "{\"format_version\":1,\"verdict\":\"accept\",\"diagnostics\":[],\"module\":{}}"
+#eval render <| parseVerdict "{\"format_version\":2,\"verdict\":\"accept\",\"diagnostics\":[],\"module\":{}}"
 -- expected: "ok Verdict.accept" (equivalently `ok accept`)
 
 -- valid reject
-#eval render <| parseVerdict "{\"format_version\":1,\"verdict\":\"reject\",\"diagnostics\":[],\"module\":{}}"
+#eval render <| parseVerdict "{\"format_version\":2,\"verdict\":\"reject\",\"diagnostics\":[],\"module\":{}}"
 -- expected: "ok Verdict.reject"
 
 -- missing format_version
 #eval render <| parseVerdict "{\"verdict\":\"accept\"}"
 -- expected: "error missing format_version"
 
--- wrong format_version
-#eval render <| parseVerdict "{\"format_version\":2,\"verdict\":\"accept\"}"
--- expected: "error unsupported format_version: 2"
+-- wrong format_version (the old v1 envelope shape is now rejected)
+#eval render <| parseVerdict "{\"format_version\":1,\"verdict\":\"accept\"}"
+-- expected: "error unsupported format_version: 1"
 
 -- malformed JSON
 #eval render <| parseVerdict "not json"
 -- expected: "error invalid JSON: ..." (parser-supplied message)
 
 -- missing verdict field
-#eval render <| parseVerdict "{\"format_version\":1}"
+#eval render <| parseVerdict "{\"format_version\":2}"
 -- expected: "error missing verdict"
 
 -- verdict has an unexpected string value
-#eval render <| parseVerdict "{\"format_version\":1,\"verdict\":\"maybe\"}"
+#eval render <| parseVerdict "{\"format_version\":2,\"verdict\":\"maybe\"}"
 -- expected: "error unexpected verdict: maybe"
 
 end MarchLean.Json.Test
