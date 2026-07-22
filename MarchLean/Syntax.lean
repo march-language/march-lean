@@ -48,7 +48,10 @@ partial def Ty.hasUnsupported : Ty → Bool
   | .record fs => fs.any (fun (_, t) => t.hasUnsupported)
   | .lin _ t => t.hasUnsupported
   | .natOp _ a b => a.hasUnsupported || b.hasUnsupported
-  | .var _ | .nat _ | .err => false
+  -- H3: a `TError` should never appear in accept output; if it does, honest-skip
+  -- rather than check a file built on an elaboration error.
+  | .err => true
+  | .var _ | .nat _ => false
 
 /-- Structural type equality (NOT canonical — `Check` canonicalizes named
 records first, then calls this). -/
@@ -210,6 +213,9 @@ open MarchLean.Syntax
 example : Ty.hasUnsupported (Ty.con "Int" []) = false := by native_decide
 -- unsupported propagates through structure.
 example : Ty.hasUnsupported (Ty.arrow Ty.unsupported (Ty.con "Int" [])) = true := by native_decide
+-- H3: `TError` is a skip trigger — a TError anywhere flags the type.
+example : Ty.hasUnsupported Ty.err = true := by native_decide
+example : Ty.hasUnsupported (Ty.tuple [Ty.con "Int" [], Ty.err]) = true := by native_decide
 
 -- Regression for the false-accept bug where `Term.hasUnsupported`'s
 -- `match_` arm discarded the `Pattern` component of each arm, so an

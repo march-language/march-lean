@@ -196,8 +196,10 @@ def checkConstraint (env : TyEnv) : Constraint → Option (Sum String String)
   | .num t => numOk env t
   | .ord t => ordOk env t
   | .eqC _ => none
-  | .adtBound _ _ => none
-  | .tnatBound _ => none
+  -- H2: an ADT/nat bound is not something A1 verifies; honest-skip rather than
+  -- silently auto-satisfy an unchecked bound.
+  | .adtBound n _ => some (.inl s!"CADTBound {n} out of fragment")
+  | .tnatBound _ => some (.inl "CTNatBound out of fragment")
   | .unsupported => some (.inl "unsupported constraint")
 
 /-- Apply a type substitution to a constraint's carried type. -/
@@ -217,6 +219,14 @@ def constraintOutOfFragment : Constraint → Bool
   | .interface _ _ => true
   | .unsupported => true
   | _ => false
+
+/-- H4: does this constraint carry an `unsupported` type anywhere (independently
+of whether its *class* is in-fragment)? A `Num`/`Ord`/`Eq` bound over an
+out-of-fragment type should still make the file honest-skip, so the numeric /
+ordered predicate never runs on a type outside our knowledge. -/
+def constraintCarriesUnsupported : Constraint → Bool
+  | .num t | .ord t | .eqC t | .interface _ t | .adtBound _ t | .tnatBound t => t.hasUnsupported
+  | .unsupported => true
 
 /-- Validate every instantiation against its scheme (joined by `ids`): arity,
 plus each constraint under the instantiation's args. The use-site *equality*
@@ -241,7 +251,33 @@ NO `| _ => .ok` catch-all (that would vacuously accept unmodeled nodes). Post
 skip-gate, no node's `ty` is `Ty.unsupported`, so the structural rules operate
 on real resolved types. -/
 partial def checkTerm (env : TyEnv) (m : Module) (insts : List Instantiation) : Term → CheckResult
-  | .lit _ _ => .ok
+  -- H1: verify a literal's value against its annotation, but CONSERVATIVELY.
+  -- Reject ONLY on a definitive primitive-vs-primitive contradiction; `.ok` on
+  -- any ambiguity (var / unsupported / non-primitive TCon / tuple / record /
+  -- arrow), so this rule can never false-reject a legitimately-typed literal.
+  | .lit l ty =>
+      let ct := canon env ty
+      match l with
+      -- int literals are Num-polymorphic (can resolve to Int OR Float);
+      -- reject only a different concrete primitive.
+      | .int _ =>
+          match ct with
+          | .con "Bool" [] | .con "String" [] => .reject s!"int literal annotated {repr ct}"
+          | _ => .ok
+      | .bool _ =>
+          match ct with
+          | .con "Int" [] | .con "Float" [] | .con "String" [] => .reject s!"bool literal annotated {repr ct}"
+          | _ => .ok
+      | .str _ =>
+          match ct with
+          | .con "Int" [] | .con "Float" [] | .con "Bool" [] => .reject s!"string literal annotated {repr ct}"
+          | _ => .ok
+      | .float _ =>
+          match ct with
+          | .con "Bool" [] | .con "String" [] => .reject s!"float literal annotated {repr ct}"
+          | _ => .ok
+      -- unit's type shape varies; don't risk it.
+      | .unit => .ok
   | .var _ span ty =>
       -- Reached for a var in NON-callee position (a polymorphic *value*). A var
       -- in callee position is handled inline by the `app` arm, which uses the
@@ -376,6 +412,20 @@ def checkModule (m : Module) : CheckResult := Id.run do
     for c in s.constraints do
       if constraintOutOfFragment c then
         return .skip "scheme carries an out-of-fragment constraint"
+  -- (1c) H4: defense-in-depth — skip if a scheme's BODY carries an unsupported
+  -- type, if any constraint's carried type is unsupported, or if an
+  -- instantiation's args include an out-of-fragment type. This prevents a
+  -- false-reject where numOk/ordOk (or a structural rule) would otherwise run
+  -- on an instantiation arg / scheme body outside the A1 fragment.
+  for s in m.schemes do
+    if s.body.hasUnsupported then
+      return .skip "scheme body carries an out-of-fragment type"
+    for c in s.constraints do
+      if constraintCarriesUnsupported c then
+        return .skip "scheme constraint carries an out-of-fragment type"
+  for i in m.insts do
+    if i.args.any Ty.hasUnsupported then
+      return .skip "instantiation carries an out-of-fragment type argument"
   let env := buildTyEnv m.decls
   -- (2/3) instantiation join + arity + constraints.
   match checkInstantiations env m with
