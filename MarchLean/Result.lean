@@ -20,6 +20,19 @@ inductive CheckResult where
   | skip (reason : String)
   deriving Repr, Inhabited
 
+/-- A2's INDEPENDENT verdict on a program, distinct from A1's `CheckResult`:
+`reject` (inference found it ill-typed) is kept separate from `typesDiffer`
+(A2 accepts it as well-typed, but its per-node types disagree with march's
+`resolved_ty`). `MarchLeanCheck` maps these to distinct exit codes (1 vs 4) so
+the harness can tell "A2 rejects the program" apart from "A2 accepts it but
+disagrees on types" — collapsing them would hide a reject-file disagreement. -/
+inductive OracleVerdict where
+  | accept
+  | reject (msg : String)
+  | typesDiffer (msg : String)
+  | skip (reason : String)
+  deriving Repr, Inhabited
+
 /-- Sequence two checks: run the continuation only if the first is `.ok`,
 otherwise short-circuit with the first non-`ok` result. -/
 def CheckResult.andThen : CheckResult → (Unit → CheckResult) → CheckResult

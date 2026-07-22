@@ -7,10 +7,10 @@ import MarchLean.Infer
 
 Up-to-equivalence comparison of A2's independently-inferred types
 (`Infer.MTy`, from `Infer.inferModule'`) against march's own per-node
-`resolved_ty` (`Syntax.Ty`), plus `inferModule : Module → IO CheckResult`,
-the A2 replacement for A1's `checkModule` (Task 7's `main` composes
-directly with this, exactly as it already did with `checkModule` /
-`Linearity.checkLinearity`).
+`resolved_ty` (`Syntax.Ty`), plus `inferModule : Module → IO OracleVerdict`,
+A2's independent accept/reject verdict (the A2-reject two-sided oracle;
+`MarchLeanCheck`'s `run` composes directly with this, mapping the four
+`OracleVerdict` cases plus `Linearity.checkLinearity` to exit codes).
 
 ## Design
 
@@ -242,12 +242,12 @@ unbound-variable and unknown-constructor throws with this literal string
 genuine type disagreement and does not carry it. -/
 def skipMarker : String := "SKIP: "
 
-/-- `inferModule m`: A2's independent-inference replacement for A1's
-`checkModule`. `IO CheckResult` (not a pure `CheckResult`) because
-`Infer.inferModule'` runs in `IO` (the `Supply` metavariable arena is
-backed by `IO.Ref`s) — this composes directly with `MarchLeanCheck`'s
-already-`IO` `main` (Task 7), exactly as that `main` already composed
-with `checkModule` / `Linearity.checkLinearity`.
+/-- `inferModule m`: A2's independent verdict on a module, as an
+`OracleVerdict` (not a pure value) because `Infer.inferModule'` runs in
+`IO` (the `Supply` metavariable arena is backed by `IO.Ref`s) — this
+composes directly with `MarchLeanCheck`'s `run`, which maps each
+`OracleVerdict` case plus `Linearity.checkLinearity`'s result to an exit
+code.
 
 1. Whole-file skip gate: any out-of-fragment construct in a declaration
    (`Decl.hasUnsupported`, transitively covers every subterm/pattern/type),
@@ -255,10 +255,10 @@ with `checkModule` / `Linearity.checkLinearity`.
    `Num`/`Eq`/`Ord` (`Result.constraintOutOfFragment` — same judgment call
    A1 used, shared rather than re-derived).
 2. Run `Infer.inferModule'` in `IO`; a `throw` is either a genuine
-   inference failure (march accepted this AST but A2's independent engine
-   disagrees on a TYPE — `.reject`) or a coverage gap (the engine simply
+   inference failure (A2's independent engine finds the program ill-typed —
+   `.reject`, A2's own reject verdict) or a coverage gap (the engine simply
    doesn't model some NAME or CONSTRUCT the module references — `.skip`,
-   never a false `MISMATCH`). The two are told apart by the `SKIP:` marker
+   never a false reject). The two are told apart by the `SKIP:` marker
    prefix `Infer.lean` puts on exactly its unbound-variable and unknown-
    constructor throws (Task 8b; see `Infer`'s module doc, "Task 8b" — every
    other throw there, e.g. a `unify` shape clash, arity mismatch, occurs
@@ -266,12 +266,13 @@ with `checkModule` / `Linearity.checkLinearity`.
    unmarked).
 3. For every recorded `(span, MTy)`, look up that node's `resolved_ty`
    (`moduleSpanTys`) and `eqvTy` them (fresh per-node bijection); any
-   disagreement is `.reject`.
-4. Otherwise `.ok`.
+   disagreement is `.typesDiffer` (A2 accepts the program as well-typed,
+   but its per-node types disagree with march's `resolved_ty`).
+4. Otherwise `.accept`.
 
 Linearity is checked by a separate pass (`Linearity.checkLinearity`,
-run by Task 7's `main`), not here. -/
-def inferModule (m : Module) : IO CheckResult := do
+run by `MarchLeanCheck`'s `run`), not here. -/
+def inferModule (m : Module) : IO OracleVerdict := do
   -- (1) whole-file skip gate: any out-of-fragment construct anywhere.
   if m.decls.any Decl.hasUnsupported then
     return .skip "out-of-fragment construct in a declaration"
@@ -287,7 +288,7 @@ def inferModule (m : Module) : IO CheckResult := do
     if e.startsWith skipMarker then
       return .skip s!"out of modeled fragment: {e}"
     else
-      return .reject s!"MISMATCH (infer): {e}"
+      return .reject s!"infer: {e}"
   | .ok recorded =>
     -- (3) cross-check every recorded var/field node against march's resolved_ty.
     let env := buildTyEnv m.decls
@@ -300,9 +301,9 @@ def inferModule (m : Module) : IO CheckResult := do
         -- `mty` is already zonked by `inferModule'` (it zonks every recorded
         -- node type before returning); no need to zonk again here.
         if !(← eqvTy bij env mty ty) then
-          return .reject s!"MISMATCH (type) at {repr span}"
+          return .typesDiffer s!"type at {repr span}"
     -- (4) all recorded nodes agree.
-    return .ok
+    return .accept
 
 end MarchLean.Compare
 
@@ -336,7 +337,7 @@ private def mOk : Module := { decls := [.dlet "top" letTermOk], schemes := [], i
 #eval show IO Unit from do
   let r ← inferModule mOk
   IO.println s!"ok-case: {repr r}"
--- expected: ok-case: CheckResult.ok
+-- expected: ok-case: OracleVerdict.accept
 
 /-- Same module, but "id"'s use-site `resolved_ty` structurally contradicts
 what A2 infers (`Bool` instead of an arrow) — a deliberate node-type
@@ -348,7 +349,7 @@ private def mRejectType : Module := { decls := [.dlet "top" letTermBad], schemes
 #eval show IO Unit from do
   let r ← inferModule mRejectType
   IO.println s!"reject-type-case: {repr r}"
--- expected: reject-type-case: CheckResult.reject "MISMATCH (type) at ..."
+-- expected: reject-type-case: OracleVerdict.typesDiffer "type at ..."
 
 /-- A module with an `unsupported` decl forces `.skip`. -/
 private def mSkip : Module := { decls := [.unsupported], schemes := [], insts := [] }
@@ -356,7 +357,7 @@ private def mSkip : Module := { decls := [.unsupported], schemes := [], insts :=
 #eval show IO Unit from do
   let r ← inferModule mSkip
   IO.println s!"skip-case: {repr r}"
--- expected: skip-case: CheckResult.skip ...
+-- expected: skip-case: OracleVerdict.skip ...
 
 /-- A scheme carrying a non-`Num`/`Eq`/`Ord` `CInterface` (a user typeclass)
 also forces `.skip`, before inference is even attempted (as A1). -/
@@ -368,12 +369,12 @@ private def mSkipInterface : Module :=
 #eval show IO Unit from do
   let r ← inferModule mSkipInterface
   IO.println s!"skip-interface-case: {repr r}"
--- expected: skip-interface-case: CheckResult.skip ...
+-- expected: skip-interface-case: OracleVerdict.skip ...
 
-/-- A module march (hypothetically) accepted but that A2's independent
-engine cannot type: applying an `Int` literal as if it were a function.
-`unify` hits its `con`-vs-`arrow` shape mismatch and `throw`s, which
-`inferModule` maps to `.reject "MISMATCH (infer): ..."`. -/
+/-- A module that A2's independent engine cannot type: applying an `Int`
+literal as if it were a function. `unify` hits its `con`-vs-`arrow` shape
+mismatch and `throw`s, which `inferModule` maps to `.reject "infer: ..."`
+— A2's own reject verdict. -/
 private def badAppTerm : Term :=
   Term.app (Term.lit (.int 1) dTy0) [Term.lit (.int 2) dTy0] dTy0
 private def mRejectInfer : Module := { decls := [.dlet "z" badAppTerm], schemes := [], insts := [] }
@@ -381,7 +382,7 @@ private def mRejectInfer : Module := { decls := [.dlet "z" badAppTerm], schemes 
 #eval show IO Unit from do
   let r ← inferModule mRejectInfer
   IO.println s!"reject-infer-case: {repr r}"
--- expected: reject-infer-case: CheckResult.reject "MISMATCH (infer): ..."
+-- expected: reject-infer-case: OracleVerdict.reject "infer: ..."
 
 /-! ### Task 8b: unmodeled name/constructor ⇒ `.skip`, genuine type error ⇒ `.reject`
 
@@ -411,14 +412,14 @@ private def mSkipUnbound : Module :=
 #eval show IO Unit from do
   let r ← inferModule mSkipUnbound
   IO.println s!"skip-unbound-case: {repr r}"
--- expected: skip-unbound-case: CheckResult.skip "out of modeled fragment: SKIP: unbound variable `undefinedName`"
+-- expected: skip-unbound-case: OracleVerdict.skip "out of modeled fragment: SKIP: unbound variable `undefinedName`"
 
 /-- `let x : Int = true in x` — a genuine type error: the binding
 annotation `Int` contradicts the rhs literal `true : Bool`, so `infer`'s
 `let_` arm's `unify (rhsTy) (annotTy)` throws an UNMARKED (no `SKIP:`
-prefix) unification-mismatch error. This must stay `.reject
-"MISMATCH (infer): ..."` — it is a real disagreement about a type, not an
-unmodeled name/constructor, and must never be misclassified as a skip. -/
+prefix) unification-mismatch error. This must stay `.reject "infer: ..."`
+— it is a real disagreement about a type, not an unmodeled name/
+constructor, and must never be misclassified as a skip. -/
 private def badAnnotLet : Term :=
   Term.let_ "x" .unrestricted (some (Ty.con "Int" []))
     (Term.lit (.bool true) dTy0) (Term.var "x" dSpan dTy0) dTy0
@@ -428,6 +429,6 @@ private def mRejectAnnotMismatch : Module :=
 #eval show IO Unit from do
   let r ← inferModule mRejectAnnotMismatch
   IO.println s!"reject-annot-mismatch-case: {repr r}"
--- expected: reject-annot-mismatch-case: CheckResult.reject "MISMATCH (infer): ..."
+-- expected: reject-annot-mismatch-case: OracleVerdict.reject "infer: ..."
 
 end MarchLean.Compare.Test
