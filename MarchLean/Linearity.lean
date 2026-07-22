@@ -1,5 +1,5 @@
 import MarchLean.Syntax
-import MarchLean.Check
+import MarchLean.Result
 
 /-!
 # `MarchLean.Linearity`
@@ -15,12 +15,14 @@ already verified `resolved_ty` consistency; `checkLinearity` only asks "is
 every linear binder used exactly once, and every affine binder used at most
 once, within its scope?". `unrestricted` binders carry no constraint.
 
-Reuses `Check.CheckResult` (`ok`/`reject`/`skip`) so both checks can be
+Reuses `Result.CheckResult` (`ok`/`reject`/`skip`) so both checks can be
 combined by the Task 6 CLI without a second result type.
 
 **N-ary note:** `Term.app` carries `(fn, args : List Term, ty)` and
-`Term.lam`/`Decl.dfn` carry `params : List (String × Lin)` (Task 4's
-N-ary refactor, matching march's `EApp`/`ELam`/`DFn` faithfully). `uses`
+`Term.lam`/`Decl.dfn` carry `params : List (String × Lin × Option Ty)`
+(Task 4's N-ary refactor plus each param's optional surface annotation,
+matching march's `EApp`/`ELam`/`DFn` faithfully). Linearity ignores the
+`Option Ty` annotation entirely (it needs only name + `Lin`). `uses`
 therefore sums over `fn` and every element of `args`; a name is shadowed
 by a `lam`/`dfn` if it appears anywhere in that binder's param list; and
 `enforceParams` enforces EVERY param in the list (not just the first).
@@ -41,7 +43,7 @@ in this task.
 
 namespace MarchLean.Linearity
 
-open MarchLean.Syntax MarchLean.Check
+open MarchLean.Syntax MarchLean.Result
 
 /-- Every name a pattern binds (recursively through `con`/`tuple`/`record`/`as`),
 used by `uses`'s `match_` arm to detect when an arm's pattern SHADOWS the name
@@ -63,9 +65,9 @@ partial def _root_.MarchLean.Syntax.Pattern.boundNames : Pattern → List String
 partial def uses (name : String) : Term → Nat
   | .var n _ _ => if n == name then 1 else 0
   | .app f args _ => uses name f + (args.map (uses name)).foldl (·+·) 0
-  | .lam ps b _ => if ps.any (fun (p, _) => p == name) then 0 else uses name b   -- shadowed
-  | .let_ n _ r b _ => uses name r + (if n == name then 0 else uses name b)
-  | .letfn n p _ fb b _ =>
+  | .lam ps b _ => if ps.any (fun (p, _, _) => p == name) then 0 else uses name b   -- shadowed
+  | .let_ n _ _ r b _ => uses name r + (if n == name then 0 else uses name b)
+  | .letfn n p _ _ fb b _ =>
       (if n == name || p == name then 0 else uses name fb) + (if n == name then 0 else uses name b)
   | .ite c u v _ => uses name c + uses name u + uses name v
   | .con _ args _ => (args.map (uses name)).foldl (·+·) 0
@@ -91,8 +93,8 @@ def enforce (name : String) (l : Lin) (n : Nat) : CheckResult :=
   | .unrestricted => .ok
 
 /-- Enforce every param in a param list against `body`'s use counts. -/
-def enforceParams (ps : List (String × Lin)) (body : Term) : CheckResult :=
-  ps.foldl (fun acc (p, l) => match acc with | .ok => enforce p l (uses p body) | o => o) .ok
+def enforceParams (ps : List (String × Lin × Option Ty)) (body : Term) : CheckResult :=
+  ps.foldl (fun acc (p, l, _) => match acc with | .ok => enforce p l (uses p body) | o => o) .ok
 
 /-- Walk a term enforcing every linear/affine binder it introduces. -/
 partial def checkTerm : Term → CheckResult
@@ -100,13 +102,13 @@ partial def checkTerm : Term → CheckResult
       match enforceParams ps b with
       | .ok => checkTerm b
       | other => other
-  | .let_ n l r b _ =>
+  | .let_ n l _ r b _ =>
       match checkTerm r with
       | .ok => match enforce n l (uses n b) with
                | .ok => checkTerm b
                | other => other
       | other => other
-  | .letfn _ p l fb b _ =>
+  | .letfn _ p l _ fb b _ =>
       match enforce p l (uses p fb) with
       | .ok => match checkTerm fb with | .ok => checkTerm b | o => o
       | other => other
@@ -138,18 +140,18 @@ end MarchLean.Linearity
 
 -- Living tests (executable documentation; run at build time via `#eval`).
 namespace MarchLean.Linearity.Test
-open MarchLean.Syntax MarchLean.Check MarchLean.Linearity
+open MarchLean.Syntax MarchLean.Result MarchLean.Linearity
 
 -- linear param used exactly once -> ok
 def linOnce : Module :=
-  { decls := [Decl.dfn "f" [("x", Lin.linear)]
+  { decls := [Decl.dfn "f" [("x", Lin.linear, none)]
       (Term.var "x" ⟨"f",1,1,1,2⟩ (Ty.con "Int" []))],
     schemes := [], insts := [] }
 #eval (repr (checkLinearity linOnce))  -- expected: CheckResult.ok
 
 -- linear param used twice -> reject
 def linTwice : Module :=
-  { decls := [Decl.dfn "f" [("x", Lin.linear)]
+  { decls := [Decl.dfn "f" [("x", Lin.linear, none)]
       (Term.tuple [Term.var "x" ⟨"f",1,1,1,2⟩ (Ty.con "Int" []),
                    Term.var "x" ⟨"f",1,3,1,4⟩ (Ty.con "Int" [])] (Ty.tuple [Ty.con "Int" [], Ty.con "Int" []]))],
     schemes := [], insts := [] }
@@ -157,7 +159,7 @@ def linTwice : Module :=
 
 -- linear param never used -> reject
 def linNever : Module :=
-  { decls := [Decl.dfn "f" [("x", Lin.linear)] (Term.lit (Lit.int 1) (Ty.con "Int" []))],
+  { decls := [Decl.dfn "f" [("x", Lin.linear, none)] (Term.lit (Lit.int 1) (Ty.con "Int" []))],
     schemes := [], insts := [] }
 #eval (repr (checkLinearity linNever)) -- expected: CheckResult.reject ...
 
@@ -166,7 +168,7 @@ def linNever : Module :=
 -- any single execution path only one arm runs, so this is exactly one use,
 -- not two. Summing (the pre-fix behaviour) would wrongly reject this.
 def linMatchBalanced : Module :=
-  { decls := [Decl.dfn "f" [("x", Lin.linear)]
+  { decls := [Decl.dfn "f" [("x", Lin.linear, none)]
       (Term.match_ (Term.lit (Lit.bool true) (Ty.con "Bool" []))
         [(Pattern.wild, Term.var "x" ⟨"f",1,1,1,2⟩ (Ty.con "Int" [])),
          (Pattern.wild, Term.var "x" ⟨"f",1,3,1,4⟩ (Ty.con "Int" []))]
@@ -181,7 +183,7 @@ def linMatchBalanced : Module :=
 -- would be misattributed to the outer linear param, masking the real
 -- unused-linear-binder bug.
 def linMatchShadowed : Module :=
-  { decls := [Decl.dfn "f" [("x", Lin.linear)]
+  { decls := [Decl.dfn "f" [("x", Lin.linear, none)]
       (Term.match_ (Term.lit (Lit.int 0) (Ty.con "Int" []))
         [(Pattern.var "x" Lin.unrestricted, Term.var "x" ⟨"f",1,1,1,2⟩ (Ty.con "Int" []))]
         (Ty.con "Int" []))],

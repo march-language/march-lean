@@ -1,5 +1,7 @@
 import MarchLean.Json
 import MarchLean.Syntax
 import MarchLean.Elab
-import MarchLean.Check
+import MarchLean.Result
 import MarchLean.Linearity
+import MarchLean.Infer
+import MarchLean.Compare
