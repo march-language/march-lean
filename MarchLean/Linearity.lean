@@ -1,5 +1,5 @@
 import MarchLean.Syntax
-import MarchLean.Check
+import MarchLean.Result
 
 /-!
 # `MarchLean.Linearity`
@@ -15,7 +15,7 @@ already verified `resolved_ty` consistency; `checkLinearity` only asks "is
 every linear binder used exactly once, and every affine binder used at most
 once, within its scope?". `unrestricted` binders carry no constraint.
 
-Reuses `Check.CheckResult` (`ok`/`reject`/`skip`) so both checks can be
+Reuses `Result.CheckResult` (`ok`/`reject`/`skip`) so both checks can be
 combined by the Task 6 CLI without a second result type.
 
 **N-ary note:** `Term.app` carries `(fn, args : List Term, ty)` and
@@ -41,7 +41,7 @@ in this task.
 
 namespace MarchLean.Linearity
 
-open MarchLean.Syntax MarchLean.Check
+open MarchLean.Syntax MarchLean.Result
 
 /-- Every name a pattern binds (recursively through `con`/`tuple`/`record`/`as`),
 used by `uses`'s `match_` arm to detect when an arm's pattern SHADOWS the name
@@ -138,7 +138,7 @@ end MarchLean.Linearity
 
 -- Living tests (executable documentation; run at build time via `#eval`).
 namespace MarchLean.Linearity.Test
-open MarchLean.Syntax MarchLean.Check MarchLean.Linearity
+open MarchLean.Syntax MarchLean.Result MarchLean.Linearity
 
 -- linear param used exactly once -> ok
 def linOnce : Module :=

@@ -1,5 +1,6 @@
 import MarchLean.Syntax
 import MarchLean.Elab
+import MarchLean.Result
 
 /-!
 # `MarchLean.Check`
@@ -72,66 +73,17 @@ never by re-running unification/inference.
 namespace MarchLean.Check
 
 open MarchLean.Syntax
-
-inductive CheckResult where
-  | ok
-  | reject (msg : String)
-  | skip (reason : String)
-  deriving Repr, Inhabited
-
-/-- Sequence two checks: run the continuation only if the first is `.ok`,
-otherwise short-circuit with the first non-`ok` result. -/
-def CheckResult.andThen : CheckResult → (Unit → CheckResult) → CheckResult
-  | .ok, f => f ()
-  | other, _ => other
+open MarchLean.Result
 
 /-- First non-`ok` result in a list, or `.ok` if all are `ok`. -/
 def firstBad (rs : List CheckResult) : CheckResult :=
   rs.foldl (fun acc r => match acc with | .ok => r | bad => bad) CheckResult.ok
-
-/-- Datatype environment: name → (type-param names, constructor sigs). Built
-from `Decl.dtype`; used to canonicalize named types and to type ADT ctors. -/
-abbrev TyEnv := List (String × (List String × List CtorSig))
-
-def buildTyEnv (decls : List Decl) : TyEnv :=
-  decls.foldr (fun d acc =>
-    match d with
-    | .dtype n ps ctors => (n, (ps, ctors)) :: acc
-    | _ => acc) []
 
 /-- Find a constructor by name across all datatypes: returns the owning
 datatype name, its type-param names, and the ctor signature. -/
 def findCtor (env : TyEnv) (name : String) : Option (String × List String × CtorSig) :=
   env.findSome? (fun (dn, params, ctors) =>
     (ctors.find? (fun c => c.name == name)).map (fun c => (dn, params, c)))
-
-/-- Substitute type arguments for quantified ids in a type. -/
-partial def substTy (s : List (Int × Ty)) : Ty → Ty
-  | .var id => match s.lookup id with | some t => t | none => .var id
-  | .con n args => .con n (args.map (substTy s))
-  | .arrow a b => .arrow (substTy s a) (substTy s b)
-  | .tuple ts => .tuple (ts.map (substTy s))
-  | .record fs => .record (fs.map (fun (n, t) => (n, substTy s t)))
-  | .lin l t => .lin l (substTy s t)
-  | .natOp o a b => .natOp o (substTy s a) (substTy s b)
-  | t => t
-
-/-- Canonicalize a type before equality: recurse structurally so nested types
-normalize. Named records would expand to their structural form here, but Task 3
-maps `TDRecord`/aliases to `Decl.unsupported` (skip-gated), so `TCon`s reaching
-this point are nominal (variant ADTs / primitives) and are left as-is (recursing
-into their args). -/
-partial def canon (env : TyEnv) : Ty → Ty
-  | .con n args => .con n (args.map (canon env))
-  | .arrow a b => .arrow (canon env a) (canon env b)
-  | .tuple ts => .tuple (ts.map (canon env))
-  | .record fs => .record (fs.map (fun (n, t) => (n, canon env t)))
-  | .lin l t => .lin l (canon env t)
-  | .natOp o a b => .natOp o (canon env a) (canon env b)
-  | t => t
-
-/-- Canonical type equality (§4). -/
-def tyEq (env : TyEnv) (a b : Ty) : Bool := (canon env a).beq (canon env b)
 
 /-- Decompose a type into `(domain, codomain)` if it is arrow-shaped, peeling
 any leading linearity qualifier (`T ⊸ U` is still an arrow underneath). -/
@@ -174,18 +126,6 @@ partial def peelArrows (env : TyEnv) : Nat → Ty → Option Ty
       match asArrow env t with
       | some (_, cod) => peelArrows env n cod
       | none => none
-
-/-- `Num`: satisfied by numeric primitives (or a still-free var). -/
-def numOk (env : TyEnv) (t : Ty) : Option (Sum String String) :=
-  match canon env t with
-  | .con "Int" [] | .con "Float" [] | .var _ => none
-  | other => some (.inr s!"Num not satisfied by {repr other}")
-
-/-- `Ord`: satisfied by the ordered primitives (or a still-free var). -/
-def ordOk (env : TyEnv) (t : Ty) : Option (Sum String String) :=
-  match canon env t with
-  | .con "Int" [] | .con "Float" [] | .con "String" [] | .con "Bool" [] | .var _ => none
-  | other => some (.inr s!"Ord not satisfied by {repr other}")
 
 /-- Constraint check for the classes A1 models. `none` = satisfied;
 `some (.inl r)` = out-of-fragment (skip); `some (.inr r)` = violated (reject).
