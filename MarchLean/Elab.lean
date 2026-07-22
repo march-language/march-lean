@@ -484,53 +484,10 @@ open Lean MarchLean.Elab MarchLean.Syntax
   decodeTy j : Except String _)
 -- expected: Except.ok Ty.unsupported
 
-/-- The 8 real emitter samples committed to `.superpowers/sdd/samples/`. -/
-def sampleNames : List String := [
-  "accept_literals", "accept_poly", "accept_if_ord", "accept_adt",
-  "accept_record", "accept_linear_let", "accept_linear_param", "reject_int_str" ]
-
-def sampleDir : String := ".superpowers/sdd/samples/"
-
-def decodeSampleFile (name : String) : IO (Except String Syntax.Module) := do
-  let contents ← IO.FS.readFile (sampleDir ++ name ++ ".json")
-  match Json.parse contents with
-  | .error e => pure (.error s!"invalid JSON in {name}: {e}")
-  | .ok j => pure (decodeModule j)
-
--- THE GATE: every real sample must decode with `Except.ok` — no spurious
--- decode error on real emitter output. Unknown/`unsupported` kinds are fine
--- (they degrade to `.unsupported` nodes); only malformed JSON is an error.
--- (Named as an explicit `IO Unit` def, not an inline `#eval do` block, since
--- a bare `#eval do` whose *first* statement is a `for`-loop can't pin down
--- its ambient monad for `ForIn` resolution.)
-def runSampleGate : IO Unit := do
-  for name in sampleNames do
-    let result ← decodeSampleFile name
-    match result with
-    | .ok m => IO.println s!"{name}: ok (decls={m.decls.length}, schemes={m.schemes.length}, insts={m.insts.length})"
-    | .error e => IO.println s!"{name}: DECODE ERROR: {e}"
-
-#eval runSampleGate
-
--- Spot check: accept_poly.json has ≥1 scheme and ≥1 instantiation (it's the
--- let-polymorphism sample; `id`/`const`-shaped schemes are used twice each
--- at different types).
-#eval do
-  let r ← decodeSampleFile "accept_poly"
-  match r with
-  | .ok m => IO.println s!"accept_poly: schemes={m.schemes.length} (expect ≥1) insts={m.insts.length} (expect ≥1)"
-  | .error e => IO.println s!"accept_poly: DECODE ERROR: {e}"
-
--- Spot check: accept_if_ord.json's scheme carries a CInterface "Ord" constraint.
-#eval do
-  let r ← decodeSampleFile "accept_if_ord"
-  match r with
-  | .ok m =>
-      let hasOrd := m.schemes.any (fun s => s.constraints.any (fun c =>
-        match c with
-        | Constraint.interface n _ => n == "Ord"
-        | _ => false))
-      IO.println s!"accept_if_ord: has CInterface \"Ord\" constraint = {hasOrd} (expect true)"
-  | .error e => IO.println s!"accept_if_ord: DECODE ERROR: {e}"
+-- Real-emitter-sample decode coverage lives in `scripts/conformance-harness.sh`
+-- (it pipes `march --emit-core-ast` through `march-lean-check` over the full
+-- corpus). Build-time `IO.FS.readFile` of sample files was removed: the source
+-- must not depend on data files at a relative path (they broke CI on a fresh
+-- checkout — the sample dir is gitignored scratch, not tracked).
 
 end MarchLean.Elab.Test
