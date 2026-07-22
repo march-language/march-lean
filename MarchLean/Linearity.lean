@@ -85,6 +85,33 @@ partial def uses (name : String) : Term → Nat
         if (Pattern.boundNames p).contains name then 0 else uses name e)).foldl Nat.max 0
   | .lit _ _ | .unsupported _ => 0
 
+/-- The outermost linearity qualifier a type carries (`Ty.lin l _`), else
+`unrestricted`. march writes a value's linearity either as a binder keyword
+(`linear let`/`affine` param), as a *type* modifier on the binding's
+annotation (`let c : affine Cap2 = ..`), or — for a call to a function with a
+`linear`/`affine` return type — on the binding's *inferred* type (a plain
+`let h = mk()` where `mk : linear Res` yields `h : linear Res`). Only the first
+form reaches a binder's `Lin` field; the other two live on a `Ty`, so the
+linearity pass must read them off the type to enforce them. -/
+def Ty.outerLin : Ty → Lin
+  | .lin l _ => l
+  | _ => .unrestricted
+
+/-- Effective linearity of a `let_` binding: the binder keyword if it carries
+one, else the annotation's outer qualifier (`let c : affine T = ..`), else the
+rhs's inferred-type outer qualifier (`let h = mk()` with `mk : linear ..`).
+This makes A2 enforce affine-via-annotation (reject/t64) and linear-return
+propagation (reject/t78), which march models but which don't surface on the
+binder's own `Lin` field. -/
+def effLin (binder : Lin) (annot : Option Ty) (rhs : Term) : Lin :=
+  match binder with
+  | .unrestricted =>
+      let fromAnnot := match annot with | some t => Ty.outerLin t | none => .unrestricted
+      match fromAnnot with
+      | .unrestricted => Ty.outerLin rhs.ty
+      | l => l
+  | l => l
+
 /-- Enforce a binder's linearity given its use count. -/
 def enforce (name : String) (l : Lin) (n : Nat) : CheckResult :=
   match l with
@@ -102,9 +129,9 @@ partial def checkTerm : Term → CheckResult
       match enforceParams ps b with
       | .ok => checkTerm b
       | other => other
-  | .let_ n l _ r b _ =>
+  | .let_ n l annot r b _ =>
       match checkTerm r with
-      | .ok => match enforce n l (uses n b) with
+      | .ok => match enforce n (effLin l annot r) (uses n b) with
                | .ok => checkTerm b
                | other => other
       | other => other
@@ -189,6 +216,34 @@ def linMatchShadowed : Module :=
         (Ty.con "Int" []))],
     schemes := [], insts := [] }
 #eval (repr (checkLinearity linMatchShadowed)) -- expected: CheckResult.reject "linear 'x' used 0 times ..."
+
+-- Affine-via-type-annotation, used twice -> reject (reject/t64). The binder's
+-- own `Lin` is `unrestricted` (there is no `affine let` keyword); the affine
+-- lives on the annotation `c : affine Cap2`, so `effLin` must read it off the
+-- annotation type for enforcement to fire.
+def affineAnnotTwice : Module :=
+  { decls := [Decl.dlet "main"
+      (Term.let_ "c" Lin.unrestricted (some (Ty.lin Lin.affine (Ty.con "Cap2" [])))
+        (Term.con "C" [Term.lit (Lit.int 1) (Ty.con "Int" [])] (Ty.con "Cap2" []))
+        (Term.tuple [Term.var "c" ⟨"f",1,1,1,2⟩ (Ty.con "Cap2" []),
+                     Term.var "c" ⟨"f",1,3,1,4⟩ (Ty.con "Cap2" [])] (Ty.tuple []))
+        (Ty.tuple []))],
+    schemes := [], insts := [] }
+#eval (repr (checkLinearity affineAnnotTwice)) -- expected: CheckResult.reject "affine 'c' used 2 times ..."
+
+-- Linear-return propagation: `let h = mk()` where the rhs's inferred type is
+-- `linear Res`, and `h` is never used -> reject (reject/t78). The binder `Lin`
+-- is `unrestricted` and there is no annotation; the linear qualifier lives on
+-- the rhs's resolved type, which `effLin` reads via `Ty.outerLin rhs.ty`.
+def linearReturnUnconsumed : Module :=
+  { decls := [Decl.dlet "main"
+      (Term.let_ "h" Lin.unrestricted none
+        (Term.app (Term.var "mk" ⟨"f",1,1,1,3⟩ (Ty.arrow (Ty.tuple []) (Ty.lin Lin.linear (Ty.con "Res" []))))
+                  [] (Ty.lin Lin.linear (Ty.con "Res" [])))
+        (Term.tuple [] (Ty.tuple []))
+        (Ty.tuple []))],
+    schemes := [], insts := [] }
+#eval (repr (checkLinearity linearReturnUnconsumed)) -- expected: CheckResult.reject "linear 'h' used 0 times ..."
 
 end MarchLean.Linearity.Test
 
