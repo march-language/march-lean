@@ -114,9 +114,15 @@ inductive Term where
   | lit (l : Lit) (ty : Ty)
   | var (name : String) (span : Span) (ty : Ty)
   | app (fn : Term) (args : List Term) (ty : Ty)
-  | lam (params : List (String × Lin)) (body : Term) (ty : Ty)
-  | let_ (name : String) (lin : Lin) (rhs : Term) (body : Term) (ty : Ty)
-  | letfn (name : String) (param : String) (lin : Lin) (fnBody : Term) (body : Term) (ty : Ty)
+  -- Each param carries its optional SURFACE type annotation (`Option Ty`, the
+  -- text the author wrote — `Int` in `fn f(x : Int)`). `Infer` unifies an
+  -- annotated param with its annotation (march-faithful: an annotated binder
+  -- HAS that type by definition); an unannotated param stays inferred.
+  | lam (params : List (String × Lin × Option Ty)) (body : Term) (ty : Ty)
+  -- `annot` is the let-binding's optional surface type annotation (`let x : Int
+  -- = ...`); `Infer` unifies the rhs against it before generalizing.
+  | let_ (name : String) (lin : Lin) (annot : Option Ty) (rhs : Term) (body : Term) (ty : Ty)
+  | letfn (name : String) (param : String) (lin : Lin) (paramAnnot : Option Ty) (fnBody : Term) (body : Term) (ty : Ty)
   | ite (cond : Term) (then_ : Term) (else_ : Term) (ty : Ty)
   | con (name : String) (args : List Term) (ty : Ty)
   | tuple (elems : List Term) (ty : Ty)
@@ -128,9 +134,17 @@ inductive Term where
 
 /-- The type annotation on a term node. -/
 def Term.ty : Term → Ty
-  | .lit _ t | .var _ _ t | .app _ _ t | .lam _ _ t | .let_ _ _ _ _ t
-  | .letfn _ _ _ _ _ t | .ite _ _ _ t | .con _ _ t | .tuple _ t
+  | .lit _ t | .var _ _ t | .app _ _ t | .lam _ _ t | .let_ _ _ _ _ _ t
+  | .letfn _ _ _ _ _ _ t | .ite _ _ _ t | .con _ _ t | .tuple _ t
   | .record _ t | .field _ _ _ t | .match_ _ _ t | .unsupported t => t
+
+/-- Does an optional surface annotation carry an out-of-fragment type? An
+absent annotation is always in-fragment; a present one is out of fragment iff
+its type is. Used by `Term.hasUnsupported`/`Decl.hasUnsupported` so an
+annotation naming an unsupported type forces the whole-file skip. -/
+def optTyHasUnsupported : Option Ty → Bool
+  | none => false
+  | some t => t.hasUnsupported
 
 /-- Is this term (or any subterm/type) out of fragment? -/
 partial def Term.hasUnsupported : Term → Bool
@@ -139,9 +153,9 @@ partial def Term.hasUnsupported : Term → Bool
     t.ty.hasUnsupported ||
     (match t with
      | .app f args _ => f.hasUnsupported || args.any Term.hasUnsupported
-     | .lam _ b _ => b.hasUnsupported
-     | .let_ _ _ r b _ => r.hasUnsupported || b.hasUnsupported
-     | .letfn _ _ _ fb b _ => fb.hasUnsupported || b.hasUnsupported
+     | .lam ps b _ => ps.any (fun (_, _, a) => optTyHasUnsupported a) || b.hasUnsupported
+     | .let_ _ _ annot r b _ => optTyHasUnsupported annot || r.hasUnsupported || b.hasUnsupported
+     | .letfn _ _ _ pa fb b _ => optTyHasUnsupported pa || fb.hasUnsupported || b.hasUnsupported
      | .ite c u v _ => c.hasUnsupported || u.hasUnsupported || v.hasUnsupported
      | .con _ args _ => args.any Term.hasUnsupported
      | .tuple es _ => es.any Term.hasUnsupported
@@ -167,8 +181,10 @@ inductive Decl where
   params, or a guard), it falls back to `Decl.unsupported`. The emitter attaches
   `resolved_ty` only to the *body* expression, not to the function itself, so a
   `dfn` carries no arrow type of its own; params' types (when needed) come from
-  the enclosing context, not from a node field. -/
-  | dfn (name : String) (params : List (String × Lin)) (body : Term)
+  the enclosing context, not from a node field. Each param carries its optional
+  surface type annotation (`Option Ty`) — `Infer` unifies an annotated param
+  with its annotation. -/
+  | dfn (name : String) (params : List (String × Lin × Option Ty)) (body : Term)
   | dlet (name : String) (rhs : Term)
   | dtype (name : String) (params : List String) (ctors : List CtorSig)
   | unsupported
@@ -179,7 +195,8 @@ inductive Decl where
 out-of-fragment types, so those are checked too. -/
 def Decl.hasUnsupported : Decl → Bool
   | .unsupported => true
-  | .dfn _ _ body => body.hasUnsupported
+  | .dfn _ params body =>
+      params.any (fun (_, _, a) => optTyHasUnsupported a) || body.hasUnsupported
   | .dlet _ body => body.hasUnsupported
   | .dtype _ _ ctors =>
       ctors.any (fun c => c.argTys.any Ty.hasUnsupported || c.resultTy.hasUnsupported)

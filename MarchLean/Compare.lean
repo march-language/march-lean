@@ -207,8 +207,8 @@ partial def termSpanTys (env : TyEnv) (isCallee : Bool) : Term → List (Span ×
   | .app fn args _ =>
       termSpanTys env true fn ++ (args.map (termSpanTys env false)).foldl (· ++ ·) []
   | .lam _ body _ => termSpanTys env false body
-  | .let_ _ _ rhs body _ => termSpanTys env false rhs ++ termSpanTys env false body
-  | .letfn _ _ _ fnBody body _ => termSpanTys env false fnBody ++ termSpanTys env false body
+  | .let_ _ _ _ rhs body _ => termSpanTys env false rhs ++ termSpanTys env false body
+  | .letfn _ _ _ _ fnBody body _ => termSpanTys env false fnBody ++ termSpanTys env false body
   | .ite c t e _ => termSpanTys env false c ++ termSpanTys env false t ++ termSpanTys env false e
   | .con _ args _ => (args.map (termSpanTys env false)).foldl (· ++ ·) []
   | .tuple es _ => (es.map (termSpanTys env false)).foldl (· ++ ·) []
@@ -307,11 +307,11 @@ Lean's mvar ids OR across occurrences (see the module doc on bijection
 scope). -/
 private def innerSpan : Span := ⟨"t", 1, 1, 1, 2⟩
 private def innerVarTy : Ty := Ty.var 3
-private def idLam : Term := Term.lam [("x", .unrestricted)] (Term.var "x" innerSpan innerVarTy) dTy0
+private def idLam : Term := Term.lam [("x", .unrestricted, none)] (Term.var "x" innerSpan innerVarTy) dTy0
 private def useSpan : Span := ⟨"t", 2, 1, 2, 4⟩
 private def idArrowTy : Ty := Ty.arrow (Ty.var 7) (Ty.var 7)
 private def useBodyOk : Term := Term.var "id" useSpan idArrowTy
-private def letTermOk : Term := Term.let_ "id" .unrestricted idLam useBodyOk dTy0
+private def letTermOk : Term := Term.let_ "id" .unrestricted none idLam useBodyOk dTy0
 private def mOk : Module := { decls := [.dlet "top" letTermOk], schemes := [], insts := [] }
 
 #eval show IO Unit from do
@@ -323,7 +323,7 @@ private def mOk : Module := { decls := [.dlet "top" letTermOk], schemes := [], i
 what A2 infers (`Bool` instead of an arrow) — a deliberate node-type
 disagreement. -/
 private def useBodyBad : Term := Term.var "id" useSpan (Ty.con "Bool" [])
-private def letTermBad : Term := Term.let_ "id" .unrestricted idLam useBodyBad dTy0
+private def letTermBad : Term := Term.let_ "id" .unrestricted none idLam useBodyBad dTy0
 private def mRejectType : Module := { decls := [.dlet "top" letTermBad], schemes := [], insts := [] }
 
 #eval show IO Unit from do

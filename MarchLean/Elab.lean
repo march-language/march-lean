@@ -211,6 +211,20 @@ partial def decodeSurfaceTy (paramNames : List String) (j : Json) : Except Strin
       .ok (Ty.natOp op (← decodeSurfaceTy paramNames (← field j "lhs")) (← decodeSurfaceTy paramNames (← field j "rhs")))
   | _ => .ok Ty.unsupported   -- TyChan (session type), TyRefine (refinement) — out of fragment
 
+/-- Decode the optional surface type annotation carried on the `"ty"` key of a
+`param`/`binding` object (emitter's `param_to_json`/`binding_to_json`: `("ty",
+json_opt ty_to_json ...)` — so it's `null` when the author wrote no
+annotation, else a surface `ty` node). A missing key or JSON `null` → `none`;
+otherwise decode via `decodeSurfaceTy`. These annotations are top-level (no
+enclosing `DType` type-parameter list), so `paramNames = []`: a `TyVar`
+reference (a generic type param — out of the A1 fragment) decodes to
+`Ty.unsupported`, which propagates through `Term.hasUnsupported`/
+`Decl.hasUnsupported` to force a whole-file skip rather than mis-binding. -/
+def decodeOptAnnot (j : Json) : Except String (Option Ty) :=
+  match j.getObjVal? "ty" with
+  | .ok v => if v.isNull then .ok none else do .ok (some (← decodeSurfaceTy [] v))
+  | .error _ => .ok none
+
 
 mutual
 
@@ -254,7 +268,8 @@ partial def decodeTerm (j : Json) : Except String Term := do
       let params ← paramsJ.toList.mapM (fun p => do
         let (n, _) ← decodeName (← field p "name")
         let lin ← decodeLin (← field p "lin")
-        pure (n, lin))
+        let annot ← decodeOptAnnot p
+        pure (n, lin, annot))
       let body ← decodeTerm (← field j "body")
       .ok (Term.lam params body ty)
   | "EBlock" =>
@@ -330,13 +345,14 @@ partial def decodeBlockStmts (exprs : List Json) (blockTy : Ty) : Except String 
         | none => .ok (Term.unsupported blockTy)
         | some name =>
             let lin ← decodeLin (← field binding "lin")
+            let annot ← decodeOptAnnot binding
             let rhs ← decodeTerm (← field binding "expr")
             let body ← decodeBlockStmts rest blockTy
-            .ok (Term.let_ name lin rhs body blockTy)
+            .ok (Term.let_ name lin annot rhs body blockTy)
       else
         let stmt ← decodeTerm e
         let body ← decodeBlockStmts rest blockTy
-        .ok (Term.let_ "_" Lin.unrestricted stmt body blockTy)
+        .ok (Term.let_ "_" Lin.unrestricted none stmt body blockTy)
 
 end -- mutual decodeTerm / decodeBlockStmts
 
@@ -345,18 +361,19 @@ end -- mutual decodeTerm / decodeBlockStmts
 a default-valued param can't be curried into `Term`'s plain-named-param
 `lam`/`dfn` shape faithfully, so the caller (`decodeFnParams`) propagates
 `none` to force the whole declaration to `Decl.unsupported`. -/
-def decodeFnParam (p : Json) : Except String (Option (String × Lin)) := do
+def decodeFnParam (p : Json) : Except String (Option (String × Lin × Option Ty)) := do
   match ← kindOf p with
   | "FPNamed" =>
       let param ← field p "param"
       let (n, _) ← decodeName (← field param "name")
       let lin ← decodeLin (← field param "lin")
-      .ok (some (n, lin))
+      let annot ← decodeOptAnnot param
+      .ok (some (n, lin, annot))
   | _ => .ok none
 
 /-- Decode every param in a clause's param list; `none` overall (not just
 per-param) if *any* param isn't a plain `FPNamed`. -/
-def decodeFnParams (ps : List Json) : Except String (Option (List (String × Lin))) := do
+def decodeFnParams (ps : List Json) : Except String (Option (List (String × Lin × Option Ty))) := do
   let raw ← ps.mapM decodeFnParam
   if raw.any Option.isNone then .ok none
   else .ok (some (raw.filterMap id))

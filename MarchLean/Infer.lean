@@ -692,18 +692,32 @@ partial def infer (s : Supply) (ctx : Ctx) : Term → InferM MTy
       pure rho
   | .lam params body _ => do
       let paramMTys ← params.mapM (fun _ => freshMVar s ctx.level)
-      let ctx' := (params.zip paramMTys).foldl (fun c ((n, _), m) => c.addMono n m) ctx
+      -- Honor surface param annotations: an annotated binder HAS that type by
+      -- definition (march-faithful), so fix its fresh mvar to the annotation;
+      -- an unannotated param stays inferred. (`tyToMTy` under the empty subst —
+      -- these top-level annotations reference no `DType` type parameters.)
+      for ((_, _, annot), m) in params.zip paramMTys do
+        match annot with
+        | some t => unify s m (← tyToMTy s [] t)
+        | none => pure ()
+      let ctx' := (params.zip paramMTys).foldl (fun c ((n, _, _), m) => c.addMono n m) ctx
       let bTy ← infer s ctx' body
       pure (paramMTys.foldr MTy.arrow bTy)
-  | .let_ name _ rhs body _ => do
+  | .let_ name _ annot rhs body _ => do
       -- level-based let-polymorphism: infer the rhs one level deeper, then
       -- generalize back to the current level (any mvar minted at level+1 is
       -- quantified; `instantiate` makes fresh copies per use, so nothing
       -- later mutates the scheme's quantified vars — no generalize-aliasing).
       let rhsTy ← infer s { ctx with level := ctx.level + 1 } rhs
+      -- march checks the rhs against a binding annotation (`let x : T = e`)
+      -- before generalizing — unify here so the scheme is fixed to the
+      -- annotated (possibly more-specific) type, not the rhs's general one.
+      match annot with
+      | some t => unify s rhsTy (← tyToMTy s [] t)
+      | none => pure ()
       let sch ← generalize s ctx.level rhsTy
       infer s (ctx.addScheme name sch) body
-  | .letfn name param _ fnBody body _ => do
+  | .letfn name param _ paramAnnot fnBody body _ => do
       -- march's `ELetFn`: a recursive single-parameter function let. Never
       -- decodes in practice (A1 confirmed), so this arm is faithful but
       -- untested. Bind `name` recursively (fresh mvar) and `param` fresh at
@@ -712,6 +726,9 @@ partial def infer (s : Supply) (ctx : Ctx) : Term → InferM MTy
       let lvl := ctx.level + 1
       let recTy ← freshMVar s lvl
       let paramTy ← freshMVar s lvl
+      match paramAnnot with
+      | some t => unify s paramTy (← tyToMTy s [] t)
+      | none => pure ()
       let ctxIn := (ctx.addMono name recTy).addMono param paramTy
       let fnBodyTy ← infer s { ctxIn with level := lvl } fnBody
       unify s recTy (.arrow paramTy fnBodyTy)
@@ -831,8 +848,14 @@ def inferModule' (s : Supply) (m : Module) : InferM (List (Span × MTy)) := do
         let lvl := ctx.level + 1
         let recTy ← freshMVar s lvl
         let paramMTys ← params.mapM (fun _ => freshMVar s lvl)
+        -- Honor surface param annotations (see the `lam` arm): fix each
+        -- annotated param's fresh mvar to its declared type.
+        for ((_, _, annot), m) in params.zip paramMTys do
+          match annot with
+          | some t => unify s m (← tyToMTy s [] t)
+          | none => pure ()
         let ctxIn := (params.zip paramMTys).foldl
-          (fun c ((n, _), mt) => c.addMono n mt) (ctx.addMono name recTy)
+          (fun c ((n, _, _), mt) => c.addMono n mt) (ctx.addMono name recTy)
         let bodyTy ← infer s { ctxIn with level := lvl } body
         unify s recTy (paramMTys.foldr MTy.arrow bodyTy)
         let sch ← generalize s ctx.level recTy
@@ -1010,18 +1033,64 @@ private def freshCtx (s : Supply) (ctors : List (String × CtorSig) := []) : IO 
 #eval show IO Unit from do
   let s ← Supply.new
   let ctx ← freshCtx s
-  let idLam := Term.lam [("x", .unrestricted)] (Term.var "x" dSpan dTy) dTy
+  let idLam := Term.lam [("x", .unrestricted, none)] (Term.var "x" dSpan dTy) dTy
   match ← (infer s ctx idLam).run with
   | .ok (.arrow (.mvar a) (.mvar b)) => IO.println s!"id-lam: {a == b}"
   | .ok _ => IO.println "id-lam-FAIL: wrong shape"
   | .error e => IO.println s!"id-lam-ERROR: {e}"
 -- expected: id-lam: true
 
+/- Surface annotation honored: `λ(x : Int). x` infers to the concrete
+`Int → Int`, NOT the over-general `?a → ?a` — the param's annotation fixes
+its type (march-faithful: an annotated binder HAS that type by definition).
+This is the exact behavior the A2 corpus run found missing (t02/t21). -/
+#eval show IO Unit from do
+  let s ← Supply.new
+  let ctx ← freshCtx s
+  let annLam := Term.lam [("x", .unrestricted, some (Ty.con "Int" []))]
+    (Term.var "x" dSpan dTy) dTy
+  match ← (do let t ← infer s ctx annLam; zonk s t).run with
+  | .ok (.arrow (.con "Int" []) (.con "Int" [])) => IO.println "annot-lam: true"
+  | .ok _ => IO.println "annot-lam-FAIL: wrong shape"
+  | .error e => IO.println s!"annot-lam-ERROR: {e}"
+-- expected: annot-lam: true
+
+/- Annotation MISMATCH is a genuine inference failure: `λ(x : Int). x`
+applied to a `Bool` literal cannot type — the annotation fixes `x : Int`, so
+the argument unification `Int ~ Bool` `throw`s (this is precisely how the
+honored annotation lets A2 reject what an over-general `?a → ?a` would have
+wrongly accepted). -/
+#eval show IO Unit from do
+  let s ← Supply.new
+  let ctx ← freshCtx s
+  let annLam := Term.lam [("x", .unrestricted, some (Ty.con "Int" []))]
+    (Term.var "x" dSpan dTy) dTy
+  let badApp := Term.app annLam [Term.lit (.bool true) dTy] dTy
+  match ← (do let t ← infer s ctx badApp; zonk s t).run with
+  | .ok _ => IO.println "annot-mismatch-FAIL: should not type"
+  | .error _ => IO.println "annot-mismatch: true"
+-- expected: annot-mismatch: true
+
+/- Let annotation honored: `let f : Int = 5 in f` — the binding annotation
+`Int` matches the rhs, and `f` records `Int`. (A binding whose annotation is
+a strict instance of a polymorphic rhs is exercised end-to-end by the real
+t21 sample through the conformance harness.) -/
+#eval show IO Unit from do
+  let s ← Supply.new
+  let ctx ← freshCtx s
+  let letAnn := Term.let_ "f" .unrestricted (some (Ty.con "Int" []))
+    (Term.lit (.int 5) dTy) (Term.var "f" dSpan dTy) dTy
+  match ← (do let t ← infer s ctx letAnn; zonk s t).run with
+  | .ok (.con "Int" []) => IO.println "annot-let: true"
+  | .ok _ => IO.println "annot-let-FAIL: wrong shape"
+  | .error e => IO.println s!"annot-let-ERROR: {e}"
+-- expected: annot-let: true
+
 /- Application `(λx.x) 1` infers to `Int`. -/
 #eval show IO Unit from do
   let s ← Supply.new
   let ctx ← freshCtx s
-  let idLam := Term.lam [("x", .unrestricted)] (Term.var "x" dSpan dTy) dTy
+  let idLam := Term.lam [("x", .unrestricted, none)] (Term.var "x" dSpan dTy) dTy
   let app := Term.app idLam [Term.lit (.int 1) dTy] dTy
   match ← (do let t ← infer s ctx app; zonk s t).run with
   | .ok (.con "Int" []) => IO.println "app-int: true"
@@ -1035,11 +1104,11 @@ generalizes it. -/
 #eval show IO Unit from do
   let s ← Supply.new
   let ctx ← freshCtx s
-  let idLam := Term.lam [("x", .unrestricted)] (Term.var "x" dSpan dTy) dTy
+  let idLam := Term.lam [("x", .unrestricted, none)] (Term.var "x" dSpan dTy) dTy
   let useInt := Term.app (Term.var "id" dSpan dTy) [Term.lit (.int 1) dTy] dTy
   let useBool := Term.app (Term.var "id" dSpan dTy) [Term.lit (.bool true) dTy] dTy
   let body := Term.tuple [useInt, useBool] dTy
-  let letId := Term.let_ "id" .unrestricted idLam body dTy
+  let letId := Term.let_ "id" .unrestricted none idLam body dTy
   match ← (do let t ← infer s ctx letId; zonk s t).run with
   | .ok (.tuple [.con "Int" [], .con "Bool" []]) => IO.println "let-poly: true"
   | .ok _ => IO.println "let-poly-FAIL: wrong shape"
