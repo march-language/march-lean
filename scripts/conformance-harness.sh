@@ -22,25 +22,28 @@
 # and reports MATCH / MISMATCH / SKIP / ERROR / MARCH_SELF_INCONSISTENT /
 # CORPUS_VIOLATION counts, plus the filenames in every non-MATCH category.
 #
-# --- A1 note: SKIP is normal, not a failure ---
+# --- A1/A2 note: SKIP is normal, not a failure ---
 # At A0 the Lean side merely echoed march's own verdict back, so ANY skip
 # was unexpected (the Lean side had no fragment restriction of its own) and
 # a hard failure. At A1 march-lean-check independently type-/linearity-
 # checks a MODELED FRAGMENT of Core March, so `skip` (lean exit 2) is the
-# expected, frequent response to any construct outside that fragment: every
-# reject/*.march file skips (A1 only re-verifies accepts, never models the
-# reject side) and roughly two-thirds of accept/*.march skips too (out-of-
-# fragment constructs: interfaces, actors, sessions, capabilities,
-# refinements, derive/module features, ...). SKIP is therefore excluded from
-# the hard-fail set below; in its place this script enforces a SKIP LEDGER
-# (scripts/expected-skips.txt) recording exactly which accept/*.march files
-# are expected to skip and why — a newly-skipping accept file (not on the
-# ledger) is a coverage regression, and a ledger entry that no longer skips
-# is a stale ledger entry, and BOTH fail the run (see the ledger-enforcement
-# block after the corpus loop below). Reject-side skips are NOT enumerated
-# on the ledger, since every reject file skipping is a structural A1
-# invariant (not a shrinking coverage tracker) — see expected-skips.txt's
-# own header for the rationale.
+# expected, frequent response to any construct outside that fragment:
+# roughly two-thirds of accept/*.march skips (out-of-fragment constructs:
+# interfaces, actors, sessions, capabilities, refinements, derive/module
+# features, ...), and at A1 every reject/*.march file skipped too (A1 only
+# re-verified accepts, never modeled the reject side). At A2-reject
+# march-lean-check renders its OWN accept/reject verdict on reject/*.march
+# files as well (A2's inference oracle judges a modeled fragment of the
+# reject corpus), so reject-side files now split into judged (match/
+# mismatch, exit 0/1/4) and skipped (exit 2, out-of-fragment) just like the
+# accept side. SKIP is therefore excluded from the hard-fail set below; in
+# its place this script enforces a SKIP LEDGER (scripts/expected-skips.txt)
+# recording exactly which accept/*.march AND reject/*.march files are
+# expected to skip and why — a newly-skipping file (not on the ledger) is a
+# coverage regression, and a ledger entry that no longer skips is a stale
+# ledger entry, and BOTH fail the run (see the ledger-enforcement block
+# after the corpus loop below). Both sides are now ledger-tracked, since
+# both are shrinking coverage sets as the modeled fragment grows.
 #
 # Exits nonzero iff any MISMATCH, ERROR, MARCH_SELF_INCONSISTENT,
 # CORPUS_VIOLATION, or SKIP-LEDGER MISMATCH occurred.
@@ -69,7 +72,8 @@
 #   0  every non-skip file MATCHed (march's --check verdict agrees with the
 #      Lean re-check, march's own two flags agree with each other, AND
 #      march's verdict agrees with the corpus's accept/reject placement),
-#      AND the observed accept-side skip set == scripts/expected-skips.txt
+#      AND the observed skip set (accept- and reject-side) ==
+#      scripts/expected-skips.txt
 #   1  at least one MISMATCH, ERROR, MARCH_SELF_INCONSISTENT,
 #      CORPUS_VIOLATION, or SKIP-LEDGER MISMATCH was recorded (see the
 #      printed summary for which)
@@ -145,6 +149,7 @@ mismatch_files=""
 error_files=""
 skip_files=""
 accept_skip_paths=""
+observed_skip_paths=""
 reject_skip_n=0
 self_inconsistent_files=""
 corpus_violation_files=""
@@ -188,6 +193,7 @@ for f in "$corpus_dir"/accept/*.march "$corpus_dir"/reject/*.march; do
         1) lean_verdict="reject" ;;
         2) lean_verdict="skip" ;;
         3) lean_verdict="error" ;;
+        4) lean_verdict="types_differ" ;;
         *) lean_verdict="error" ;;  # defensive: unexpected exit code treated as error
     esac
 
@@ -216,19 +222,20 @@ for f in "$corpus_dir"/accept/*.march "$corpus_dir"/reject/*.march; do
     if [ "$lean_verdict" = "error" ]; then
         error_files="$error_files$f (lean_verdict=error, march_verdict=$march_verdict)"$'\n'
     elif [ "$lean_verdict" = "skip" ]; then
-        # SKIP is expected at A1 (see the header comment): every reject/
-        # file skips structurally (A1 never models the reject side), and a
-        # known subset of accept/ files skip because they use a construct
-        # outside the modeled fragment. Record it for the summary and, for
-        # accept-side skips only, for the skip-ledger comparison below —
-        # reject-side skips are not ledger-tracked (structural, not a
-        # shrinking coverage set).
+        # SKIP is expected at A1/A2 (see the header comment): a known subset
+        # of accept/ and reject/ files skip because they use a construct
+        # outside the modeled fragment. Record it for the summary and for
+        # the skip-ledger comparison below — both sides are now
+        # ledger-tracked (see the ledger-enforcement block after the loop).
         skip_files="$skip_files$f (lean_verdict=skip, march_verdict=$march_verdict)"$'\n'
+        observed_skip_paths="$observed_skip_paths$parent_dir/$(basename "$f")"$'\n'
         if [ "$parent_dir" = "accept" ]; then
             accept_skip_paths="$accept_skip_paths$parent_dir/$(basename "$f")"$'\n'
         else
             reject_skip_n=$((reject_skip_n + 1))
         fi
+    elif [ "$lean_verdict" = "types_differ" ]; then
+        mismatch_files="$mismatch_files$f (A2 accepts but per-node types differ from resolved_ty; march=$march_verdict)"$'\n'
     elif [ "$march_verdict" != "$lean_verdict" ]; then
         mismatch_files="$mismatch_files$f (march=$march_verdict, lean=$lean_verdict)"$'\n'
     else
@@ -251,15 +258,16 @@ accept_skip_n=$(printf '%s' "$accept_skip_paths" | grep -c . || true)
 self_inconsistent_n=$(printf '%s' "$self_inconsistent_files" | grep -c . || true)
 corpus_violation_n=$(printf '%s' "$corpus_violation_files" | grep -c . || true)
 
-# --- skip-ledger enforcement (A1) ---
-# Compare the OBSERVED accept-side skip set against the checked-in ledger
-# (scripts/expected-skips.txt, paths only, `# reason` comments and blank
-# lines stripped). Any difference — either direction — fails the run:
-#   - an accept file skipping that ISN'T on the ledger is a newly-skipping
-#     file, i.e. a coverage regression (the fragment shrank, or a decode/
-#     check bug started bailing out on something it used to handle);
+# --- skip-ledger enforcement (A1/A2) ---
+# Compare the OBSERVED skip set — BOTH accept/ and reject/ sides — against
+# the checked-in ledger (scripts/expected-skips.txt, paths only, `# reason`
+# comments and blank lines stripped). Any difference — either direction —
+# fails the run:
+#   - a file skipping that ISN'T on the ledger is a newly-skipping file,
+#     i.e. a coverage regression (the fragment shrank, or a decode/check
+#     bug started bailing out on something it used to handle);
 #   - a ledger entry that is NOT observed skipping is a stale ledger entry
-#     (the fragment widened and this file is now modeled — update the
+#     (the fragment widened and this file is now judged — update the
 #     ledger to reflect the improved coverage, don't leave it stale).
 ledger_fail=0
 expected_ledger="$(cd "$(dirname "$0")/.." && pwd)/scripts/expected-skips.txt"
@@ -268,7 +276,7 @@ if [ ! -f "$expected_ledger" ]; then
     ledger_fail=1
     ledger_diff=""
 else
-    observed_skips_sorted="$(printf '%s\n' "$accept_skip_paths" | sed '/^$/d' | sort -u)"
+    observed_skips_sorted="$(printf '%s\n' "$observed_skip_paths" | sed '/^$/d' | sort -u)"
     expected_skips_sorted="$(sed 's/#.*//; s/[[:space:]]*$//; /^$/d' "$expected_ledger" | sort -u)"
     if [ "$observed_skips_sorted" != "$expected_skips_sorted" ]; then
         ledger_fail=1
@@ -304,11 +312,11 @@ if [ "$error_n" -gt 0 ]; then
     printf '%s' "$error_files" | sed '/^$/d;s/^/  - /'
 fi
 if [ "$skip_n" -gt 0 ]; then
-    echo "SKIP files (expected at A1 — out-of-fragment; see scripts/expected-skips.txt for the accept-side ledger):"
+    echo "SKIP files (expected at A1/A2 — out-of-fragment; see scripts/expected-skips.txt for the accept- and reject-side ledger):"
     printf '%s' "$skip_files" | sed '/^$/d;s/^/  - /'
 fi
 if [ "$ledger_fail" -ne 0 ]; then
-    echo "SKIP-LEDGER MISMATCH — observed accept-side skips differ from scripts/expected-skips.txt:"
+    echo "SKIP-LEDGER MISMATCH — observed skips (accept- and reject-side) differ from scripts/expected-skips.txt:"
     echo "  (lines prefixed '<' are in the ledger but NOT observed skipping — stale ledger entry;"
     echo "   lines prefixed '>' are observed skipping but NOT in the ledger — coverage regression)"
     printf '%s\n' "$ledger_diff" | sed '/^$/d;s/^/  /'
