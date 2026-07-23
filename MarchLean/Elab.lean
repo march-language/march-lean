@@ -184,7 +184,18 @@ partial def decodeSurfaceTy (paramNames : List String) (j : Json) : Except Strin
   | "TyCon" =>
       let (name, _) ← decodeName (← field j "name")
       let args ← (← (← field j "args").getArr?.mapError (fun _ => "args")).toList.mapM (decodeSurfaceTy paramNames)
-      .ok (Ty.con name args)
+      -- `Cap(perm)` is march's capability type — a `TyCon` named `Cap` APPLIED
+      -- to a permission argument (`Cap(IO.Network)`), out of the Core+linearity
+      -- fragment (A2 models no capability discipline). Decode it to
+      -- `Ty.unsupported` so a signature like `fn listen(cap : Cap(IO.Network),
+      -- ...)` trips the whole-file skip gate (`Decl.hasUnsupported`) rather than
+      -- being mistaken for an ordinary ADT and letting the residual program
+      -- falsely accept (reject/t36). The APPLIED test (`args ≠ []`) is load-
+      -- bearing: a *nullary* `Cap` is an ordinary user ADT (`type Cap = C(Int)`
+      -- in accept/t80), NOT the capability type, and must stay in fragment. A
+      -- capability is always `Cap(permission)`; a bare `Cap` never is. -/
+      if name == "Cap" && !args.isEmpty then .ok Ty.unsupported
+      else .ok (Ty.con name args)
   | "TyVar" =>
       let (name, _) ← decodeName (← field j "name")
       match paramNames.findIdx? (· == name) with
@@ -389,6 +400,21 @@ partial def decodeDecl (j : Json) : Except String Decl := do
   | "DFn" => do
       let fn ← field j "fn"
       let (name, _) ← decodeName (← field fn "name")
+      -- The declared return-type annotation. A refinement (`{Int | _ >= 0}` →
+      -- `TyRefine`), a session channel, or any other out-of-fragment return
+      -- type decodes (via `decodeSurfaceTy`) to a type containing
+      -- `Ty.unsupported`. The `Decl.dfn`/`Decl.dlet` shapes carry no
+      -- return-type field, so we cannot thread it through — instead, a
+      -- return type that is out of fragment forces the whole declaration to
+      -- `Decl.unsupported`, so the file honestly skips rather than checking
+      -- only the (in-fragment) body and ignoring the annotation march
+      -- rejected against (reject/t72). A missing or `null` `ret_ty` (an
+      -- unannotated `fn`) imposes no such constraint.
+      let retUnsupported ← (match fn.getObjVal? "ret_ty" with
+        | .ok v => if v.isNull then pure false else do
+            let t ← decodeSurfaceTy [] v
+            pure t.hasUnsupported
+        | .error _ => pure false : Except String Bool)
       let clausesJ ← (← field fn "clauses").getArr?.mapError (fun _ => "clauses")
       match clausesJ.toList with
       | [clause] => do
@@ -397,6 +423,8 @@ partial def decodeDecl (j : Json) : Except String Decl := do
             -- A guarded clause can't be represented (`Decl.dfn`'s body is a
             -- plain `Term`, with no guard slot) — see Task 2's doc comment
             -- on `Decl.dfn`, which calls for `Decl.unsupported` here.
+            .ok Decl.unsupported
+          else if retUnsupported then
             .ok Decl.unsupported
           else do
             let paramsJ ← (← field clause "params").getArr?.mapError (fun _ => "params")

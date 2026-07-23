@@ -1,15 +1,28 @@
 name: Conformance
 
-# A1 conformance gate: build march-lean-check (this repo) and march (via
+# Conformance gate: build march-lean-check (this repo) and march (via
 # march-language/setup-march, pinned to a main SHA — see the setup-march
 # step below), then run scripts/conformance-harness.sh over march's
 # static-semantics corpus and fail the job on any MISMATCH/ERROR/
-# MARCH_SELF_INCONSISTENT/CORPUS_VIOLATION/SKIP-LEDGER-MISMATCH. SKIP itself
-# is expected and frequent at A1 (march-lean-check only independently
-# checks a modeled fragment; scripts/expected-skips.txt tracks exactly
-# which accept-side corpus files are expected to skip, and the harness
-# fails if the observed skip set drifts from it — see that file's header
-# and the harness's own comments for the full rationale).
+# MARCH_SELF_INCONSISTENT/CORPUS_VIOLATION/SKIP-LEDGER-MISMATCH/
+# KNOWN-LIMITATIONS-STALE.
+#
+# As of A2-reject the gate is TWO-SIDED: march-lean-check renders its own
+# accept/reject verdict (independent HM inference + linearity, ignoring
+# march's verdict) on both the accept/ and reject/ corpora, so the harness
+# confirms not just that march was right to accept, but that it was right
+# to reject. SKIP is still expected and frequent — march-lean-check only
+# independently checks a modeled fragment. Two ledgers keep that honest,
+# and both are enforced in BOTH directions (a new skip and a stale entry
+# each fail the run):
+#   - scripts/expected-skips.txt: the accept- AND reject-side skip sets.
+#   - scripts/known-limitations.txt: the handful of march=reject files
+#     whose rejection reason is erased before --emit-core-ast (so it is
+#     structurally invisible to a Core-AST checker) and which A2 therefore
+#     wrongly accepts. Gated to march=reject, so it can never mask an
+#     accept-side bug.
+# See those files' headers and the harness's own comments for the full
+# rationale.
 on:
   push:
     branches: [main]

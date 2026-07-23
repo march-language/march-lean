@@ -85,6 +85,60 @@ partial def uses (name : String) : Term → Nat
         if (Pattern.boundNames p).contains name then 0 else uses name e)).foldl Nat.max 0
   | .lit _ _ | .unsupported _ => 0
 
+/-- The outermost linearity qualifier a type carries (`Ty.lin l _`), else
+`unrestricted`. march writes a value's linearity either as a binder keyword
+(`linear let`/`affine` param), as a *type* modifier on the binding's
+annotation (`let c : affine Cap2 = ..`), or — for a call to a function with a
+`linear`/`affine` return type — on the binding's *inferred* type (a plain
+`let h = mk()` where `mk : linear Res` yields `h : linear Res`). Only the first
+form reaches a binder's `Lin` field; the other two live on a `Ty`, so the
+linearity pass must read them off the type to enforce them. -/
+def Ty.outerLin : Ty → Lin
+  | .lin l _ => l
+  | _ => .unrestricted
+
+/-- Effective linearity of a `let_` binding: the binder keyword if it carries
+one, else the annotation's outer qualifier (`let c : affine T = ..`), else the
+rhs's inferred-type outer qualifier (`let h = mk()` with `mk : linear ..`).
+This makes A2 enforce affine-via-annotation (reject/t64) and linear-return
+propagation (reject/t78), which march models but which don't surface on the
+binder's own `Lin` field. -/
+def effLin (binder : Lin) (annot : Option Ty) (rhs : Term) : Lin :=
+  match binder with
+  | .unrestricted =>
+      let fromAnnot := match annot with | some t => Ty.outerLin t | none => .unrestricted
+      match fromAnnot with
+      | .unrestricted => Ty.outerLin rhs.ty
+      | l => l
+  | l => l
+
+/-- Does `name` occur free INSIDE a closure (`Term.lam` body) anywhere within
+`t`, i.e. is it captured by a closure? A `lam` whose param list rebinds `name`
+shadows it (uses inside belong to the param, not our binder); otherwise any
+free use of `name` in the lam body — `uses name b > 0`, which itself already
+discounts shadowing and counts through nested lams — means `name` escaped into
+a closure. Intervening `let_`/`letfn`/`match_` binders that rebind `name` cut
+the scope short (a later capture is of a different binder). Used to detect the
+closure-capture case A2's static use-counting cannot judge (reject/t62): a
+closure may be invoked any number of times, so a captured linear/affine value's
+use count is not statically knowable. -/
+partial def capturedInLam (name : String) : Term → Bool
+  | .lam ps b _ => if ps.any (fun (p, _, _) => p == name) then false else uses name b > 0
+  | .let_ n _ _ r b _ => capturedInLam name r || (if n == name then false else capturedInLam name b)
+  | .letfn n p _ _ fb b _ =>
+      (if n == name || p == name then false else capturedInLam name fb) ||
+      (if n == name then false else capturedInLam name b)
+  | .app f args _ => capturedInLam name f || args.any (capturedInLam name)
+  | .ite c u v _ => capturedInLam name c || capturedInLam name u || capturedInLam name v
+  | .con _ args _ => args.any (capturedInLam name)
+  | .tuple es _ => es.any (capturedInLam name)
+  | .record fs _ => fs.any (fun (_, e) => capturedInLam name e)
+  | .field r _ _ _ => capturedInLam name r
+  | .match_ s arms _ =>
+      capturedInLam name s || arms.any (fun (p, e) =>
+        if (Pattern.boundNames p).contains name then false else capturedInLam name e)
+  | .lit _ _ | .var _ _ _ | .unsupported _ => false
+
 /-- Enforce a binder's linearity given its use count. -/
 def enforce (name : String) (l : Lin) (n : Nat) : CheckResult :=
   match l with
@@ -92,9 +146,23 @@ def enforce (name : String) (l : Lin) (n : Nat) : CheckResult :=
   | .affine => if n <= 1 then .ok else .reject s!"affine '{name}' used {n} times (must be ≤ 1)"
   | .unrestricted => .ok
 
-/-- Enforce every param in a param list against `body`'s use counts. -/
+/-- Check one binder: if a linear/affine binder is captured by a closure within
+its scope, the whole file must SKIP (A2 does not model closure escape analysis
+— it cannot statically know how many times the closure runs); otherwise enforce
+its use count. Skip takes precedence over a use-count reject, since a capture
+means the count is not trustworthy in the first place. -/
+def bindCheck (name : String) (l : Lin) (scope : Term) : CheckResult :=
+  match l with
+  | .unrestricted => .ok
+  | _ =>
+      if capturedInLam name scope then
+        .skip s!"linear/affine binder '{name}' captured in a closure; escape analysis not modeled"
+      else enforce name l (uses name scope)
+
+/-- Check every param in a param list against `body` (use count + closure
+capture). A captured linear/affine param skips the whole file. -/
 def enforceParams (ps : List (String × Lin × Option Ty)) (body : Term) : CheckResult :=
-  ps.foldl (fun acc (p, l, _) => match acc with | .ok => enforce p l (uses p body) | o => o) .ok
+  ps.foldl (fun acc (p, l, _) => match acc with | .ok => bindCheck p l body | o => o) .ok
 
 /-- Walk a term enforcing every linear/affine binder it introduces. -/
 partial def checkTerm : Term → CheckResult
@@ -102,14 +170,14 @@ partial def checkTerm : Term → CheckResult
       match enforceParams ps b with
       | .ok => checkTerm b
       | other => other
-  | .let_ n l _ r b _ =>
+  | .let_ n l annot r b _ =>
       match checkTerm r with
-      | .ok => match enforce n l (uses n b) with
+      | .ok => match bindCheck n (effLin l annot r) b with
                | .ok => checkTerm b
                | other => other
       | other => other
   | .letfn _ p l _ fb b _ =>
-      match enforce p l (uses p fb) with
+      match bindCheck p l fb with
       | .ok => match checkTerm fb with | .ok => checkTerm b | o => o
       | other => other
   | .app f args _ =>
@@ -189,6 +257,66 @@ def linMatchShadowed : Module :=
         (Ty.con "Int" []))],
     schemes := [], insts := [] }
 #eval (repr (checkLinearity linMatchShadowed)) -- expected: CheckResult.reject "linear 'x' used 0 times ..."
+
+-- Affine-via-type-annotation, used twice -> reject (reject/t64). The binder's
+-- own `Lin` is `unrestricted` (there is no `affine let` keyword); the affine
+-- lives on the annotation `c : affine Cap2`, so `effLin` must read it off the
+-- annotation type for enforcement to fire.
+def affineAnnotTwice : Module :=
+  { decls := [Decl.dlet "main"
+      (Term.let_ "c" Lin.unrestricted (some (Ty.lin Lin.affine (Ty.con "Cap2" [])))
+        (Term.con "C" [Term.lit (Lit.int 1) (Ty.con "Int" [])] (Ty.con "Cap2" []))
+        (Term.tuple [Term.var "c" ⟨"f",1,1,1,2⟩ (Ty.con "Cap2" []),
+                     Term.var "c" ⟨"f",1,3,1,4⟩ (Ty.con "Cap2" [])] (Ty.tuple []))
+        (Ty.tuple []))],
+    schemes := [], insts := [] }
+#eval (repr (checkLinearity affineAnnotTwice)) -- expected: CheckResult.reject "affine 'c' used 2 times ..."
+
+-- Linear-return propagation: `let h = mk()` where the rhs's inferred type is
+-- `linear Res`, and `h` is never used -> reject (reject/t78). The binder `Lin`
+-- is `unrestricted` and there is no annotation; the linear qualifier lives on
+-- the rhs's resolved type, which `effLin` reads via `Ty.outerLin rhs.ty`.
+def linearReturnUnconsumed : Module :=
+  { decls := [Decl.dlet "main"
+      (Term.let_ "h" Lin.unrestricted none
+        (Term.app (Term.var "mk" ⟨"f",1,1,1,3⟩ (Ty.arrow (Ty.tuple []) (Ty.lin Lin.linear (Ty.con "Res" []))))
+                  [] (Ty.lin Lin.linear (Ty.con "Res" [])))
+        (Term.tuple [] (Ty.tuple []))
+        (Ty.tuple []))],
+    schemes := [], insts := [] }
+#eval (repr (checkLinearity linearReturnUnconsumed)) -- expected: CheckResult.reject "linear 'h' used 0 times ..."
+
+-- Closure capture of a linear binder -> whole-file SKIP (reject/t62). `r` is
+-- `linear` and used exactly once syntactically, but that one use is INSIDE a
+-- closure (`let f = fn -> take(r)`), so its runtime use count is not statically
+-- knowable. A2 must skip rather than accept (its single-use count would wrongly
+-- pass) or reject (it cannot prove a violation either).
+def linearCapturedInClosure : Module :=
+  { decls := [Decl.dlet "main"
+      (Term.let_ "r" Lin.linear none
+        (Term.con "R" [Term.lit (Lit.int 1) (Ty.con "Int" [])] (Ty.con "Res" []))
+        (Term.let_ "f" Lin.unrestricted none
+          (Term.lam [] (Term.app (Term.var "take" ⟨"f",1,1,1,5⟩ (Ty.arrow (Ty.con "Res" []) (Ty.con "Int" [])))
+                                  [Term.var "r" ⟨"f",1,6,1,7⟩ (Ty.con "Res" [])] (Ty.con "Int" []))
+                     (Ty.arrow (Ty.tuple []) (Ty.con "Int" [])))
+          (Term.tuple [] (Ty.tuple []))
+          (Ty.tuple []))
+        (Ty.tuple []))],
+    schemes := [], insts := [] }
+#eval (repr (checkLinearity linearCapturedInClosure)) -- expected: CheckResult.skip "...captured in a closure..."
+
+-- Guard against over-skip: a linear binder used once OUTSIDE any closure, in a
+-- program that also HAS a closure (over an unrelated unrestricted value), must
+-- still be checked normally (ok), not skipped.
+def linearNotCaptured : Module :=
+  { decls := [Decl.dfn "f" [("x", Lin.linear, none)]
+      (Term.let_ "g" Lin.unrestricted none
+        (Term.lam [("y", Lin.unrestricted, none)] (Term.var "y" ⟨"f",1,1,1,2⟩ (Ty.con "Int" []))
+                  (Ty.arrow (Ty.con "Int" []) (Ty.con "Int" [])))
+        (Term.var "x" ⟨"f",2,1,2,2⟩ (Ty.con "Int" []))
+        (Ty.con "Int" []))],
+    schemes := [], insts := [] }
+#eval (repr (checkLinearity linearNotCaptured)) -- expected: CheckResult.ok
 
 end MarchLean.Linearity.Test
 
