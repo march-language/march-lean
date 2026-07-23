@@ -191,7 +191,7 @@ inductive Decl where
   is scoped to its own module: Check 1 asks whether *this* module's declared
   needs cover the `Cap(X)` types in *this* module's signatures. Inference, by
   contrast, treats a module as transparent and splices its decls into the
-  enclosing scope (see `Compare.flattenDecls`) — an approximation that holds
+  enclosing scope (see `flattenDecls` below) — an approximation that holds
   only while names do not collide across sibling modules, which
   `Elab.decodeModule` guards against. -/
   | dmod (name : String) (decls : List Decl)
@@ -225,6 +225,21 @@ partial def Decl.hasUnsupported : Decl → Bool
   | .dneeds _ => false
   | .duse _ => false
   | .dextern _ => false
+
+/-- Splice nested `dmod` decls into a single flat list, for the passes that
+treat a module as a transparent scope (inference, linearity). Cap checking
+does NOT use this — `needs` is scoped to its module, so `CapCheck` walks the
+tree instead (see `Decl.dmod`'s docstring).
+
+This is an approximation of march, which scopes names per module and supports
+qualified cross-module references. It is sound only while names do not collide
+across sibling modules; `Elab.decodeModule` refuses files where they do.
+Marked `partial`: the recursion through `List Decl` inside `dmod` isn't
+structurally recognized by the kernel, matching `Decl.hasUnsupported`. -/
+partial def flattenDecls : List Decl → List Decl
+  | [] => []
+  | .dmod _ inner :: rest => flattenDecls inner ++ flattenDecls rest
+  | d :: rest => d :: flattenDecls rest
 
 structure Scheme where
   ids : List Int

@@ -227,8 +227,9 @@ def declSpanTys (env : TyEnv) : Decl → List (Span × Ty)
   | .dlet _ body => termSpanTys env false body
   | .dfn _ _ body => termSpanTys env false body
   -- A3 Task 2 decode-only constructors: no term of their own, so no
-  -- `(span, ty)` pairs to contribute. `dmod`'s nested decls are left to
-  -- Task 4's flattening, same deferral as `Infer.inferModule'`.
+  -- `(span, ty)` pairs to contribute. `dmod` is inert-but-unreachable here:
+  -- `inferModule` flattens nested `dmod`s via `flattenDecls` before this is
+  -- ever called, so its children already appear as top-level decls.
   | .dmod .. | .dneeds _ | .duse _ | .dextern _ => []
   | .unsupported => []
 
@@ -277,15 +278,19 @@ code.
 Linearity is checked by a separate pass (`Linearity.checkLinearity`,
 run by `MarchLeanCheck`'s `run`), not here. -/
 def inferModule (m : Module) : IO OracleVerdict := do
+  -- Flatten nested `dmod` bodies into the enclosing scope first — inference
+  -- treats a module as transparent (see `flattenDecls`'s docstring). `m'` is
+  -- what every step below walks, in place of `m`.
+  let m' : Module := { m with decls := flattenDecls m.decls }
   -- (1) whole-file skip gate: any out-of-fragment construct anywhere.
-  if m.decls.any Decl.hasUnsupported then
+  if m'.decls.any Decl.hasUnsupported then
     return .skip "out-of-fragment construct in a declaration"
   -- (1b) skip gate: a scheme carrying a non-Num/Eq/Ord CInterface (as A1).
-  if m.schemes.any (fun sch => sch.constraints.any constraintOutOfFragment) then
+  if m'.schemes.any (fun sch => sch.constraints.any constraintOutOfFragment) then
     return .skip "scheme carries an out-of-fragment constraint"
   -- (2) run the independent inference engine.
   let s ← Supply.new
-  match ← (inferModule' s m).run with
+  match ← (inferModule' s m').run with
   | .error e =>
     -- (2b) Task 8b: an unmodeled name/constructor is a coverage gap, not a
     -- type disagreement — route it to `.skip` instead of a false `.reject`.
@@ -295,8 +300,8 @@ def inferModule (m : Module) : IO OracleVerdict := do
       return .reject s!"infer: {e}"
   | .ok recorded =>
     -- (3) cross-check every recorded var/field node against march's resolved_ty.
-    let env := buildTyEnv m.decls
-    let spanTys := moduleSpanTys env m
+    let env := buildTyEnv m'.decls
+    let spanTys := moduleSpanTys env m'
     for (span, mty) in recorded do
       match spanTys.find? (fun p => p.1 == span) with
       | none => pure ()   -- defensive: no module node carries this span
