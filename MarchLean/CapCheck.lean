@@ -33,12 +33,24 @@ partial def capsInTy : Ty → List String
   | .lin _ t    => capsInTy t
   | _           => []
 
-/-- The caps a declaration's *signature* mentions. Only signatures matter for
-Check 1 — body uses are Check 1b, which is warning-only and not implemented. -/
+/-- The caps a declaration's PARAMETER signature mentions. Only signatures
+matter for Check 1 — body uses are Check 1b, which is warning-only and not
+implemented. Return-type caps are handled separately by
+`capsInReturnSignature` (they are gated differently — see `checkOneModule`). -/
 def capsInSignature : Decl → List String
-  | .dfn _ params _ =>
+  | .dfn _ params _ _ =>
       params.flatMap (fun (_, _, annot) =>
         match annot with | some t => capsInTy t | none => [])
+  | _ => []
+
+/-- The caps a declaration's RETURN-type annotation mentions. march's Check 1
+scans `param_tys @ ret_tys`, so a `Cap(X)` in return position counts exactly
+like one in a parameter. Kept separate from `capsInSignature` because the
+return scan is GATED on the enclosing module being fully in fragment — see
+`checkOneModule`. -/
+def capsInReturnSignature : Decl → List String
+  | .dfn _ _ retAnnot _ =>
+      match retAnnot with | some t => capsInTy t | none => []
   | _ => []
 
 /-- The caps this module declares via `needs`. -/
@@ -54,8 +66,25 @@ that, since each module is checked against its OWN declared needs). -/
 def checkOneModule (modName : String) (decls : List Decl)
     (moduleCaps : List (String × List String)) : CapResult :=
   let declared := declaredNeeds decls
-  -- Check 1 — signature Cap(X) coverage
-  let sigCaps := decls.flatMap capsInSignature
+  -- Check 1 — signature Cap(X) coverage over `param_tys @ ret_tys`
+  -- (march's `check_module_needs`). Parameter caps are ALWAYS scanned.
+  --
+  -- RETURN caps are scanned only when this module is ENTIRELY in fragment. A
+  -- module carrying an out-of-fragment declaration (e.g. a `proof cap`, which
+  -- decodes to `Decl.unsupported`) may satisfy a return cap through machinery
+  -- this checker does not model: march's self-declaration exemption lets a
+  -- module's own `proof cap X` implicitly cover `Cap(Module.X)` returned by
+  -- its public fns (accept/t62 — `Cap(Db.Migrated)` returned under `needs IO`,
+  -- accepted). Rather than mis-reject such a return, defer — the file skips
+  -- downstream via the out-of-fragment gate, exactly as it did before this
+  -- scan existed. A fully-in-fragment module has only modeled IO caps and no
+  -- such escape, so an uncovered return cap there is a real Check 1 violation
+  -- (the M1 gap: e.g. `fn f(cap : Cap(IO.Console)) : Cap(IO.Network)` under
+  -- `needs IO.Console`). Params are left unconditional so no existing
+  -- signature-based reject changes.
+  let retCaps :=
+    if decls.any Decl.hasUnsupported then [] else decls.flatMap capsInReturnSignature
+  let sigCaps := decls.flatMap capsInSignature ++ retCaps
   match sigCaps.find? (fun c => !covered declared c) with
   | some bad =>
       .violation s!"Check 1: `Cap({bad})` used in module `{modName}` but `{bad}` is not declared in `needs`"
@@ -110,7 +139,7 @@ def siblingViolation : Module := {
     Decl.dneeds ["IO.FileRead"],
     Decl.dfn "save" [("cap", Lin.unrestricted,
                       some (Ty.con "Cap" [Ty.con "IO.FileWrite" []]))]
-             (Term.lit (Lit.unit) (Ty.con "Unit" []))]],
+             none (Term.lit (Lit.unit) (Ty.con "Unit" []))]],
   schemes := [], insts := [], moduleCaps := [] }
 #eval checkCaps siblingViolation
   -- expect: violation — IO.FileWrite not covered by IO.FileRead
@@ -121,7 +150,7 @@ def rootCovers : Module := {
     Decl.dneeds ["IO"],
     Decl.dfn "listen" [("cap", Lin.unrestricted,
                         some (Ty.con "Cap" [Ty.con "IO.Network" []]))]
-             (Term.lit (Lit.unit) (Ty.con "Unit" []))]],
+             none (Term.lit (Lit.unit) (Ty.con "Unit" []))]],
   schemes := [], insts := [], moduleCaps := [] }
 #eval checkCaps rootCovers
   -- expect: ok
@@ -164,9 +193,63 @@ def externCovered : Module := {
 /-- A module with no caps at all is trivially fine — the overwhelmingly
 common case, and it must not be flagged. -/
 def noCapsAtAll : Module := {
-  decls := [Decl.dfn "f" [] (Term.lit (Lit.int 1) (Ty.con "Int" []))],
+  decls := [Decl.dfn "f" [] none (Term.lit (Lit.int 1) (Ty.con "Int" []))],
   schemes := [], insts := [], moduleCaps := [] }
 #eval checkCaps noCapsAtAll
   -- expect: ok
+
+/-- True iff a `CapResult` is a violation — a `Bool` projection so the
+`native_decide` guards below can pin the verdict at build time. (An end-to-end
+guard that decodes real `march --emit-core-ast` output and cap-checks it lives
+in `MarchLeanCheck.lean`, which already imports the decoder — this file's core
+stays independent of `Elab`.) -/
+def CapResult.isViolation : CapResult → Bool
+  | .violation _ => true
+  | .ok          => false
+
+/-- Finding M1 regression, direct unit (no decode): a fully-in-fragment module
+whose ONLY defect is an
+uncovered RETURN cap is a Check 1 violation — the param `Cap(IO.Console)` is
+covered by `needs IO.Console`, the return `Cap(IO.Network)` is not. -/
+def retCapUncovered : Module := {
+  decls := [Decl.dneeds ["IO.Console"],
+    Decl.dfn "get_net"
+      [("cap", Lin.unrestricted, some (Ty.con "Cap" [Ty.con "IO.Console" []]))]
+      (some (Ty.con "Cap" [Ty.con "IO.Network" []]))
+      (Term.lit (Lit.int 0) (Ty.con "Int" []))],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps retCapUncovered  -- expect: violation (return IO.Network uncovered)
+example : (checkCaps retCapUncovered).isViolation = true := by native_decide
+
+/-- A covered RETURN cap must NOT be flagged: broad `needs IO` subsumes the
+returned `Cap(IO.Network)` (the param here is a plain `Int`, isolating the
+return path). -/
+def retCapCovered : Module := {
+  decls := [Decl.dneeds ["IO"],
+    Decl.dfn "get_net"
+      [("port", Lin.unrestricted, some (Ty.con "Int" []))]
+      (some (Ty.con "Cap" [Ty.con "IO.Network" []]))
+      (Term.lit (Lit.int 0) (Ty.con "Int" []))],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps retCapCovered  -- expect: ok
+example : (checkCaps retCapCovered).isViolation = false := by native_decide
+
+/-- The gate that keeps accept/t62 safe: a module carrying an out-of-fragment
+declaration (here a bare `Decl.unsupported`, standing in for `proof cap
+Migrated`) does NOT get its return caps scanned. march covers t62's returned
+`Cap(Db.Migrated)` — under only `needs IO` — via the self-declaration
+exemption this checker does not model, and ACCEPTS. So `checkCaps` must NOT
+reject: it defers to the downstream out-of-fragment skip gate. Without the
+gate, the uncovered `Db.Migrated` return would wrongly reject an accept file. -/
+def retProofCapDeferred : Module := {
+  decls := [Decl.unsupported,   -- e.g. `proof cap Migrated`
+            Decl.dneeds ["IO"],
+    Decl.dfn "run_migrations"
+      [("cap", Lin.unrestricted, some (Ty.con "Cap" [Ty.con "IO" []]))]
+      (some (Ty.con "Cap" [Ty.con "Db.Migrated" []]))
+      (Term.lit (Lit.int 0) (Ty.con "Int" []))],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps retProofCapDeferred  -- expect: ok (deferred, NOT rejected)
+example : (checkCaps retProofCapDeferred).isViolation = false := by native_decide
 
 end MarchLean.CapCheck

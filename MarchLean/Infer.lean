@@ -878,7 +878,10 @@ def inferModule' (s : Supply) (m : Module) : InferM (List (Span × MTy)) := do
         let t ← infer s { ctx with level := ctx.level + 1 } rhs
         let sch ← generalize s ctx.level t
         ctx := ctx.addScheme name sch
-    | .dfn name params body => do
+    | .dfn name params _ body => do
+        -- `retAnnot` (the surface return type) is ignored: inference derives
+        -- the body's type and cross-checks `resolved_ty`, rather than trusting
+        -- the annotation. It exists only for `CapCheck`'s Check 1 return scan.
         let lvl := ctx.level + 1
         let recTy ← freshMVar s lvl
         let paramMTys ← params.mapM (fun _ => freshMVar s lvl)
