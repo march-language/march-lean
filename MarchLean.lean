@@ -5,3 +5,5 @@ import MarchLean.Result
 import MarchLean.Linearity
 import MarchLean.Infer
 import MarchLean.Compare
+import MarchLean.CapLattice
+import MarchLean.CapCheck

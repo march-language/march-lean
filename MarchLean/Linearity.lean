@@ -199,10 +199,17 @@ def checkDecl : Decl → CheckResult
       | other => other
   | .dlet _ body => checkTerm body
   | .dtype _ _ _ => .ok
+  -- A3 Task 2 decode-only constructors: no term of their own to check.
+  -- `dmod` is inert-but-unreachable here: `checkLinearity` flattens nested
+  -- `dmod`s via `flattenDecls` before this is ever called, so its children
+  -- already appear as top-level decls.
+  | .dmod .. | .dneeds _ | .duse _ | .dextern _ => .ok
   | .unsupported => .ok
 
+/-- Flattens nested `dmod` bodies into the enclosing scope first — linearity
+treats a module as transparent (see `flattenDecls`'s docstring). -/
 def checkLinearity (m : Module) : CheckResult :=
-  m.decls.foldl (fun acc d => match acc with | .ok => checkDecl d | o => o) .ok
+  (flattenDecls m.decls).foldl (fun acc d => match acc with | .ok => checkDecl d | o => o) .ok
 
 end MarchLean.Linearity
 
