@@ -196,6 +196,13 @@ partial def decodeSurfaceTy (paramNames : List String) (j : Json) : Except Strin
       -- plain `Ty.con name args` path below. A capability is always
       -- `Cap(permission)`; a bare `Cap` never is. -/
       if name == "Cap" && !args.isEmpty then .ok (Ty.con "Cap" args)
+      -- `Tagged(_, Realtime)` drives march's Check 7 realtime exclusion, out
+      -- of A3 slice (a)'s fragment: an applied `Tagged` (mirroring the `Cap`
+      -- carve-out above) decodes to `Ty.unsupported` so the whole file
+      -- honestly skips rather than being silently accepted against a rule
+      -- A3 does not model. A hypothetical nullary `Tagged` user ADT (none
+      -- exists today) would stay a normal `Ty.con` here, same as bare `Cap`.
+      else if name == "Tagged" && !args.isEmpty then .ok Ty.unsupported
       else .ok (Ty.con name args)
   | "TyVar" =>
       let (name, _) ← decodeName (← field j "name")
@@ -536,13 +543,31 @@ partial def decodeDecl (j : Json) : Except String Decl := do
         pure (String.intercalate "." segs))
       .ok (Decl.dneeds paths)
   | "DUse" => do
-      -- The imported module path lives at `use.path` (a name-object list);
-      -- `use.selector` is ignored — Check 4 only needs the module name
-      -- (verified shape, samples/t39).
+      -- The imported module path lives at `use.path` (a name-object list).
+      -- `use.selector.kind` distinguishes a plain whole-module `use Vault`
+      -- (`"UseSingle"`) from a selective `use Array.{lst_rev}`
+      -- (`"UseNames"`). Selective import selects specific names whose
+      -- visibility/privacy A3 does not model (march's import-name-privacy
+      -- rule, reject/t27, is out of this slice's fragment); a plain
+      -- whole-module `use` stays in fragment for Check 4 (verified shape,
+      -- samples/t39). Defensive: if `selector`/`selector.kind` is missing or
+      -- an unexpected shape, fall back to the plain-`use` behavior rather
+      -- than erroring.
       let useJ ← field j "use"
-      let pathJ ← (← field useJ "path").getArr?.mapError (fun _ => "DUse.path")
-      let segs ← pathJ.toList.mapM (fun s => do let (t, _) ← decodeName s; pure t)
-      .ok (Decl.duse (String.intercalate "." segs))
+      let selectorKind : String :=
+        match useJ.getObjVal? "selector" with
+        | .error _ => "UseSingle"
+        | .ok sel =>
+            match sel.getObjVal? "kind" with
+            | .error _ => "UseSingle"
+            | .ok k => match k.getStr? with
+              | .error _ => "UseSingle"
+              | .ok s => s
+      if selectorKind == "UseNames" then .ok Decl.unsupported
+      else
+        let pathJ ← (← field useJ "path").getArr?.mapError (fun _ => "DUse.path")
+        let segs ← pathJ.toList.mapM (fun s => do let (t, _) ← decodeName s; pure t)
+        .ok (Decl.duse (String.intercalate "." segs))
   | "DExtern" => do
       -- The capability type lives at `extern.cap_ty` (NOT top-level), and is
       -- a type node, not a string (verified shape, samples/t50). An
@@ -662,13 +687,24 @@ open Lean MarchLean.Elab MarchLean.Syntax
   | .ok j    => IO.println (repr (decodeDecl j))
   -- expect: Except.ok (Decl.dneeds ["Clock", "IO.FileRead"])
 
--- DUse: module path, ignoring `use.selector`.
+-- DUse: plain whole-module use (`selector.kind == "UseSingle"`) still
+-- decodes to Decl.duse — Check 4 needs it.
 #eval show IO Unit from do
   let j := Json.parse r#"{"kind":"DUse","use":{"path":[{"txt":"Vault","span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}}],"selector":{"kind":"UseSingle"}},"span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}}"#
   match j with
   | .error e => IO.println s!"parse failed: {e}"
   | .ok j    => IO.println (repr (decodeDecl j))
   -- expect: Except.ok (Decl.duse "Vault")
+
+-- DUse: selective `use Array.{lst_rev}` (`selector.kind == "UseNames"`)
+-- decodes to Decl.unsupported — import-name privacy is out of A3's fragment
+-- (reject/t27).
+#eval show IO Unit from do
+  let j := Json.parse r#"{"kind":"DUse","use":{"path":[{"txt":"Array","span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}}],"selector":{"kind":"UseNames","names":[{"txt":"lst_rev","span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}}]}},"span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}}"#
+  match j with
+  | .error e => IO.println s!"parse failed: {e}"
+  | .ok j    => IO.println (repr (decodeDecl j))
+  -- expect: Except.ok Decl.unsupported
 
 -- DExtern: cap_ty present, extracting the Cap(X) argument's constructor name.
 #eval show IO Unit from do
@@ -785,5 +821,21 @@ private def collisionEnvelope (nestedName : String) : String :=
   | .error e => IO.println s!"parse failed: {e}"
   | .ok j    => IO.println (repr (decodeOptAnnot j))
   -- expect: Except.ok (some (Ty.con "Cap" []))
+
+-- A3 fix: an APPLIED `Tagged(Int, Realtime)` param annotation decodes to a
+-- type containing `Ty.unsupported`, driving `Ty.hasUnsupported = true` — the
+-- realtime-tag construct that feeds march's Check 7 (realtime exclusion) is
+-- out of A3's fragment, so the whole file must skip (reject/t41), not be
+-- wrongly accepted for ignoring the tag.
+#eval show IO Unit from do
+  let j := Json.parse r#"{"ty":{"kind":"TyCon","name":{"txt":"Tagged","span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}},"args":[{"kind":"TyCon","name":{"txt":"Int","span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}},"args":[]},{"kind":"TyCon","name":{"txt":"Realtime","span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}},"args":[]}]}}"#
+  match j with
+  | .error e => IO.println s!"parse failed: {e}"
+  | .ok j    =>
+      match decodeOptAnnot j with
+      | .error e => IO.println s!"decode failed: {e}"
+      | .ok none => IO.println "UNEXPECTED: none"
+      | .ok (some t) => IO.println s!"hasUnsupported={t.hasUnsupported}"
+  -- expect: hasUnsupported=true
 
 end MarchLean.Elab.Test
