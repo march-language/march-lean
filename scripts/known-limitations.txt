@@ -1,0 +1,23 @@
+# A2-reject known-limitations allowlist.
+#
+# Reject-corpus files that march rejects for a reason A2 CANNOT SEE in the
+# Core AST it checks, so march-lean-check (A2's independent oracle) accepts
+# them (a would-be MISMATCH). Each listed file is reclassified by
+# scripts/conformance-harness.sh as KNOWN_LIMITATION instead of MISMATCH: it
+# is reported (count + filename) but does NOT fail the run.
+#
+# This is NOT a way to silence real divergences. It is enforced BOTH
+# directions, exactly like the skip ledger:
+#   - a listed file that NO LONGER wrong-accepts (A2 now skips or rejects it)
+#     is a STALE entry and FAILS the run — so the list can only shrink as A2
+#     improves, never rot;
+#   - a wrong-accept that is NOT on this list is still a hard MISMATCH.
+#
+# Every entry documents WHY the rejection is invisible to A2. The only
+# category so far: march's desugarer erases the rejecting construct before
+# --emit-core-ast runs, so the emitted Core AST is a well-typed residual
+# program A2 (correctly, independently) accepts. Detecting these would require
+# reading march's own verdict/diagnostics, which would defeat A2's purpose as
+# an INDEPENDENT oracle.
+reject/t23_derive_unknown_interface.march   # rejection reason erased by march's desugarer: `derive Frobnicate for Color` (unknown interface) expands to nothing; emitted Core AST is just `type Color` + `fn main`, well-typed. Invisible to the core AST A2 checks.
+reject/t49_derive_unknown_type.march   # rejection reason erased by march's desugarer: `derive Show for NoSuchType` (unknown type) expands to nothing; emitted Core AST is just `fn main`, well-typed. Invisible to the core AST A2 checks.

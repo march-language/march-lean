@@ -19,8 +19,21 @@
 #      disabled a class of checks) — a case plain MISMATCH can never catch,
 #      since at A0 the Lean side just echoes march's own verdict back
 #
-# and reports MATCH / MISMATCH / SKIP / ERROR / MARCH_SELF_INCONSISTENT /
-# CORPUS_VIOLATION counts, plus the filenames in every non-MATCH category.
+# and reports MATCH / MISMATCH / SKIP / ERROR / KNOWN_LIMITATION /
+# MARCH_SELF_INCONSISTENT / CORPUS_VIOLATION counts, plus the filenames in
+# every non-MATCH category.
+#
+# --- KNOWN_LIMITATION (A2-reject) ---
+# A handful of reject/*.march files are rejected by march for a reason that is
+# ERASED from the Core AST march-lean-check sees (e.g. a construct desugared
+# away before --emit-core-ast runs), so A2 independently — and correctly, given
+# only the residual well-typed program — accepts them. These would otherwise
+# read as MISMATCH forever with no in-fragment fix. scripts/known-limitations.txt
+# enumerates them (with reasons); a listed wrong-accept is reclassified as
+# KNOWN_LIMITATION (reported, NOT a failure). The list is enforced both
+# directions like the skip ledger: a listed file that no longer wrong-accepts
+# (A2 improved to skip/reject it) is a STALE entry and FAILS the run, and a
+# wrong-accept NOT on the list is still a hard MISMATCH.
 #
 # --- A1/A2 note: SKIP is normal, not a failure ---
 # At A0 the Lean side merely echoed march's own verdict back, so ANY skip
@@ -153,6 +166,21 @@ observed_skip_paths=""
 reject_skip_n=0
 self_inconsistent_files=""
 corpus_violation_files=""
+known_limitation_files=""
+observed_known_limitations=""
+
+# --- known-limitations allowlist (A2-reject) ---
+# Reject-corpus files march rejects for a reason ERASED from the Core AST A2
+# checks (e.g. a construct desugared away before --emit-core-ast), so A2
+# independently accepts them. Listed files are reclassified from MISMATCH to
+# KNOWN_LIMITATION below. Enforced both directions after the loop (a stale
+# entry — one that no longer wrong-accepts — fails the run).
+known_limitations_file="$(cd "$(dirname "$0")/.." && pwd)/scripts/known-limitations.txt"
+if [ -f "$known_limitations_file" ]; then
+    known_limitations_set="$(sed 's/#.*//; s/[[:space:]]*$//; /^$/d' "$known_limitations_file" | sort -u)"
+else
+    known_limitations_set=""
+fi
 
 json_tmp="$(mktemp)"
 trap 'rm -f "$json_tmp"' EXIT
@@ -170,6 +198,7 @@ for f in "$corpus_dir"/accept/*.march "$corpus_dir"/reject/*.march; do
         reject) expected_verdict="reject" ;;
         *) expected_verdict="unknown" ;;
     esac
+    rel_path="$parent_dir/$(basename "$f")"
 
     if "$march_bin" --check "$f" >/dev/null 2>&1; then
         march_verdict="accept"
@@ -228,12 +257,22 @@ for f in "$corpus_dir"/accept/*.march "$corpus_dir"/reject/*.march; do
         # the skip-ledger comparison below — both sides are now
         # ledger-tracked (see the ledger-enforcement block after the loop).
         skip_files="$skip_files$f (lean_verdict=skip, march_verdict=$march_verdict)"$'\n'
-        observed_skip_paths="$observed_skip_paths$parent_dir/$(basename "$f")"$'\n'
+        observed_skip_paths="$observed_skip_paths$rel_path"$'\n'
         if [ "$parent_dir" = "accept" ]; then
-            accept_skip_paths="$accept_skip_paths$parent_dir/$(basename "$f")"$'\n'
+            accept_skip_paths="$accept_skip_paths$rel_path"$'\n'
         else
             reject_skip_n=$((reject_skip_n + 1))
         fi
+    elif [ "$march_verdict" = "reject" ] && { [ "$lean_verdict" = "accept" ] || [ "$lean_verdict" = "types_differ" ]; } \
+         && printf '%s\n' "$known_limitations_set" | grep -Fxq "$rel_path"; then
+        # A2 did not reject a march-reject (it accepted, or accepted-but-types-
+        # differ), AND this file is on the known-limitations allowlist: march
+        # rejects for a reason erased from the Core AST A2 checks. Reclassify
+        # from MISMATCH to KNOWN_LIMITATION — reported, but not a failure. The
+        # allowlist is enforced both directions after the loop (a listed file
+        # that no longer wrong-accepts is a stale entry and fails).
+        known_limitation_files="$known_limitation_files$f (march=reject, lean=$lean_verdict; on known-limitations allowlist)"$'\n'
+        observed_known_limitations="$observed_known_limitations$rel_path"$'\n'
     elif [ "$lean_verdict" = "types_differ" ]; then
         mismatch_files="$mismatch_files$f (A2 accepts but per-node types differ from resolved_ty; march=$march_verdict)"$'\n'
     elif [ "$march_verdict" != "$lean_verdict" ]; then
@@ -253,6 +292,7 @@ done
 
 mismatch_n=$(printf '%s' "$mismatch_files" | grep -c . || true)
 error_n=$(printf '%s' "$error_files" | grep -c . || true)
+known_limitation_n=$(printf '%s' "$known_limitation_files" | grep -c . || true)
 skip_n=$(printf '%s' "$skip_files" | grep -c . || true)
 accept_skip_n=$(printf '%s' "$accept_skip_paths" | grep -c . || true)
 self_inconsistent_n=$(printf '%s' "$self_inconsistent_files" | grep -c . || true)
@@ -286,6 +326,21 @@ else
     fi
 fi
 
+# --- known-limitations enforcement (both directions) ---
+# A listed file that was NOT observed wrong-accepting is STALE: A2 now skips or
+# rejects it (an improvement), so the entry must be removed. This mirrors the
+# skip ledger's stale-entry check and keeps the allowlist strictly shrinking.
+known_limitations_fail=0
+if [ -n "$known_limitations_set" ]; then
+    observed_known_sorted="$(printf '%s\n' "$observed_known_limitations" | sed '/^$/d' | sort -u)"
+    known_stale="$(comm -23 <(printf '%s\n' "$known_limitations_set") <(printf '%s\n' "$observed_known_sorted"))"
+    if [ -n "$known_stale" ]; then
+        known_limitations_fail=1
+    fi
+else
+    known_stale=""
+fi
+
 echo "==================================================================="
 echo "Conformance harness summary"
 echo "==================================================================="
@@ -298,9 +353,11 @@ echo "MATCH:                    $match_count"
 echo "MISMATCH:                 $mismatch_n"
 echo "ERROR:                    $error_n"
 echo "SKIP:                     $skip_n  (accept-side: $accept_skip_n, reject-side: $reject_skip_n)"
+echo "KNOWN_LIMITATION:         $known_limitation_n"
 echo "MARCH_SELF_INCONSISTENT:  $self_inconsistent_n"
 echo "CORPUS_VIOLATION:         $corpus_violation_n"
 echo "SKIP-LEDGER:              $([ "$ledger_fail" -eq 0 ] && echo OK || echo MISMATCH)"
+echo "KNOWN-LIMITATIONS:        $([ "$known_limitations_fail" -eq 0 ] && echo OK || echo STALE)"
 echo "-------------------------------------------------------------------"
 
 if [ "$mismatch_n" -gt 0 ]; then
@@ -321,6 +378,14 @@ if [ "$ledger_fail" -ne 0 ]; then
     echo "   lines prefixed '>' are observed skipping but NOT in the ledger — coverage regression)"
     printf '%s\n' "$ledger_diff" | sed '/^$/d;s/^/  /'
 fi
+if [ "$known_limitation_n" -gt 0 ]; then
+    echo "KNOWN_LIMITATION files (march=reject, but the rejection reason is invisible to the Core AST A2 checks — see scripts/known-limitations.txt; reported, NOT a failure):"
+    printf '%s' "$known_limitation_files" | sed '/^$/d;s/^/  - /'
+fi
+if [ "$known_limitations_fail" -ne 0 ]; then
+    echo "KNOWN-LIMITATIONS STALE — these files are on scripts/known-limitations.txt but no longer wrong-accept (A2 now skips or rejects them). Remove them from the allowlist:"
+    printf '%s\n' "$known_stale" | sed '/^$/d;s/^/  - /'
+fi
 if [ "$self_inconsistent_n" -gt 0 ]; then
     echo "MARCH_SELF_INCONSISTENT files (--check disagrees with --emit-core-ast's own verdict field):"
     printf '%s' "$self_inconsistent_files" | sed '/^$/d;s/^/  - /'
@@ -332,7 +397,7 @@ fi
 
 echo "==================================================================="
 
-if [ "$mismatch_n" -gt 0 ] || [ "$error_n" -gt 0 ] || [ "$self_inconsistent_n" -gt 0 ] || [ "$corpus_violation_n" -gt 0 ] || [ "$ledger_fail" -ne 0 ]; then
+if [ "$mismatch_n" -gt 0 ] || [ "$error_n" -gt 0 ] || [ "$self_inconsistent_n" -gt 0 ] || [ "$corpus_violation_n" -gt 0 ] || [ "$ledger_fail" -ne 0 ] || [ "$known_limitations_fail" -ne 0 ]; then
     echo "RESULT: FAIL"
     exit 1
 else
