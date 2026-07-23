@@ -183,8 +183,17 @@ inductive Decl where
   `dfn` carries no arrow type of its own; params' types (when needed) come from
   the enclosing context, not from a node field. Each param carries its optional
   surface type annotation (`Option Ty`) — `Infer` unifies an annotated param
-  with its annotation. -/
-  | dfn (name : String) (params : List (String × Lin × Option Ty)) (body : Term)
+  with its annotation.
+
+  `retAnnot` is the function's optional surface RETURN-type annotation (the
+  `Cap(IO.Network)` in `fn f(…) : Cap(IO.Network)`), decoded from the emitter's
+  `ret_ty`. It is `none` for an unannotated `fn`, and — like a param annotation
+  — is always in fragment when present, because the decoder forces the whole
+  declaration to `Decl.unsupported` when the return annotation is out of
+  fragment. `CapCheck.capsInReturnSignature` scans it so Check 1 covers
+  `param_tys @ ret_tys` exactly as march's `check_module_needs` does; `Infer`
+  ignores it (it infers the body's type, not the annotation). -/
+  | dfn (name : String) (params : List (String × Lin × Option Ty)) (retAnnot : Option Ty) (body : Term)
   | dlet (name : String) (rhs : Term)
   | dtype (name : String) (params : List String) (ctors : List CtorSig)
   /-- A nested module, `mod Name do … end`. Carried as a TREE because `needs`
@@ -216,8 +225,9 @@ through `List Decl` inside `dmod` isn't structurally recognized by the
 kernel, matching how `Term.hasUnsupported` handles its own nesting. -/
 partial def Decl.hasUnsupported : Decl → Bool
   | .unsupported => true
-  | .dfn _ params body =>
-      params.any (fun (_, _, a) => optTyHasUnsupported a) || body.hasUnsupported
+  | .dfn _ params retAnnot body =>
+      params.any (fun (_, _, a) => optTyHasUnsupported a)
+        || optTyHasUnsupported retAnnot || body.hasUnsupported
   | .dlet _ body => body.hasUnsupported
   | .dtype _ _ ctors =>
       ctors.any (fun c => c.argTys.any Ty.hasUnsupported || c.resultTy.hasUnsupported)

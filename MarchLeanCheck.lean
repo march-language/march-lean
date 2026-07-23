@@ -77,3 +77,50 @@ def run (input : String) : IO UInt32 := do
 def main : IO UInt32 := do
   let input ← (← IO.getStdin).readToEnd
   run input
+
+namespace MarchLean.Test
+open MarchLean
+
+/-- Finding M1 regression (end-to-end, over real emitter output). march scans
+`param_tys @ ret_tys` for Check 1 (`typecheck.ml`'s `check_module_needs`), but
+`CapCheck.capsInSignature` used to scan only params — so a module whose ONLY
+capability defect is an uncovered RETURN-type `Cap(X)` was wrongly accepted by
+the cap checker. This exercises the whole path — `Elab.decodeModule` (which
+must surface `ret_ty` onto `Decl.dfn.retAnnot`) then `CapCheck.checkCaps` —
+guarding BOTH the decoder threading and the return-cap union at once.
+
+The envelope is `march --emit-core-ast` output (format_version 3) for
+
+    mod Server do
+      needs IO.Console
+      fn get_net(cap : Cap(IO.Console)) : Cap(IO.Network) do cap_narrow(root_cap) end
+    end
+
+with the body trimmed to `0 : Int` (kept in fragment so the module stays fully
+in fragment and the return-cap scan fires — see the gate in
+`CapCheck.checkOneModule`) and spans normalised to `"f"`. march rejects it:
+`Cap(IO.Network)` (the RETURN) is not covered by `needs IO.Console` (siblings);
+the param `Cap(IO.Console)` IS covered, so the sole defect is the return cap.
+Before the fix `checkCaps` returned `.ok`; now it must return a `.violation`. -/
+def retCapEnvelope : String :=
+  r#"{"diagnostics":[],"format_version":3,"instantiations":[],"module":{"decls":[{"kind":"DNeeds","paths":[[{"span":{"end_col":2,"end_line":1,"file":"f","start_col":1,"start_line":1},"txt":"IO"},{"span":{"end_col":2,"end_line":1,"file":"f","start_col":1,"start_line":1},"txt":"Console"}]],"span":{"end_col":2,"end_line":1,"file":"f","start_col":1,"start_line":1}},{"fn":{"attrs":[],"bounds":[],"clauses":[{"body":{"kind":"ELit","literal":{"kind":"LitInt","value":0},"resolved_ty":{"kind":"TCon","name":"Int","args":[]}},"guard":null,"params":[{"kind":"FPNamed","param":{"lin":{"kind":"Unrestricted"},"name":{"span":{"end_col":2,"end_line":1,"file":"f","start_col":1,"start_line":1},"txt":"cap"},"ty":{"args":[{"args":[],"kind":"TyCon","name":{"span":{"end_col":2,"end_line":1,"file":"f","start_col":1,"start_line":1},"txt":"IO.Console"}}],"kind":"TyCon","name":{"span":{"end_col":2,"end_line":1,"file":"f","start_col":1,"start_line":1},"txt":"Cap"}}}}],"span":{"end_col":2,"end_line":1,"file":"f","start_col":1,"start_line":1}}],"doc":null,"name":{"span":{"end_col":2,"end_line":1,"file":"f","start_col":1,"start_line":1},"txt":"get_net"},"ret_ty":{"args":[{"args":[],"kind":"TyCon","name":{"span":{"end_col":2,"end_line":1,"file":"f","start_col":1,"start_line":1},"txt":"IO.Network"}}],"kind":"TyCon","name":{"span":{"end_col":2,"end_line":1,"file":"f","start_col":1,"start_line":1},"txt":"Cap"}},"vis":{"kind":"Public"}},"kind":"DFn","span":{"end_col":2,"end_line":1,"file":"f","start_col":1,"start_line":1}}],"name":{"span":{"end_col":2,"end_line":1,"file":"f","start_col":1,"start_line":1},"txt":"Server"}},"module_caps":[],"schemes":[],"verdict":"reject"}"#
+
+#eval show IO Unit from do
+  match Lean.Json.parse retCapEnvelope with
+  | .error e => IO.println s!"parse failed: {e}"
+  | .ok j    => match Elab.decodeModule j with
+    | .error e => IO.println s!"decode failed: {e}"
+    | .ok m    => IO.println s!"verdict={repr (CapCheck.checkCaps m)}"
+  -- expect: verdict=(CapResult.violation "Check 1: `Cap(IO.Network)` ...")
+
+/-- Enforced M1 guard: decoding the real envelope above and cap-checking it
+MUST reject. Fails to build if the return-cap scan ever regresses — the decoder
+dropping `ret_ty`, or `capsInReturnSignature` no longer being unioned in. -/
+example :
+    (match Lean.Json.parse retCapEnvelope with
+     | .ok j => match Elab.decodeModule j with
+                | .ok m => (CapCheck.checkCaps m).isViolation
+                | .error _ => false
+     | .error _ => false) = true := by native_decide
+
+end MarchLean.Test

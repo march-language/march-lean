@@ -426,7 +426,7 @@ carry no name into the value/type namespace); `dmod`'s own decls are walked
 separately by `flattenedBindingNames`, one scope level at a time, so `dmod`
 itself contributes nothing here. -/
 def declBindingName : Decl → Option String
-  | .dfn n _ _ => some n
+  | .dfn n _ _ _ => some n
   | .dlet n _ => some n
   | .dtype n _ _ => some n
   | .dmod _ _ | .dneeds _ | .duse _ | .dextern _ | .unsupported => none
@@ -459,21 +459,29 @@ partial def decodeDecl (j : Json) : Except String Decl := do
   | "DFn" => do
       let fn ← field j "fn"
       let (name, _) ← decodeName (← field fn "name")
-      -- The declared return-type annotation. A refinement (`{Int | _ >= 0}` →
-      -- `TyRefine`), a session channel, or any other out-of-fragment return
-      -- type decodes (via `decodeSurfaceTy`) to a type containing
-      -- `Ty.unsupported`. The `Decl.dfn`/`Decl.dlet` shapes carry no
-      -- return-type field, so we cannot thread it through — instead, a
-      -- return type that is out of fragment forces the whole declaration to
-      -- `Decl.unsupported`, so the file honestly skips rather than checking
-      -- only the (in-fragment) body and ignoring the annotation march
-      -- rejected against (reject/t72). A missing or `null` `ret_ty` (an
-      -- unannotated `fn`) imposes no such constraint.
-      let retUnsupported ← (match fn.getObjVal? "ret_ty" with
-        | .ok v => if v.isNull then pure false else do
+      -- The declared return-type annotation (`ret_ty`), decoded as `Option Ty`
+      -- (`none` for an unannotated `fn` or a `null` `ret_ty`). A refinement
+      -- (`{Int | _ >= 0}` → `TyRefine`), a session channel, or any other
+      -- out-of-fragment return type decodes (via `decodeSurfaceTy`) to a type
+      -- containing `Ty.unsupported`; such a return forces the whole
+      -- declaration to `Decl.unsupported` (below), so the file honestly skips
+      -- rather than checking only the (in-fragment) body and ignoring the
+      -- annotation march rejected against (reject/t72). A missing/`null`
+      -- `ret_ty` imposes no such constraint. An IN-fragment annotation is
+      -- threaded onto `Decl.dfn.retAnnot` so `CapCheck` can scan it for
+      -- Check 1: march scans `param_tys @ ret_tys` (`check_module_needs`), and
+      -- a `Cap(X)` in RETURN position is exactly the coverage gap this closes.
+      -- (`Decl.dlet` — the 0-param case — still carries no return field, so a
+      -- 0-param `fn () : Cap(X)` drops its return annotation as before; the M1
+      -- gap is about multi-param `Decl.dfn`s.)
+      let retTy ← (match fn.getObjVal? "ret_ty" with
+        | .ok v => if v.isNull then pure none else do
             let t ← decodeSurfaceTy [] v
-            pure t.hasUnsupported
-        | .error _ => pure false : Except String Bool)
+            pure (some t)
+        | .error _ => pure none : Except String (Option Ty))
+      let retUnsupported := match retTy with
+        | some t => t.hasUnsupported
+        | none => false
       let clausesJ ← (← field fn "clauses").getArr?.mapError (fun _ => "clauses")
       match clausesJ.toList with
       | [clause] => do
@@ -496,9 +504,10 @@ partial def decodeDecl (j : Json) : Except String Decl := do
                 let body ← decodeTerm bodyJ
                 .ok (Decl.dlet name body)
             | some params =>
-                -- N-ary: carry the whole param list directly (no currying).
+                -- N-ary: carry the whole param list directly (no currying),
+                -- plus the (in-fragment) return annotation for Check 1.
                 let body ← decodeTerm bodyJ
-                .ok (Decl.dfn name params body)
+                .ok (Decl.dfn name params retTy body)
       | _ => .ok Decl.unsupported   -- 0 or 2+ clauses: multi-clause fns unsupported
   | "DLet" => do
       let binding ← field j "binding"
