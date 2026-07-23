@@ -71,7 +71,7 @@ jobs:
         id: setup-march
         uses: march-language/setup-march@main
         with:
-          march-version: 733e7a0ba80d1bd7626beb5540555bad36047e8b
+          march-version: 3e4b0e0351a1edb646a3824fd29b2eb70db3ec63
 
       # Only the static-semantics corpus is needed from march's own repo
       # (the binary itself came from setup-march above); pinned to the
