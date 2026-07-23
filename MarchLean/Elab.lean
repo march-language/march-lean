@@ -185,16 +185,17 @@ partial def decodeSurfaceTy (paramNames : List String) (j : Json) : Except Strin
       let (name, _) ← decodeName (← field j "name")
       let args ← (← (← field j "args").getArr?.mapError (fun _ => "args")).toList.mapM (decodeSurfaceTy paramNames)
       -- `Cap(perm)` is march's capability type — a `TyCon` named `Cap` APPLIED
-      -- to a permission argument (`Cap(IO.Network)`), out of the Core+linearity
-      -- fragment (A2 models no capability discipline). Decode it to
-      -- `Ty.unsupported` so a signature like `fn listen(cap : Cap(IO.Network),
-      -- ...)` trips the whole-file skip gate (`Decl.hasUnsupported`) rather than
-      -- being mistaken for an ordinary ADT and letting the residual program
-      -- falsely accept (reject/t36). The APPLIED test (`args ≠ []`) is load-
-      -- bearing: a *nullary* `Cap` is an ordinary user ADT (`type Cap = C(Int)`
-      -- in accept/t80), NOT the capability type, and must stay in fragment. A
-      -- capability is always `Cap(permission)`; a bare `Cap` never is. -/
-      if name == "Cap" && !args.isEmpty then .ok Ty.unsupported
+      -- to a permission argument (`Cap(IO.Network)`). Under the A3 capability
+      -- lattice design (design §5) this is now first-class and modeled: decode
+      -- it to `Ty.con "Cap" args`, preserving the permission argument, so
+      -- `CapCheck.capsInTy`'s `Ty.con "Cap" [Ty.con x _]` shape can match it and
+      -- the capability checker (Check 1) can actually fire against real march
+      -- output. The APPLIED test (`args ≠ []`) is still load-bearing: a
+      -- *nullary* `Cap` is an ordinary user ADT (`type Cap = C(Int)` in
+      -- accept/t80), NOT the capability type, and must keep flowing through the
+      -- plain `Ty.con name args` path below. A capability is always
+      -- `Cap(permission)`; a bare `Cap` never is. -/
+      if name == "Cap" && !args.isEmpty then .ok (Ty.con "Cap" args)
       else .ok (Ty.con name args)
   | "TyVar" =>
       let (name, _) ← decodeName (← field j "name")
@@ -762,5 +763,27 @@ private def collisionEnvelope (nestedName : String) : String :=
       | .error e => IO.println s!"decode failed as expected: {e}"
       | .ok _    => IO.println "UNEXPECTED: decoded ok, should have errored"
   -- expect: "decode failed as expected: missing field 'module_caps'"
+
+-- A3 fix: an APPLIED `Cap(IO.Network)` param annotation now decodes to the
+-- first-class capability con `Ty.con "Cap" [Ty.con "IO.Network" []]`, NOT
+-- `Ty.unsupported` — this is the shape `CapCheck.capsInTy`'s
+-- `Ty.con "Cap" [Ty.con x _]` match requires for Check 1 to ever fire.
+#eval show IO Unit from do
+  let j := Json.parse r#"{"ty":{"kind":"TyCon","name":{"txt":"Cap","span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}},"args":[{"kind":"TyCon","name":{"txt":"IO.Network","span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}},"args":[]}]}}"#
+  match j with
+  | .error e => IO.println s!"parse failed: {e}"
+  | .ok j    => IO.println (repr (decodeOptAnnot j))
+  -- expect: Except.ok (some (Ty.con "Cap" [Ty.con "IO.Network" []]))
+
+-- Regression guard: a NULLARY `Cap` (the user ADT `type Cap = C(Int)` from
+-- accept/t80 — no applied argument) must still decode as an ordinary `Ty.con
+-- "Cap" []`, i.e. it must NOT be mistaken for the capability con. Only the
+-- APPLIED form is special-cased.
+#eval show IO Unit from do
+  let j := Json.parse r#"{"ty":{"kind":"TyCon","name":{"txt":"Cap","span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}},"args":[]}}"#
+  match j with
+  | .error e => IO.println s!"parse failed: {e}"
+  | .ok j    => IO.println (repr (decodeOptAnnot j))
+  -- expect: Except.ok (some (Ty.con "Cap" []))
 
 end MarchLean.Elab.Test
