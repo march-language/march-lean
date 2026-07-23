@@ -36,7 +36,7 @@ def run (input : String) : IO UInt32 := do
   | .error e => IO.eprintln s!"invalid JSON: {e}"; pure 3
   | .ok envelope =>
     -- Version/format gate ONLY: reuse parseVerdict for the malformed /
-    -- format_version≠2 check (→ exit 3), but IGNORE march's verdict — A2
+    -- format_version≠3 check (→ exit 3), but IGNORE march's verdict — A2
     -- renders its OWN verdict below (pure-independent).
     match MarchLean.Json.parseVerdict input with
     | .error msg => IO.eprintln msg; pure 3

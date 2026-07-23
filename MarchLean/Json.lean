@@ -40,7 +40,7 @@ Parse march's `--emit-core-ast` JSON envelope and extract the verdict.
 
 - Fails with `"invalid JSON: ..."` if `input` isn't valid JSON.
 - Fails with `"missing format_version"` / `"unsupported format_version: ..."`
-  if the `format_version` field is absent, not a number, or not equal to `2`.
+  if the `format_version` field is absent, not a number, or not equal to `3`.
 - Fails with `"missing verdict"` / `"unexpected verdict: ..."` if the
   `verdict` field is absent, not a string, or not exactly `"accept"` or
   `"reject"`.

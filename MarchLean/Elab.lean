@@ -4,14 +4,14 @@ import MarchLean.Syntax
 /-!
 # `MarchLean.Elab`
 
-Decodes march's real `--emit-core-ast` **format_version 2** JSON envelope
+Decodes march's real `--emit-core-ast` **format_version 3** JSON envelope
 into the `MarchLean.Syntax` types (Task 2). The envelope shape (verified
 against `march`'s encoder, `lib/dump/ast_json.ml`, and the 8 real samples in
 `.superpowers/sdd/samples/*.json` — NOT the task brief's placeholder
 snippets, which guessed at some key paths before the real emitter existed):
 
 ```
-{ "format_version": 2, "verdict": "accept"|"reject", "diagnostics": [...],
+{ "format_version": 3, "verdict": "accept"|"reject", "diagnostics": [...],
   "module": { "name": <name>, "decls": [<decl>...] },
   "schemes": [ {"ids":[Int...], "constraints":[<constraint>...], "body":<ty>} ... ],
   "instantiations": [ {"use_span":<span>, "ids":[Int...], "args":[<ty>...]} ... ] }
