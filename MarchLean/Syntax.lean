@@ -130,7 +130,7 @@ inductive Term where
   | field (record : Term) (name : String) (span : Span) (ty : Ty)
   | match_ (scrut : Term) (arms : List (Pattern × Term)) (ty : Ty)
   | unsupported (ty : Ty)
-  deriving Inhabited
+  deriving Repr, Inhabited
 
 /-- The type annotation on a term node. -/
 def Term.ty : Term → Ty
@@ -187,19 +187,44 @@ inductive Decl where
   | dfn (name : String) (params : List (String × Lin × Option Ty)) (body : Term)
   | dlet (name : String) (rhs : Term)
   | dtype (name : String) (params : List String) (ctors : List CtorSig)
+  /-- A nested module, `mod Name do … end`. Carried as a TREE because `needs`
+  is scoped to its own module: Check 1 asks whether *this* module's declared
+  needs cover the `Cap(X)` types in *this* module's signatures. Inference, by
+  contrast, treats a module as transparent and splices its decls into the
+  enclosing scope (see `Compare.flattenDecls`) — an approximation that holds
+  only while names do not collide across sibling modules, which
+  `Elab.decodeModule` guards against. -/
+  | dmod (name : String) (decls : List Decl)
+  /-- `needs IO.FileRead, IO.Clock` — the module's capability manifest, as
+  dot-joined paths. -/
+  | dneeds (paths : List String)
+  /-- `use Vault` — a module import, as a dot-joined path. Drives Check 4. -/
+  | duse (path : String)
+  /-- An `extern "lib" : Cap(X) do … end` block. `capTy` is the dot-joined
+  `X`, or `none` when the block declares no capability. Drives Check 5. -/
+  | dextern (capTy : Option String)
   | unsupported
-  deriving Inhabited
+  deriving Repr, Inhabited
 
 /-- Is this declaration (or any term/type it carries) out of fragment?
 `dtype` carries no terms, but its constructor signatures may reference
-out-of-fragment types, so those are checked too. -/
-def Decl.hasUnsupported : Decl → Bool
+out-of-fragment types, so those are checked too. The four A3 constructors are
+IN fragment on their own (`dneeds`/`duse`/`dextern` carry no term/type of
+their own); `dmod` recurses into its nested decls, since one of those could
+still be an unsupported `dfn`/`dlet`/`dtype`. Marked `partial`: the recursion
+through `List Decl` inside `dmod` isn't structurally recognized by the
+kernel, matching how `Term.hasUnsupported` handles its own nesting. -/
+partial def Decl.hasUnsupported : Decl → Bool
   | .unsupported => true
   | .dfn _ params body =>
       params.any (fun (_, _, a) => optTyHasUnsupported a) || body.hasUnsupported
   | .dlet _ body => body.hasUnsupported
   | .dtype _ _ ctors =>
       ctors.any (fun c => c.argTys.any Ty.hasUnsupported || c.resultTy.hasUnsupported)
+  | .dmod _ decls => decls.any Decl.hasUnsupported
+  | .dneeds _ => false
+  | .duse _ => false
+  | .dextern _ => false
 
 structure Scheme where
   ids : List Int
@@ -217,6 +242,15 @@ structure Module where
   decls : List Decl
   schemes : List Scheme
   insts : List Instantiation
+  /-- The v3 `module_caps` envelope table: `(module name, declared needs)`
+  pairs, keyed by bare module name (duplicates already resolved by the
+  emitter — see `Elab.decodeModule`). Only records modules nested one level
+  below the file's top-level module; NOT a complete module→needs map (see
+  the A3 Task 2 shape-limits note). Drives Check 4.
+  Defaults to `[]` so the many hand-built `Module` test fixtures elsewhere
+  (`Linearity.lean`, `Compare.lean`, `Infer.lean`) that predate A3 and don't
+  exercise capability checking keep compiling unchanged. -/
+  moduleCaps : List (String × List String) := []
   deriving Inhabited
 
 end MarchLean.Syntax

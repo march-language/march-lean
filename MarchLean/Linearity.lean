@@ -199,6 +199,10 @@ def checkDecl : Decl → CheckResult
       | other => other
   | .dlet _ body => checkTerm body
   | .dtype _ _ _ => .ok
+  -- A3 Task 2 decode-only constructors: no term of their own to check.
+  -- `dmod`'s nested decls are left to Task 4's flattening (splicing them
+  -- into this same enclosing scope), same deferral as `Infer.inferModule'`.
+  | .dmod .. | .dneeds _ | .duse _ | .dextern _ => .ok
   | .unsupported => .ok
 
 def checkLinearity (m : Module) : CheckResult :=

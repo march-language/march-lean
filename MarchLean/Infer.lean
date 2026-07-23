@@ -868,6 +868,12 @@ def inferModule' (s : Supply) (m : Module) : InferM (List (Span × MTy)) := do
   for d in m.decls do
     match d with
     | .dtype .. => pure ()
+    -- A3 Task 2 decode-only constructors: no term of their own to infer.
+    -- `dmod`'s nested decls are not walked here — Task 4's flattening
+    -- (splicing them into this same loop) is what will make them visible
+    -- to inference; until then they're simply not type-checked, same as
+    -- any other not-yet-spliced-in scope.
+    | .dmod .. | .dneeds .. | .duse .. | .dextern .. => pure ()
     | .dlet name rhs => do
         let t ← infer s { ctx with level := ctx.level + 1 } rhs
         let sch ← generalize s ctx.level t

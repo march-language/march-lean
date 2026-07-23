@@ -389,12 +389,63 @@ def decodeFnParams (ps : List Json) : Except String (Option (List (String × Lin
   if raw.any Option.isNone then .ok none
   else .ok (some (raw.filterMap id))
 
-/-- Decode a top-level `decl` node. Only `DFn`/`DLet`/`DType` are
-representable in the A1 fragment; every other decl kind (`DActor`,
-`DProtocol`, `DMod`, `DSig`, `DInterface`, `DImpl`, `DExtern`, `DUse`,
-`DAlias`, `DNeeds`, `DProofCap`, `DOpts`, `DAlwaysLinearType`,
-`DTransitions`, `DApp`, `DDeriving`, `DSatisfy`, `DTest`, `DDescribe`,
-`DSetup`, `DSetupAll`) decodes to `Decl.unsupported`. -/
+/-- Extract the `Cap(X)` argument's constructor name from a `DExtern`'s
+`extern.cap_ty` node — a surface type shaped
+`{"kind":"TyCon","name":{"txt":"Cap"},"args":[<capCon>]}` (verified against
+real emitter output, `.superpowers/sdd/samples/t50_*.json`: the argument's
+own `name.txt` is already the fully dot-joined cap path, e.g.
+`"IO.FileSystem"` — no further joining needed). Returns `none` for anything
+that isn't exactly this shape (an absent/null `cap_ty`, an empty `args`, or
+an unexpected node) rather than failing the whole decode: an extern block
+declaring no capability is legal March, and `Decl.dextern` must not force a
+skip on account of it. -/
+def decodeCapTyArg (j : Json) : Option String := do
+  let kindJ ← j.getObjVal? "kind" |>.toOption
+  let kind ← kindJ.getStr?.toOption
+  guard (kind == "TyCon")
+  let argsJ ← j.getObjVal? "args" |>.toOption
+  let argsArr ← argsJ.getArr?.toOption
+  let arg ← argsArr[0]?
+  let nameJ ← arg.getObjVal? "name" |>.toOption
+  let txtJ ← nameJ.getObjVal? "txt" |>.toOption
+  txtJ.getStr?.toOption
+
+/-- Every name a decl binds into its enclosing module's scope, for the
+flattening-safety guard in `decodeModule` below. `dneeds`/`duse`/`dextern`
+bind no term/type name of their own (a capability manifest entry, an import,
+and — at this decoding granularity — an extern block's declared capability
+carry no name into the value/type namespace); `dmod`'s own decls are walked
+separately by `flattenedBindingNames`, one scope level at a time, so `dmod`
+itself contributes nothing here. -/
+def declBindingName : Decl → Option String
+  | .dfn n _ _ => some n
+  | .dlet n _ => some n
+  | .dtype n _ _ => some n
+  | .dmod _ _ | .dneeds _ | .duse _ | .dextern _ | .unsupported => none
+
+/-- Every binding name reachable once Task 4 flattens the tree (`dmod` is
+transparent to inference — its decls splice into the enclosing scope,
+recursively at every nesting level). Used only to detect collisions before
+that splicing exists; this file does not itself flatten anything. -/
+partial def flattenedBindingNames (decls : List Decl) : List String :=
+  decls.flatMap (fun d =>
+    match d with
+    | .dmod _ nested => flattenedBindingNames nested
+    | _ => (declBindingName d).toList)
+
+/-- Would flattening this decl tree (Task 4's transparent-`dmod`
+approximation) collide two decls under the same name? Module decl counts are
+small, so the O(n²) scan is fine. -/
+def hasNameCollision (decls : List Decl) : Bool :=
+  let names := flattenedBindingNames decls
+  names.any (fun n => (names.filter (· == n)).length > 1)
+
+/-- Decode a top-level `decl` node. `DFn`/`DLet`/`DType` are the A1 term/type
+fragment; `DMod`/`DNeeds`/`DUse`/`DExtern` are the A3 module-structure and
+capability-declaration fragment (Task 2). Every other decl kind (`DActor`,
+`DProtocol`, `DSig`, `DInterface`, `DImpl`, `DAlias`, `DProofCap`, `DOpts`,
+`DAlwaysLinearType`, `DTransitions`, `DApp`, `DDeriving`, `DSatisfy`, `DTest`,
+`DDescribe`, `DSetup`, `DSetupAll`) decodes to `Decl.unsupported`. -/
 partial def decodeDecl (j : Json) : Except String Decl := do
   match ← kindOf j with
   | "DFn" => do
@@ -468,6 +519,40 @@ partial def decodeDecl (j : Json) : Except String Decl := do
             pure ({ name := vname, argTys, resultTy } : CtorSig))
           .ok (Decl.dtype name paramNames ctors)
       | _ => .ok Decl.unsupported   -- TDAlias / TDRecord: not an ADT-with-ctors shape
+  | "DMod" => do
+      let (name, _) ← decodeName (← field j "name")
+      let declsJ ← (← field j "decls").getArr?.mapError (fun _ => "DMod.decls")
+      let decls ← declsJ.toList.mapM decodeDecl
+      .ok (Decl.dmod name decls)
+  | "DNeeds" => do
+      -- `paths` is a list of paths; each path is a list of name objects
+      -- (`{"txt":…,"span":…}`) — join each inner list's `txt` with "." to
+      -- get one dotted cap like "IO.FileRead" (verified shape, samples/t46).
+      let pathsJ ← (← field j "paths").getArr?.mapError (fun _ => "DNeeds.paths")
+      let paths ← pathsJ.toList.mapM (fun p => do
+        let segsJ ← p.getArr?.mapError (fun _ => "DNeeds.path segments")
+        let segs ← segsJ.toList.mapM (fun s => do let (t, _) ← decodeName s; pure t)
+        pure (String.intercalate "." segs))
+      .ok (Decl.dneeds paths)
+  | "DUse" => do
+      -- The imported module path lives at `use.path` (a name-object list);
+      -- `use.selector` is ignored — Check 4 only needs the module name
+      -- (verified shape, samples/t39).
+      let useJ ← field j "use"
+      let pathJ ← (← field useJ "path").getArr?.mapError (fun _ => "DUse.path")
+      let segs ← pathJ.toList.mapM (fun s => do let (t, _) ← decodeName s; pure t)
+      .ok (Decl.duse (String.intercalate "." segs))
+  | "DExtern" => do
+      -- The capability type lives at `extern.cap_ty` (NOT top-level), and is
+      -- a type node, not a string (verified shape, samples/t50). An
+      -- absent/null `cap_ty`, or one that isn't a `Cap(X)` application,
+      -- decodes to `none` rather than failing — a capability-free extern
+      -- block is legal March.
+      let extJ ← field j "extern"
+      let capTy := match extJ.getObjVal? "cap_ty" with
+        | .error _ => none
+        | .ok v => if v.isNull then none else decodeCapTyArg v
+      .ok (Decl.dextern capTy)
   | _ => .ok Decl.unsupported
 
 partial def decodeConstraint (j : Json) : Except String Constraint := do
@@ -504,11 +589,30 @@ def decodeModule (envelope : Json) : Except String Module := do
   let modJson ← field envelope "module"
   let declsJ ← (← field modJson "decls").getArr?.mapError (fun _ => "decls")
   let decls ← declsJ.toList.mapM decodeDecl
+  -- A3 flattening-safety guard: Task 4's `dmod`-transparent-to-inference
+  -- approximation splices every nested module's decls into one enclosing
+  -- scope, which is only sound while no two decls collide under that
+  -- flattening. Rather than mis-approximate a colliding file, force the
+  -- existing whole-file skip gate (`Decl.hasUnsupported`, read by
+  -- `Compare.inferModule`) by appending a sentinel `unsupported` decl —
+  -- the real decoded tree is otherwise left untouched.
+  let decls := if hasNameCollision decls then decls ++ [Decl.unsupported] else decls
   let schemesJ ← (← field envelope "schemes").getArr?.mapError (fun _ => "schemes")
   let schemes ← schemesJ.toList.mapM decodeScheme
   let instsJ ← (← field envelope "instantiations").getArr?.mapError (fun _ => "insts")
   let insts ← instsJ.toList.mapM decodeInstantiation
-  .ok { decls, schemes, insts }
+  -- A3: the (module_name, declared_needs) table march emits at
+  -- format_version 3. Required, not optional: treating a missing key as an
+  -- empty table would turn an emitter regression into a false accept,
+  -- because Check 4 would silently find nothing to enforce.
+  let capsJ ← (← field envelope "module_caps").getArr?.mapError (fun _ => "module_caps")
+  let moduleCaps ← capsJ.toList.mapM (fun c => do
+    let m ← (← field c "module").getStr?.mapError (fun _ => "module_caps.module")
+    let needsJ ← (← field c "needs").getArr?.mapError (fun _ => "module_caps.needs")
+    let needs ← needsJ.toList.mapM (fun n =>
+      n.getStr?.mapError (fun _ => "module_caps.needs entry"))
+    pure (m, needs))
+  .ok { decls, schemes, insts, moduleCaps }
 
 end MarchLean.Elab
 
@@ -534,5 +638,129 @@ open Lean MarchLean.Elab MarchLean.Syntax
 -- corpus). Build-time `IO.FS.readFile` of sample files was removed: the source
 -- must not depend on data files at a relative path (they broke CI on a fresh
 -- checkout — the sample dir is gitignored scratch, not tracked).
+
+-- A3 Task 2: module structure + capability declarations decode.
+-- Self-contained: JSON built inline, matching the VERIFIED shapes in
+-- `.superpowers/sdd/task-2-verified-shapes.md` (name objects always carry a
+-- real `span`, unlike the task brief's guessed placeholder JSON) — never
+-- read from a corpus sample.
+
+-- DNeeds: a single need with one dotted segment.
+#eval show IO Unit from do
+  let j := Json.parse r#"{"kind":"DNeeds","paths":[[{"txt":"IO","span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}}]],"span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}}"#
+  match j with
+  | .error e => IO.println s!"parse failed: {e}"
+  | .ok j    => IO.println (repr (decodeDecl j))
+  -- expect: Except.ok (Decl.dneeds ["IO"])
+
+-- DNeeds: two needs, the second a multi-segment dotted path (IO.FileRead).
+#eval show IO Unit from do
+  let j := Json.parse r#"{"kind":"DNeeds","paths":[[{"txt":"Clock","span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}}],[{"txt":"IO","span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}},{"txt":"FileRead","span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}}]],"span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}}"#
+  match j with
+  | .error e => IO.println s!"parse failed: {e}"
+  | .ok j    => IO.println (repr (decodeDecl j))
+  -- expect: Except.ok (Decl.dneeds ["Clock", "IO.FileRead"])
+
+-- DUse: module path, ignoring `use.selector`.
+#eval show IO Unit from do
+  let j := Json.parse r#"{"kind":"DUse","use":{"path":[{"txt":"Vault","span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}}],"selector":{"kind":"UseSingle"}},"span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}}"#
+  match j with
+  | .error e => IO.println s!"parse failed: {e}"
+  | .ok j    => IO.println (repr (decodeDecl j))
+  -- expect: Except.ok (Decl.duse "Vault")
+
+-- DExtern: cap_ty present, extracting the Cap(X) argument's constructor name.
+#eval show IO Unit from do
+  let j := Json.parse r#"{"kind":"DExtern","extern":{"lib_name":"libc","cap_ty":{"kind":"TyCon","name":{"txt":"Cap","span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}},"args":[{"kind":"TyCon","name":{"txt":"IO.FileSystem","span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}},"args":[]}]},"fns":[]},"span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}}"#
+  match j with
+  | .error e => IO.println s!"parse failed: {e}"
+  | .ok j    => IO.println (repr (decodeDecl j))
+  -- expect: Except.ok (Decl.dextern (some "IO.FileSystem"))
+
+-- DExtern: cap_ty null (a capability-free extern block) decodes to `none`,
+-- not a decode failure.
+#eval show IO Unit from do
+  let j := Json.parse r#"{"kind":"DExtern","extern":{"lib_name":"libc","cap_ty":null,"fns":[]},"span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}}"#
+  match j with
+  | .error e => IO.println s!"parse failed: {e}"
+  | .ok j    => IO.println (repr (decodeDecl j))
+  -- expect: Except.ok (Decl.dextern none)
+
+-- DMod: nested module, name + recursive decls (here containing a DNeeds).
+#eval show IO Unit from do
+  let j := Json.parse r#"{"kind":"DMod","name":{"txt":"Vault","span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}},"decls":[{"kind":"DNeeds","paths":[[{"txt":"IO","span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}}]],"span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}}],"span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}}"#
+  match j with
+  | .error e => IO.println s!"parse failed: {e}"
+  | .ok j    => IO.println (repr (decodeDecl j))
+  -- expect: Except.ok (Decl.dmod "Vault" [Decl.dneeds ["IO"]])
+
+-- Flattening-safety guard: a top-level `f` and a nested `mod Vault`'s `f`
+-- would collide once Task 4 splices `Vault`'s decls into the enclosing
+-- scope, so `decodeModule` must force the whole-file skip gate
+-- (`Decl.hasUnsupported`) by appending a sentinel `unsupported` decl.
+private def collisionSpan : String := r#"{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}"#
+private def collisionLit : String :=
+  r#"{"kind":"ELit","literal":{"kind":"LitInt","value":1},"resolved_ty":{"kind":"TCon","name":"Int","args":[]}}"#
+-- A `DLet` decl node binding plain name `n`, built with `++` (not `s!`) to
+-- avoid the interpolation-escaping ambiguity of mixing literal `{`/`}` with
+-- `{var}` splices in a JSON-heavy string.
+private def collisionDLet (n : String) : String :=
+  "{\"kind\":\"DLet\",\"binding\":{\"pattern\":{\"kind\":\"PatVar\",\"name\":{\"txt\":\"" ++ n ++
+    "\",\"span\":" ++ collisionSpan ++ "}},\"lin\":{\"kind\":\"Unrestricted\"},\"expr\":" ++ collisionLit ++
+    "},\"span\":" ++ collisionSpan ++ "}"
+private def collisionEnvelope (nestedName : String) : String :=
+  "{\"format_version\":3,\"verdict\":\"accept\",\"diagnostics\":[],\"module\":{\"name\":{\"txt\":\"Server\",\"span\":" ++
+    collisionSpan ++ "},\"decls\":[" ++ collisionDLet "f" ++ ",{\"kind\":\"DMod\",\"name\":{\"txt\":\"Vault\",\"span\":" ++
+    collisionSpan ++ "},\"decls\":[" ++ collisionDLet nestedName ++ "],\"span\":" ++ collisionSpan ++
+    "}]},\"schemes\":[],\"instantiations\":[],\"module_caps\":[]}"
+
+-- Flattening-safety guard: a top-level `f` and a nested `mod Vault`'s `f`
+-- would collide once Task 4 splices `Vault`'s decls into the enclosing
+-- scope, so `decodeModule` must force the whole-file skip gate
+-- (`Decl.hasUnsupported`) by appending a sentinel `unsupported` decl.
+#eval show IO Unit from do
+  match Json.parse (collisionEnvelope "f") with
+  | .error e => IO.println s!"parse failed: {e}"
+  | .ok j    =>
+      match decodeModule j with
+      | .error e => IO.println s!"decode failed: {e}"
+      | .ok m    => IO.println s!"hasUnsupported={m.decls.any Decl.hasUnsupported}"
+  -- expect: hasUnsupported=true (guard fired on the "f"/"f" collision)
+
+-- Same shape, but the nested module's name doesn't collide ("g" vs "f") —
+-- the guard must NOT false-trigger on distinctly-named decls.
+#eval show IO Unit from do
+  match Json.parse (collisionEnvelope "g") with
+  | .error e => IO.println s!"parse failed: {e}"
+  | .ok j    =>
+      match decodeModule j with
+      | .error e => IO.println s!"decode failed: {e}"
+      | .ok m    => IO.println s!"hasUnsupported={m.decls.any Decl.hasUnsupported}"
+  -- expect: hasUnsupported=false (distinct names, no collision)
+
+-- module_caps: a minimal but complete v3 envelope decodes its moduleCaps
+-- table, de-duplicated/sorted-in table form (the emitter's job, not ours) —
+-- here just two entries.
+#eval show IO Unit from do
+  let j := Json.parse r#"{"format_version":3,"verdict":"accept","diagnostics":[],"module":{"name":{"txt":"Server","span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}},"decls":[]},"schemes":[],"instantiations":[],"module_caps":[{"module":"A","needs":[]},{"module":"Vault","needs":["IO.FileRead"]}]}"#
+  match j with
+  | .error e => IO.println s!"parse failed: {e}"
+  | .ok j    =>
+      match decodeModule j with
+      | .error e => IO.println s!"decode failed: {e}"
+      | .ok m    => IO.println (repr m.moduleCaps)
+  -- expect: Except.ok ... -> [("A", []), ("Vault", ["IO.FileRead"])]
+
+-- module_caps: a MISSING key is a hard decode error, not an empty list — an
+-- emitter regression here must not silently disable Check 4.
+#eval show IO Unit from do
+  let j := Json.parse r#"{"format_version":3,"verdict":"accept","diagnostics":[],"module":{"name":{"txt":"Server","span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}},"decls":[]},"schemes":[],"instantiations":[]}"#
+  match j with
+  | .error e => IO.println s!"parse failed: {e}"
+  | .ok j    =>
+      match decodeModule j with
+      | .error e => IO.println s!"decode failed as expected: {e}"
+      | .ok _    => IO.println "UNEXPECTED: decoded ok, should have errored"
+  -- expect: "decode failed as expected: missing field 'module_caps'"
 
 end MarchLean.Elab.Test
