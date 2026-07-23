@@ -1,15 +1,15 @@
 name: Conformance
 
-# A1 conformance gate: build march-lean-check (this repo) and march (pinned
-# to a main SHA, see the checkout step below), then run
-# scripts/conformance-harness.sh over march's static-semantics corpus and
-# fail the job on any MISMATCH/ERROR/MARCH_SELF_INCONSISTENT/
-# CORPUS_VIOLATION/SKIP-LEDGER-MISMATCH. SKIP itself is expected and
-# frequent at A1 (march-lean-check only independently checks a modeled
-# fragment; scripts/expected-skips.txt tracks exactly which accept-side
-# corpus files are expected to skip, and the harness fails if the observed
-# skip set drifts from it — see that file's header and the harness's own
-# comments for the full rationale).
+# A1 conformance gate: build march-lean-check (this repo) and march (via
+# march-language/setup-march, pinned to a main SHA — see the setup-march
+# step below), then run scripts/conformance-harness.sh over march's
+# static-semantics corpus and fail the job on any MISMATCH/ERROR/
+# MARCH_SELF_INCONSISTENT/CORPUS_VIOLATION/SKIP-LEDGER-MISMATCH. SKIP itself
+# is expected and frequent at A1 (march-lean-check only independently
+# checks a modeled fragment; scripts/expected-skips.txt tracks exactly
+# which accept-side corpus files are expected to skip, and the harness
+# fails if the observed skip set drifts from it — see that file's header
+# and the harness's own comments for the full rationale).
 on:
   push:
     branches: [main]
@@ -47,66 +47,48 @@ jobs:
           build-args: march-lean-check
           use-mathlib-cache: false
 
-      # Pinned to a march main SHA (not the branch) for reproducibility.
-      # v2 emitter (--emit-core-ast's typed-envelope format the A1 checker
+      # Pinned to a march main SHA (not a branch) for reproducibility. v2
+      # emitter (--emit-core-ast's typed-envelope format the A1 checker
       # decodes) merged to march main via #63 (merge commit 733e7a0b) on
       # 2026-07-21; this pin is that merge commit itself. Bump periodically;
-      # no need to chase every push.
-      - name: Checkout march (main, pinned)
+      # no need to chase every push. setup-march builds march from source
+      # and caches the result keyed on this SHA (actions/cache under the
+      # hood), so repeat runs at the same pin skip the OCaml build entirely.
+      - name: Set up March
+        id: setup-march
+        uses: march-language/setup-march@main
+        with:
+          march-version: 733e7a0ba80d1bd7626beb5540555bad36047e8b
+
+      # Only the static-semantics corpus is needed from march's own repo
+      # (the binary itself came from setup-march above); pinned to the
+      # exact commit setup-march resolved and built so corpus and binary
+      # never drift apart.
+      - name: Checkout march corpus (specs/lang/types)
         uses: actions/checkout@v4
         with:
           repository: march-language/march
-          ref: 733e7a0ba80d1bd7626beb5540555bad36047e8b
+          ref: ${{ steps.setup-march.outputs.march-version }}
           path: march-checkout
+          sparse-checkout: |
+            specs/lang/types
+          sparse-checkout-cone-mode: false
 
-      # --- Mirror of march's own .github/workflows/ci.yml `build` job ---
-      # (one matrix combo — ubuntu-24.04 / ocaml 5.3.0 — is enough here; the
-      # full OS/OCaml matrix is march's own CI's job, not ours).
-      - name: Set up OCaml
-        uses: ocaml/setup-ocaml@v3
-        with:
-          ocaml-compiler: 5.3.0
-
-      - name: Install march system dependencies
-        working-directory: march-checkout
-        run: |
-          # z3: the refinement-type conformance corpus (@types-check, i.e.
-          # exactly the specs/lang/types/{accept,reject} corpus this
-          # workflow's harness runs over) discharges pre/postcondition +
-          # division-safety verification conditions via the `z3` binary on
-          # PATH (lib/refine/solver.ml). Without it, refinement checks
-          # silently no-op — no build failure, just reject/t71-t73 silently
-          # stop being rejected on a runner that lacks z3 (ubuntu-24.04
-          # doesn't ship it by default). Matches march's own ci.yml fix
-          # (commit 5f4d7dd9, "install z3 so refinement conformance corpus
-          # is checked on Linux"), already present at the pinned SHA above.
-          sudo apt-get install -y libbrotli-dev libzstd-dev llvm-dev z3
-          # libblake3-dev is not available in Ubuntu 24.04; build from source
-          # (matches march's own ci.yml recipe verbatim).
-          git clone --depth 1 https://github.com/BLAKE3-team/BLAKE3.git /tmp/blake3
-          cd /tmp/blake3/c
-          gcc -O2 -shared -fPIC -o libblake3.so \
-            blake3.c blake3_dispatch.c blake3_portable.c \
-            blake3_sse2_x86-64_unix.S blake3_sse41_x86-64_unix.S \
-            blake3_avx2_x86-64_unix.S blake3_avx512_x86-64_unix.S
-          sudo cp libblake3.so /usr/local/lib/libblake3.so
-          sudo cp blake3.h /usr/local/include/blake3.h
-          sudo ldconfig
-
-      - name: Install march OCaml dependencies
-        working-directory: march-checkout
-        run: opam install --deps-only --with-test -y .
-
-      - name: Build march
-        working-directory: march-checkout
-        run: |
-          eval $(opam env)
-          dune build
+      # z3: the refinement-type conformance corpus (@types-check, i.e.
+      # exactly the specs/lang/types/{accept,reject} corpus this
+      # workflow's harness runs over) discharges pre/postcondition +
+      # division-safety verification conditions via the `z3` binary on
+      # PATH (lib/refine/solver.ml). Without it, refinement checks
+      # silently no-op — no build failure, just reject/t71-t73 silently
+      # stop being rejected. setup-march doesn't install it since it's a
+      # march *runtime* dependency, not a build dependency.
+      - name: Install z3
+        run: sudo apt-get install -y z3
 
       - name: Run conformance harness
         run: |
           scripts/conformance-harness.sh \
-            --march-bin "$GITHUB_WORKSPACE/march-checkout/_build/default/bin/main.exe" \
+            --march-bin "$(command -v march)" \
             --corpus-dir "$GITHUB_WORKSPACE/march-checkout/specs/lang/types" \
             --march-lean-check-bin "$GITHUB_WORKSPACE/.lake/build/bin/march-lean-check"
 
