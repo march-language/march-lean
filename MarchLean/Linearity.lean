@@ -199,11 +199,11 @@ def checkDecl : Decl → CheckResult
       | other => other
   | .dlet _ body => checkTerm body
   | .dtype _ _ _ => .ok
-  -- A3 Task 2 decode-only constructors: no term of their own to check.
+  -- A3 Task 2/3 decode-only constructors: no term of their own to check.
   -- `dmod` is inert-but-unreachable here: `checkLinearity` flattens nested
   -- `dmod`s via `flattenDecls` before this is ever called, so its children
   -- already appear as top-level decls.
-  | .dmod .. | .dneeds _ | .duse _ | .dextern _ => .ok
+  | .dmod .. | .dneeds _ | .duse _ | .dextern .. | .dproofcap _ => .ok
   | .unsupported => .ok
 
 /-- Flattens nested `dmod` bodies into the enclosing scope first — linearity

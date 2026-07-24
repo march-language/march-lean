@@ -56,8 +56,6 @@ accept/t41_binary_protocol_chan_new.march                      # out-of-fragment
 accept/t42_mpst_protocol_new.march                             # out-of-fragment construct in a declaration
 accept/t43_choose_offer_roundtrip.march                        # out-of-fragment construct in a declaration
 accept/t44_binary_choice_identical_branches.march              # out-of-fragment construct in a declaration
-accept/t51_cap_narrow_thread.march                             # out of modeled fragment: SKIP: unbound variable `cap_narrow`
-accept/t52_cap_narrow_multi.march                              # out of modeled fragment: SKIP: unbound variable `root_cap`
 accept/t53_migrate_pure_needs_io.march                         # out-of-fragment construct in a declaration
 accept/t54_cap_pure_arithmetic.march                           # out-of-fragment construct in a declaration
 accept/t55_cap_no_alloc_arithmetic.march                       # out-of-fragment construct in a declaration
@@ -65,9 +63,7 @@ accept/t56_cap_no_extern_ok.march                              # out-of-fragment
 accept/t58_revoke_cap_typechecks.march                         # out-of-fragment construct in a declaration
 accept/t59_cap_no_panic_guarded_guardless_catchall.march       # out-of-fragment construct in a declaration
 accept/t60_nested_id_polymorphic.march                         # out-of-fragment construct in a declaration
-accept/t61_cap_narrow_io_narrow_still_ok.march                 # out of modeled fragment: SKIP: unbound variable `cap_narrow`
 accept/t62_mint_cap_public_declaring.march                     # out-of-fragment construct in a declaration
-accept/t63_proof_cap_passthrough.march                         # out-of-fragment construct in a declaration
 accept/t67_linear_field_arith_single.march                     # out-of-fragment construct in a declaration
 accept/t68_linear_send_consumes.march                          # out-of-fragment construct in a declaration
 accept/t69_sibling_own_ctor.march                              # out-of-fragment construct in a declaration
@@ -116,8 +112,6 @@ reject/t32_invalid_choose_label.march                          # out-of-fragment
 reject/t33_wrong_payload_type.march                            # out-of-fragment construct in a declaration
 reject/t34_recv_at_wrong_state.march                           # out-of-fragment construct in a declaration
 reject/t35_linear_used_twice.march                             # out-of-fragment construct in a declaration
-reject/t40_migrate_state_does_io.march                         # out-of-fragment construct in a declaration
-reject/t41_realtime_excludes_cap_io.march                      # out-of-fragment construct in a declaration
 reject/t42_cap_no_panic_explicit_panic.march                   # out-of-fragment construct in a declaration
 reject/t43_cap_no_alloc_tuple.march                            # out-of-fragment construct in a declaration
 reject/t44_cap_no_extern_extern_block.march                    # out-of-fragment construct in a declaration

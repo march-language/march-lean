@@ -360,7 +360,14 @@ metavariable whose binding level is strictly greater than `level`
 let/letfn-binding's level to achieve let-polymorphism; NO value
 restriction, any binder generalizes). `body` is the zonked type with
 quantified mvars left in place as `MTy.mvar id`; `instantiate` performs
-the actual substitution later, keyed by id. -/
+the actual substitution later, keyed by id.
+
+This function itself has no value restriction — but that does not mean the
+checker as a whole lacks one: see `demoteToLevel0`, which is called BEFORE
+`generalize` at a `cap_narrow` let-binding specifically to pin that binding's
+result to level 0 so this very function's level check makes it
+non-generalizable. Read the two together, not `generalize` alone, if the
+question is "does this checker apply a value restriction anywhere". -/
 def generalize (s : Supply) (level : Nat) (t : MTy) : InferM Scheme := do
   let zt ← zonk s t
   let (idsRev, classesRev) ← genCollect s level ([], []) zt
@@ -692,6 +699,30 @@ partial def inferPattern (s : Supply) (ctx : Ctx) : Pattern → MTy → InferM (
       pure (bindss.foldl (· ++ ·) [])
   | .unsupported, _ => throw "infer: unsupported pattern (should have been skip-gated)"
 
+/-- Demote every unbound metavariable reachable in `t` to level 0, march's
+`demote_to_monomorphic` (`typecheck.ml:4684-4694`). Used for the result of a
+`cap_narrow(...)` application: because an application is expansive, its result
+must never let-generalize. `generalize` only quantifies unbound vars whose
+level is strictly greater than the level it generalizes at, so pinning them to
+level 0 (the outermost, never-generalized level) keeps `let x = cap_narrow(e)`
+monomorphic — its single use is the only thing that pins the cap var, exactly
+like march. Mirrors `zonk`'s structural walk, `repr`-ing at every node so
+nested mvars (e.g. the `X` in `Cap(X)`) are reached, not just the top one. -/
+partial def demoteToLevel0 (s : Supply) (t : MTy) : InferM Unit := do
+  match ← repr s t with
+  | .mvar id => do
+      match ← getMVar s id with
+      | .unbound id' level classes =>
+          if level > 0 then setMVar s id' (.unbound id' 0 classes)
+      | .link t' => demoteToLevel0 s t'   -- unreachable after `repr`, but total
+  | .con _ args => args.forM (demoteToLevel0 s)
+  | .arrow a b => do demoteToLevel0 s a; demoteToLevel0 s b
+  | .tuple ts => ts.forM (demoteToLevel0 s)
+  | .record fs => fs.forM (fun (_, t) => demoteToLevel0 s t)
+  | .lin _ t => demoteToLevel0 s t
+  | .natOp _ a b => do demoteToLevel0 s a; demoteToLevel0 s b
+  | .nat _ => pure ()
+
 /-- Infer the type of a `Term`, threading the arena `s` and context `ctx`.
 One explicit arm per constructor (no wildcard); `.unsupported` `throw`s
 defensively (Task 6's gate removes such nodes before inference runs). Every
@@ -717,6 +748,17 @@ partial def infer (s : Supply) (ctx : Ctx) : Term → InferM MTy
       let argTys ← args.mapM (infer s ctx)
       let rho ← freshMVar s ctx.level
       unify s fnTy (argTys.foldr MTy.arrow rho)
+      -- march's value restriction for `cap_narrow` (typecheck.ml:4684-4694,
+      -- `demote_to_monomorphic`): a `cap_narrow(...)` application is
+      -- expansive, so its result must never let-generalize. Demoting every
+      -- metavariable reachable in `rho` to level 0 means the enclosing
+      -- `let`'s `generalize` (which only quantifies vars whose level is
+      -- strictly greater than the level it generalizes at) can never pick
+      -- them up — the enclosing binder's one use is the only thing that
+      -- ever pins the cap var, exactly like march. See `demoteToLevel0`.
+      match fn with
+      | .var "cap_narrow" _ _ => demoteToLevel0 s rho
+      | _ => pure ()
       pure rho
   | .lam params body _ => do
       let paramMTys ← params.mapM (fun _ => freshMVar s ctx.level)
@@ -831,7 +873,13 @@ def builtins (s : Supply) : InferM (List (String × EnvEntry)) := do
   -- Eq-constrained equality: ∀a:Eq. a→a→Bool
   for name in ["==", "!="] do
     out := (name, .scheme (← mkPoly1 s [Class.eq] (fun a => arr a (arr a b)))) :: out
+  -- Capability-narrowing: ∀a. Cap(IO)→Cap(a)  (typecheck.ml:1972)
+  let cap := fun (t : MTy) => MTy.con "Cap" [t]
+  let capIO := cap (MTy.con "IO" [])
+  out := ("cap_narrow", .scheme (← mkPoly1 s [] (fun a => arr capIO (cap a)))) :: out
   pure <| out ++ [
+    -- The IO capability root, threaded from the entry point. (typecheck.ml:1971)
+    mono "root_cap" capIO,
     -- Monomorphic operators / prelude functions.
     mono "%"  (arr i (arr i i)),
     mono "+." (arr f (arr f f)), mono "-." (arr f (arr f f)),
@@ -873,7 +921,7 @@ def inferModule' (s : Supply) (m : Module) : InferM (List (Span × MTy)) := do
     -- (splicing them into this same loop) is what will make them visible
     -- to inference; until then they're simply not type-checked, same as
     -- any other not-yet-spliced-in scope.
-    | .dmod .. | .dneeds .. | .duse .. | .dextern .. => pure ()
+    | .dmod .. | .dneeds .. | .duse .. | .dextern .. | .dproofcap .. => pure ()
     | .dlet name rhs => do
         let t ← infer s { ctx with level := ctx.level + 1 } rhs
         let sch ← generalize s ctx.level t
@@ -1207,6 +1255,81 @@ the pending `Num` constraint discharged via a module-style flow succeeds
   | .ok _ => IO.println "op-num-ok: true"
   | .error e => IO.println s!"op-num-ok-FAIL: {e}"
 -- expected: op-num-ok: true
+
+/- Capability-narrowing builtins (A3 slice b, Task 1): a module-level
+`fn boot(root : Cap(IO)) : Cap(IO.Network) do cap_narrow(root) end` infers
+with no unbound-variable throw for `cap_narrow`/`root_cap`. Modeled as a
+`dfn` run through `inferModule'`, exactly like `op-num-ok` above. -/
+#eval show IO Unit from do
+  let s ← Supply.new
+  let capIO : Ty := Ty.con "Cap" [Ty.con "IO" []]
+  let capNet : Ty := Ty.con "Cap" [Ty.con "IO.Network" []]
+  let boot : Decl := .dfn "boot" [("root", .unrestricted, some capIO)] (some capNet)
+    (Term.app (Term.var "cap_narrow" dSpan dTy) [Term.var "root" dSpan dTy] dTy)
+  let m : Module := { decls := [boot], schemes := [], insts := [] }
+  match ← (inferModule' s m).run with
+  | .ok _ => IO.println "cap-narrow-module-ok: true"
+  | .error e => IO.println s!"cap-narrow-module-FAIL: {e}"
+-- expected: cap-narrow-module-ok: true
+
+/- Same shape as above, but checking that `cap_narrow`'s polymorphic result
+actually unifies with the `Cap(IO.Network)` return annotation (`inferModule'`
+ignores `retAnnot`, so this unify is done explicitly here — see its doc
+comment above `.dfn`'s case). `λ(root : Cap(IO)). cap_narrow(root)` infers to
+`Cap(IO) → ?a`; unifying `?a` with `Cap(IO.Network)` and zonking must yield
+exactly `Cap(IO) → Cap(IO.Network)`. -/
+#eval show IO Unit from do
+  let s ← Supply.new
+  let ctx ← freshCtx s
+  let capIO : Ty := Ty.con "Cap" [Ty.con "IO" []]
+  let boot := Term.lam [("root", .unrestricted, some capIO)]
+    (Term.app (Term.var "cap_narrow" dSpan dTy) [Term.var "root" dSpan dTy] dTy) dTy
+  match ← (do
+      let t ← infer s ctx boot
+      let bodyTy := match t with | .arrow _ r => r | other => other
+      let retMTy ← tyToMTy s [] (Ty.con "Cap" [Ty.con "IO.Network" []])
+      unify s bodyTy retMTy
+      zonk s t
+    ).run with
+  | .ok (.arrow (.con "Cap" [.con "IO" []]) (.con "Cap" [.con "IO.Network" []])) =>
+      IO.println "cap-narrow-unify-ok: true"
+  | .ok _ => IO.println "cap-narrow-unify-FAIL: wrong shape"
+  | .error e => IO.println s!"cap-narrow-unify-ERROR: {e}"
+-- expected: cap-narrow-unify-ok: true
+
+/- VALUE RESTRICTION — the discriminating test for `demoteToLevel0`.
+
+`let net = cap_narrow(root) in (net, net)` must make `net` MONOMORPHIC: both
+uses share one metavariable, so unifying the first component with
+`Cap(IO.Network)` and the second with `Cap(IO.Console)` must FAIL.
+
+Without the demotion `net` would let-generalize to `∀a. Cap(a)`, each use
+would instantiate its own fresh var, and BOTH unifications would wrongly
+succeed. A single-use body cannot tell the two apart (one use instantiates
+once either way), which is why this test binds two uses. Verified to have
+teeth: stubbing out the `demoteToLevel0` call makes this print FALSE.
+march rejects the same program for the same reason (typecheck.ml:4684). -/
+#eval show IO Unit from do
+  let s ← Supply.new
+  let ctx ← freshCtx s
+  let capIO : Ty := Ty.con "Cap" [Ty.con "IO" []]
+  let netUse := Term.var "net" dSpan dTy
+  let boot := Term.lam [("root", .unrestricted, some capIO)]
+    (Term.let_ "net" .unrestricted none
+      (Term.app (Term.var "cap_narrow" dSpan dTy) [Term.var "root" dSpan dTy] dTy)
+      (Term.tuple [netUse, netUse] dTy) dTy) dTy
+  match ← (do
+      let t ← infer s ctx boot
+      let tupTy := match t with | .arrow _ r => r | other => other
+      let (a, b) := match tupTy with
+        | .tuple [x, y] => (x, y)
+        | other => (other, other)
+      unify s a (← tyToMTy s [] (Ty.con "Cap" [Ty.con "IO.Network" []]))
+      unify s b (← tyToMTy s [] (Ty.con "Cap" [Ty.con "IO.Console" []]))
+    ).run with
+  | .error _ => IO.println "value-restriction-ok: true"
+  | .ok _    => IO.println "value-restriction-ok: FALSE (net wrongly polymorphic)"
+-- expected: value-restriction-ok: true
 
 end Test
 end MarchLean.Infer

@@ -196,13 +196,37 @@ partial def decodeSurfaceTy (paramNames : List String) (j : Json) : Except Strin
       -- plain `Ty.con name args` path below. A capability is always
       -- `Cap(permission)`; a bare `Cap` never is. -/
       if name == "Cap" && !args.isEmpty then .ok (Ty.con "Cap" args)
-      -- `Tagged(_, Realtime)` drives march's Check 7 realtime exclusion, out
-      -- of A3 slice (a)'s fragment: an applied `Tagged` (mirroring the `Cap`
-      -- carve-out above) decodes to `Ty.unsupported` so the whole file
-      -- honestly skips rather than being silently accepted against a rule
-      -- A3 does not model. A hypothetical nullary `Tagged` user ADT (none
-      -- exists today) would stay a normal `Ty.con` here, same as bare `Cap`.
-      else if name == "Tagged" && !args.isEmpty then .ok Ty.unsupported
+      -- `Tagged(_, Realtime)` drives march's Check 7 realtime exclusion (A3
+      -- slice (b)). An applied `Tagged` (mirroring the `Cap` carve-out above)
+      -- decodes to `Ty.con "Tagged" args`, preserving both arguments, so
+      -- `CapCheck`'s Check 7 can inspect the second argument's constructor
+      -- name to detect `Tagged(_, Realtime)`. (Slice (a) mapped this to
+      -- `Ty.unsupported` — Check 7 was out of scope then, so the honest move
+      -- was to skip rather than silently ignore the tag.) A hypothetical
+      -- nullary `Tagged` user ADT (none exists today) would stay a normal
+      -- `Ty.con` here, same as bare `Cap`.
+      --
+      -- Un-skipping is safe ONLY because `CapCheck.capsInTy` also consumes
+      -- decoded types and now carries its own explicit
+      -- `| .con "Tagged" _ => []` arm (matching march's `cap_paths_in_surface_ty`
+      -- carve-out for `Tagged`) placed ahead of its generic `.con` recursion.
+      -- Check 7 was NOT the only consumer of this decoded type — that was the
+      -- mistaken assumption the first time this arm was un-skipped, and it
+      -- opened a false-reject hole: `capsInTy`'s generic `.con` arm descended
+      -- into `Tagged`'s payload and found `Cap(_)` types nested inside a
+      -- `Tagged(Cap(X), Realtime)` annotation, rejecting files march accepts.
+      -- Any future change here must re-check every decoded-`Ty` consumer, not
+      -- just the one this change was written for.
+      --
+      -- One more consequence of un-skipping: a module whose ONLY
+      -- out-of-fragment marker used to be an applied `Tagged` annotation
+      -- previously decoded to `Ty.unsupported`, which made
+      -- `Decl.hasUnsupported` true for the enclosing decl and drove
+      -- `checkOneModule`'s return-cap fragment gate to defer (skip) on it.
+      -- Now that `Tagged` decodes to a real `Ty.con`, such a module has
+      -- `Decl.hasUnsupported = false` and the return-cap gate can fire on it
+      -- where it previously deferred.
+      else if name == "Tagged" && !args.isEmpty then .ok (Ty.con "Tagged" args)
       else .ok (Ty.con name args)
   | "TyVar" =>
       let (name, _) ← decodeName (← field j "name")
@@ -429,7 +453,7 @@ def declBindingName : Decl → Option String
   | .dfn n _ _ _ => some n
   | .dlet n _ => some n
   | .dtype n _ _ => some n
-  | .dmod _ _ | .dneeds _ | .duse _ | .dextern _ | .unsupported => none
+  | .dmod _ _ | .dneeds _ | .duse _ | .dextern _ _ | .dproofcap _ | .unsupported => none
 
 /-- Every binding name reachable once Task 4 flattens the tree (`dmod` is
 transparent to inference — its decls splice into the enclosing scope,
@@ -449,9 +473,10 @@ def hasNameCollision (decls : List Decl) : Bool :=
   names.any (fun n => (names.filter (· == n)).length > 1)
 
 /-- Decode a top-level `decl` node. `DFn`/`DLet`/`DType` are the A1 term/type
-fragment; `DMod`/`DNeeds`/`DUse`/`DExtern` are the A3 module-structure and
-capability-declaration fragment (Task 2). Every other decl kind (`DActor`,
-`DProtocol`, `DSig`, `DInterface`, `DImpl`, `DAlias`, `DProofCap`, `DOpts`,
+fragment; `DMod`/`DNeeds`/`DUse`/`DExtern`/`DProofCap` are the A3
+module-structure and capability-declaration fragment (Task 2; `DProofCap`
+added for Finding I1 — see `Decl.dproofcap`). Every other decl kind (`DActor`,
+`DProtocol`, `DSig`, `DInterface`, `DImpl`, `DAlias`, `DOpts`,
 `DAlwaysLinearType`, `DTransitions`, `DApp`, `DDeriving`, `DSatisfy`, `DTest`,
 `DDescribe`, `DSetup`, `DSetupAll`) decodes to `Decl.unsupported`. -/
 partial def decodeDecl (j : Json) : Except String Decl := do
@@ -587,7 +612,32 @@ partial def decodeDecl (j : Json) : Except String Decl := do
       let capTy := match extJ.getObjVal? "cap_ty" with
         | .error _ => none
         | .ok v => if v.isNull then none else decodeCapTyArg v
-      .ok (Decl.dextern capTy)
+      -- `extern.fns` is a list of extern-fn objects, each carrying its own
+      -- `name` (verified shape: emitting `extern "libc" : Cap(X) do fn
+      -- counter_migrate_state(...) ... end` — samples/t50-shaped). Extracting
+      -- just the names (not the params/ret_ty) is enough for Check 8 (Finding
+      -- I2): march attributes the BLOCK's declared capability to every extern
+      -- fn whose name matches `is_migrate_fn_name`, regardless of that fn's
+      -- own signature. A missing/malformed `fns` array degrades to `[]`
+      -- rather than failing the whole decode — an extern block is still
+      -- legal March even if this particular fact can't be extracted.
+      let fnNames : List String :=
+        match extJ.getObjVal? "fns" with
+        | .error _ => []
+        | .ok v =>
+            match v.getArr? with
+            | .error _ => []
+            | .ok arr => arr.toList.filterMap (fun f => do
+                let nameJ ← f.getObjVal? "name" |>.toOption
+                let txtJ ← nameJ.getObjVal? "txt" |>.toOption
+                txtJ.getStr?.toOption)
+      .ok (Decl.dextern capTy fnNames)
+  | "DProofCap" => do
+      -- `proof cap X` — carries just the declared bare name (verified shape:
+      -- `{"kind":"DProofCap","name":{"txt":"Migrated","span":{...}},...}`).
+      -- In-fragment (Finding I1): see `Decl.dproofcap`'s docstring.
+      let (name, _) ← decodeName (← field j "name")
+      .ok (Decl.dproofcap name)
   | _ => .ok Decl.unsupported
 
 partial def decodeConstraint (j : Json) : Except String Constraint := do
@@ -622,6 +672,11 @@ decl list is at `module.decls`, and `schemes`/`instantiations` are siblings
 of `module` at the envelope's top level (not nested inside it). -/
 def decodeModule (envelope : Json) : Except String Module := do
   let modJson ← field envelope "module"
+  -- The entry module's own bare name (`module.name.txt`, e.g. `"Db"` for a
+  -- file whose whole content is `mod Db do … end`). Carried on `Module` only
+  -- to key `CapCheck`'s proof-cap self-declaration exemption (Finding I1) —
+  -- nothing else consumes it.
+  let (entryName, _) ← decodeName (← field modJson "name")
   let declsJ ← (← field modJson "decls").getArr?.mapError (fun _ => "decls")
   let decls ← declsJ.toList.mapM decodeDecl
   -- A3 flattening-safety guard: Task 4's `dmod`-transparent-to-inference
@@ -647,7 +702,7 @@ def decodeModule (envelope : Json) : Except String Module := do
     let needs ← needsJ.toList.mapM (fun n =>
       n.getStr?.mapError (fun _ => "module_caps.needs entry"))
     pure (m, needs))
-  .ok { decls, schemes, insts, moduleCaps }
+  .ok { decls, schemes, insts, moduleCaps, entryName }
 
 end MarchLean.Elab
 
@@ -716,12 +771,13 @@ open Lean MarchLean.Elab MarchLean.Syntax
   -- expect: Except.ok Decl.unsupported
 
 -- DExtern: cap_ty present, extracting the Cap(X) argument's constructor name.
+-- No `fns`, so `fnNames = []`.
 #eval show IO Unit from do
   let j := Json.parse r#"{"kind":"DExtern","extern":{"lib_name":"libc","cap_ty":{"kind":"TyCon","name":{"txt":"Cap","span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}},"args":[{"kind":"TyCon","name":{"txt":"IO.FileSystem","span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}},"args":[]}]},"fns":[]},"span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}}"#
   match j with
   | .error e => IO.println s!"parse failed: {e}"
   | .ok j    => IO.println (repr (decodeDecl j))
-  -- expect: Except.ok (Decl.dextern (some "IO.FileSystem"))
+  -- expect: Except.ok (Decl.dextern (some "IO.FileSystem") [])
 
 -- DExtern: cap_ty null (a capability-free extern block) decodes to `none`,
 -- not a decode failure.
@@ -730,7 +786,26 @@ open Lean MarchLean.Elab MarchLean.Syntax
   match j with
   | .error e => IO.println s!"parse failed: {e}"
   | .ok j    => IO.println (repr (decodeDecl j))
-  -- expect: Except.ok (Decl.dextern none)
+  -- expect: Except.ok (Decl.dextern none [])
+
+-- Finding I2: DExtern with a `fns` entry, extracting its `name.txt` into
+-- `fnNames` (verified shape: emitting `extern "libc" : Cap(IO.Foreign) do fn
+-- counter_migrate_state(old : Int) : Int end`, samples/t50-shaped).
+#eval show IO Unit from do
+  let j := Json.parse r#"{"kind":"DExtern","extern":{"lib_name":"libc","cap_ty":{"kind":"TyCon","name":{"txt":"Cap","span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}},"args":[{"kind":"TyCon","name":{"txt":"IO.Foreign","span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}},"args":[]}]},"fns":[{"name":{"txt":"counter_migrate_state","span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}},"params":[],"ret_ty":{"kind":"TyCon","name":{"txt":"Int","span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}},"args":[]}}]},"span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}}"#
+  match j with
+  | .error e => IO.println s!"parse failed: {e}"
+  | .ok j    => IO.println (repr (decodeDecl j))
+  -- expect: Except.ok (Decl.dextern (some "IO.Foreign") ["counter_migrate_state"])
+
+-- Finding I1: DProofCap decodes to Decl.dproofcap, carrying the bare declared
+-- name (verified shape, real emitter output for `proof cap Migrated`).
+#eval show IO Unit from do
+  let j := Json.parse r#"{"kind":"DProofCap","name":{"txt":"Migrated","span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}},"span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}}"#
+  match j with
+  | .error e => IO.println s!"parse failed: {e}"
+  | .ok j    => IO.println (repr (decodeDecl j))
+  -- expect: Except.ok (Decl.dproofcap "Migrated")
 
 -- DMod: nested module, name + recursive decls (here containing a DNeeds).
 #eval show IO Unit from do
@@ -831,11 +906,13 @@ private def collisionEnvelope (nestedName : String) : String :=
   | .ok j    => IO.println (repr (decodeOptAnnot j))
   -- expect: Except.ok (some (Ty.con "Cap" []))
 
--- A3 fix: an APPLIED `Tagged(Int, Realtime)` param annotation decodes to a
--- type containing `Ty.unsupported`, driving `Ty.hasUnsupported = true` — the
--- realtime-tag construct that feeds march's Check 7 (realtime exclusion) is
--- out of A3's fragment, so the whole file must skip (reject/t41), not be
--- wrongly accepted for ignoring the tag.
+-- A3 slice (b): an APPLIED `Tagged(Int, Realtime)` param annotation now
+-- decodes to `Ty.con "Tagged" [Ty.con "Int" [], Ty.con "Realtime" []]` —
+-- preserving both arguments (neither `Int` nor `Realtime` is itself
+-- unsupported) — so `Ty.hasUnsupported = false` and the file is NOT skipped
+-- on this construct alone. `CapCheck`'s Check 7 (realtime exclusion) is what
+-- now polices `Tagged(_, Realtime)` combined with an excluded `Cap`
+-- (reject/t41), not the out-of-fragment skip gate (slice (a)'s behaviour).
 #eval show IO Unit from do
   let j := Json.parse r#"{"ty":{"kind":"TyCon","name":{"txt":"Tagged","span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}},"args":[{"kind":"TyCon","name":{"txt":"Int","span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}},"args":[]},{"kind":"TyCon","name":{"txt":"Realtime","span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}},"args":[]}]}}"#
   match j with
@@ -844,7 +921,7 @@ private def collisionEnvelope (nestedName : String) : String :=
       match decodeOptAnnot j with
       | .error e => IO.println s!"decode failed: {e}"
       | .ok none => IO.println "UNEXPECTED: none"
-      | .ok (some t) => IO.println s!"hasUnsupported={t.hasUnsupported}"
-  -- expect: hasUnsupported=true
+      | .ok (some t) => IO.println s!"decoded={repr t}, hasUnsupported={t.hasUnsupported}"
+  -- expect: decoded=Ty.con "Tagged" [Ty.con "Int" [], Ty.con "Realtime" []], hasUnsupported=false
 
 end MarchLean.Elab.Test

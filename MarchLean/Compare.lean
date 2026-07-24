@@ -226,11 +226,11 @@ def declSpanTys (env : TyEnv) : Decl → List (Span × Ty)
   | .dtype .. => []
   | .dlet _ body => termSpanTys env false body
   | .dfn _ _ _ body => termSpanTys env false body
-  -- A3 Task 2 decode-only constructors: no term of their own, so no
+  -- A3 Task 2/3 decode-only constructors: no term of their own, so no
   -- `(span, ty)` pairs to contribute. `dmod` is inert-but-unreachable here:
   -- `inferModule` flattens nested `dmod`s via `flattenDecls` before this is
   -- ever called, so its children already appear as top-level decls.
-  | .dmod .. | .dneeds _ | .duse _ | .dextern _ => []
+  | .dmod .. | .dneeds _ | .duse _ | .dextern .. | .dproofcap _ => []
   | .unsupported => []
 
 /-- Every `(span, resolved_ty)` pair for every `var`/`field` node in the
