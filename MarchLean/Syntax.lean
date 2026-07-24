@@ -210,8 +210,25 @@ inductive Decl where
   /-- `use Vault` — a module import, as a dot-joined path. Drives Check 4. -/
   | duse (path : String)
   /-- An `extern "lib" : Cap(X) do … end` block. `capTy` is the dot-joined
-  `X`, or `none` when the block declares no capability. Drives Check 5. -/
-  | dextern (capTy : Option String)
+  `X`, or `none` when the block declares no capability. `fnNames` is every
+  extern fn's own name declared inside the block (`extern.fns[*].name.txt`,
+  verified shape: `.superpowers/sdd/samples/t50_*.json`), independent of
+  `capTy` — an extern block always carries a (possibly empty) `fns` list, cap
+  or no cap. `capTy` drives Check 5; `fnNames` additionally drives Check 8
+  (Finding I2 — an extern fn matching `is_migrate_fn_name` inherits the
+  block's declared capability into its `own_caps` in march, exactly like a
+  `DFn`'s own signature/body caps do). -/
+  | dextern (capTy : Option String) (fnNames : List String)
+  /-- `proof cap X` — declares `X` a nominal proof capability owned by this
+  module. In-fragment (unlike slice (a), which mapped it to `Decl.unsupported`
+  since Check 1's self-declaration exemption was out of scope then): carrying
+  the bare declared name lets `CapCheck` recognize when a `Cap(Mod.X)` used in
+  THIS module's own signatures is self-covered by this very declaration,
+  mirroring march's `env.proof_caps` self-declaration exemption
+  (`typecheck.ml:6966-6970`) for the one shape that mechanism actually reaches
+  (see `CapCheck.checkCaps`'s docstring on `entryName` for the precise,
+  narrower-than-it-looks scope of that exemption). -/
+  | dproofcap (name : String)
   | unsupported
   deriving Repr, Inhabited
 
@@ -234,7 +251,8 @@ partial def Decl.hasUnsupported : Decl → Bool
   | .dmod _ decls => decls.any Decl.hasUnsupported
   | .dneeds _ => false
   | .duse _ => false
-  | .dextern _ => false
+  | .dextern _ _ => false
+  | .dproofcap _ => false
 
 /-- Splice nested `dmod` decls into a single flat list, for the passes that
 treat a module as a transparent scope (inference, linearity). Cap checking
@@ -276,6 +294,17 @@ structure Module where
   (`Linearity.lean`, `Compare.lean`, `Infer.lean`) that predate A3 and don't
   exercise capability checking keep compiling unchanged. -/
   moduleCaps : List (String × List String) := []
+  /-- The bare name of the FILE'S OWN entry module (the envelope's
+  `module.name`, e.g. `"Db"` for a file whose entire content is `mod Db do …
+  end`). Used ONLY by `CapCheck.checkCaps` to key the proof-cap
+  self-declaration exemption (Finding I1) at the top level — see that
+  function's docstring for why the exemption is narrower than "same bare
+  module name" and applies ONLY at this outermost level, never to a nested
+  `dmod`. Defaults to `""` so the many hand-built `Module` fixtures elsewhere
+  that predate this field keep compiling unchanged (an empty `entryName`
+  simply means no self-declared cap will ever match, since a real cap path is
+  never literally `".X"`). -/
+  entryName : String := ""
   deriving Inhabited
 
 end MarchLean.Syntax

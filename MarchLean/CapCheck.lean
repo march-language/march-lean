@@ -47,23 +47,42 @@ started descending into `Tagged`'s payload and manufacturing false Check
 never looks inside `Tagged` at all. This arm must stay ahead of the generic
 `.con` arm below.
 
-**The `Cap` arm requires its argument to be a NULLARY constructor**, mirroring
-march exactly: `cap_paths_in_surface_ty` matches
-`Ast.TyCon (con, [arg]) when con.txt = "Cap"` and then, inside that arm,
-`| Ast.TyCon (name, []) -> [name.txt] | _ -> []` (`typecheck.ml:1617-1620`) —
-a `Cap(_)` whose argument carries type arguments (e.g. `Cap(Foo(Int))`) is
-NOT a capability path at all and march's whole `Cap` arm returns `[]` for it,
-without falling through to generic recursion into the argument's own
-sub-terms. The explicit `| .con "Cap" _ => []` arm below is required to match
-that: without it, a non-nullary `Cap(_)` argument would fall through to the
-generic `.con _ args => args.flatMap capsInTy` arm and this function would
-wrongly recurse into the argument's payload (and could still surface a
-`Cap(_)` nested further inside, e.g. `Cap(Foo(Cap(IO)))`, that march itself
-never looks for). -/
+**The `Cap` MARKER ITSELF requires EXACTLY ONE type argument**, mirroring
+march's `cap_paths_in_surface_ty`, which only recognizes the capability
+position at all via the pattern `Ast.TyCon (con, [arg]) when con.txt = "Cap"`
+(`typecheck.ml:1617`, one-element list) — march's OCaml match is
+non-exhaustive here (`con` name aside, only the singleton-arg-list shape has
+a `Cap`-specific arm at all) and any OTHER arity of `Cap` (0 args — the plain
+user-ADT `Cap` from `type Cap = C(Int)`; 2+ args — e.g. `Cap(Cap(IO.Network),
+Int)`) falls through to march's generic `| Ast.TyCon (_, args) ->
+List.concat_map cap_paths_in_surface_ty args` catch-all, which DOES recurse
+into every argument looking for capability paths nested inside them. A
+regression in the previous commit collapsed this to `| .con "Cap" _ => []`
+(matching Cap at ANY arity and always returning `[]`), which silently
+swallowed any `Cap(_)` nested inside a non-unary `Cap(...)` application — a
+live false accept (`fn f(_c : Cap(Cap(IO.Network), Int)) : Int`, which march
+rejects for the uncovered `IO.Network` but the buggy checker accepted). The
+`| .con "Cap" [_] => []` arm below is the arity-1-only guard: it only ever
+fires for a single-argument `Cap(_)`, letting every other arity fall through
+to the generic `.con _ args => args.flatMap capsInTy` arm below it, exactly
+as march's own fallthrough does.
+
+**Within that arity-1 arm, the argument must ALSO be a NULLARY constructor**
+to extract a capability name at all, mirroring march's inner match on the
+single argument: `| Ast.TyCon (name, []) -> [name.txt] | _ -> []`
+(`typecheck.ml:1618-1619`) — a `Cap(_)` whose sole argument carries its OWN
+type arguments (e.g. `Cap(Foo(Int))`) is NOT a capability path and march's
+whole `Cap` arm returns `[]` for it, WITHOUT falling through to generic
+recursion into that argument's own sub-terms (so a further-nested `Cap(_)`
+inside it, e.g. `Cap(Foo(Cap(IO)))`, is never found — march itself never
+looks for it there either). The explicit `| .con "Cap" [_] => []` arm (after
+the nullary-match arm above it) is required for this: without it, a
+non-nullary single argument would fall through to the generic
+`.con _ args => args.flatMap capsInTy` arm and wrongly recurse into it. -/
 partial def capsInTy : Ty → List String
   | .con "Tagged" _ => []
   | .con "Cap" [.con x []] => [x]
-  | .con "Cap" _ => []
+  | .con "Cap" [_] => []
   | .con _ args => args.flatMap capsInTy
   | .arrow a b  => capsInTy a ++ capsInTy b
   | .tuple ts   => ts.flatMap capsInTy
@@ -86,11 +105,11 @@ scans `param_tys @ ret_tys`, so a `Cap(X)` in return position counts exactly
 like one in a parameter. Kept separate from `capsInSignature` because the two
 call sites gate it differently: for **Check 1**, `checkOneModule` calls this
 GATED on the enclosing module being fully in fragment (see its docstring for
-why — march's self-declaration exemption can cover a return cap through
-machinery this checker doesn't model). For **Check 8**, `checkOneModule`
-calls this UNGATED — correctly so, since march's own Check 8 tests
-`own_caps <> []` directly and is not subject to Check 1's self-declaration
-exemption at all. -/
+why a residual gate is still needed even now that proof-cap self-declaration,
+Finding I1, is modeled directly via `selfDeclaredCaps` rather than through
+this gate). For **Check 8**, `checkOneModule` calls this UNGATED — correctly
+so, since march's own Check 8 tests `own_caps <> []` directly and is not
+subject to Check 1's self-declaration exemption at all. -/
 def capsInReturnSignature : Decl → List String
   | .dfn _ _ retAnnot _ =>
       match retAnnot with | some t => capsInTy t | none => []
@@ -99,6 +118,13 @@ def capsInReturnSignature : Decl → List String
 /-- The caps this module declares via `needs`. -/
 def declaredNeeds (decls : List Decl) : List String :=
   decls.flatMap (fun d => match d with | .dneeds ps => ps | _ => [])
+
+/-- The bare names of proof caps this module declares DIRECTLY — a sibling
+`Decl.dproofcap` in its OWN `decls` (not one declared inside a nested
+`dmod`). Used only by `checkCaps` to build the top-level self-declaration
+exemption (Finding I1) — see that function's docstring. -/
+def declaredProofCapNames (decls : List Decl) : List String :=
+  decls.flatMap (fun d => match d with | .dproofcap n => [n] | _ => [])
 
 /-- IO-effectful builtin names — the subset of march's builtin→cap table
 (`typecheck.ml:1498-1590`) whose cap begins `IO`. Copied verbatim from the
@@ -180,11 +206,21 @@ checker regression.
    march and thereby *introduce* a fresh divergence (a false reject) rather
    than remove one. If transitive migrate-state checking is ever wanted,
    march itself must implement it first, and this checker should follow.
-2. Extern migrate fns are not modelled: march also flags a `DExtern` fn whose
-   name matches `is_migrate_fn_name` (`typecheck.ml:7226-7234`), attributing
-   it `IO.Foreign` (plus `IO.Foreign.Blocking` under `blocking`) regardless of
-   body. This checker has no representation of extern function bodies/caps
-   for that case and does not check it.
+2. Extern migrate fns (Finding I2 — CLOSED): march also flags a `DExtern` fn
+   whose name matches `is_migrate_fn_name` (`typecheck.ml:6941-6950`,
+   `:7226-7234`), attributing it `IO.Foreign` (plus `IO.Foreign.Blocking`
+   under `blocking`) UNCONDITIONALLY — every extern fn in every extern block
+   gets this, regardless of the block's own declared `ext_cap_ty` (verified
+   directly against `march`: an extern block whose declared type isn't even
+   `Cap`-shaped still rejects a migrate-named fn inside it). `checkOneModule`
+   now checks this directly (below, right after the `dfn`-based scan above):
+   ANY extern block listing a migrate-named fn is a violation, independent of
+   this checker's own decoded `capTy` (which drives Check 5's separate
+   `needs`-coverage obligation only). This checker doesn't distinguish
+   `blocking` from non-blocking externs the way march's two-cap-vs-one-cap
+   attribution does — but Check 8 only ever tests `own_caps <> []` (ANY
+   non-empty list), never which specific caps are in it, so that distinction
+   is irrelevant to the verdict here.
 3. A multi-clause fn (0 or 2+ clauses) whose name ends in `_migrate_state`
    decodes to `Decl.unsupported` (`Elab.lean`), never a `dfn` — it is
    therefore never seen by this scan at all and escapes Check 8 entirely.
@@ -225,36 +261,49 @@ def covered (declared : List String) (used : String) : Bool :=
   declared.any (fun need => capSubsumes need used)
 
 /-- Check one module (not recursing into nested modules — the caller does
-that, since each module is checked against its OWN declared needs). -/
+that, since each module is checked against its OWN declared needs).
+`selfDeclaredCaps` is the list of fully-qualified cap paths (e.g.
+`"Db.Migrated"`) that Check 1 must treat as covered regardless of `needs`,
+per Finding I1's self-declaration exemption — see `checkCaps`'s docstring for
+why this is passed in ONLY at the top-level call and always `[]` for a
+nested `dmod`. -/
 def checkOneModule (modName : String) (decls : List Decl)
-    (moduleCaps : List (String × List String)) : CapResult :=
+    (moduleCaps : List (String × List String))
+    (selfDeclaredCaps : List String := []) : CapResult :=
   let declared := declaredNeeds decls
   -- Check 1 — signature Cap(X) coverage over `param_tys @ ret_tys`
   -- (march's `check_module_needs`). Parameter caps are ALWAYS scanned.
   --
-  -- RETURN caps are scanned only when this module is ENTIRELY in fragment. A
-  -- module carrying an out-of-fragment declaration (e.g. a `proof cap`, which
-  -- decodes to `Decl.unsupported`) may satisfy a return cap through machinery
-  -- this checker does not model: march's self-declaration exemption lets a
-  -- module's own `proof cap X` implicitly cover `Cap(Module.X)` returned by
-  -- its public fns (accept/t62 — `Cap(Db.Migrated)` returned under `needs IO`,
-  -- accepted). Rather than mis-reject such a return, defer — the file skips
-  -- downstream via the out-of-fragment gate, exactly as it did before this
-  -- scan existed. A fully-in-fragment module has only modeled IO caps and no
-  -- such escape, so an uncovered return cap there is a real Check 1 violation
-  -- (the M1 gap: e.g. `fn f(cap : Cap(IO.Console)) : Cap(IO.Network)` under
-  -- `needs IO.Console`). Params are left unconditional so no existing
-  -- signature-based reject changes.
+  -- RETURN caps are scanned only when this module is ENTIRELY in fragment
+  -- (excluding `Decl.dproofcap`, which is in-fragment but drives
+  -- `selfDeclaredCaps` below rather than this gate — see Finding I1). A
+  -- module carrying some OTHER out-of-fragment declaration may satisfy a
+  -- return cap through machinery this checker still does not model at all
+  -- (e.g. an actor/interface construct this fragment has no representation
+  -- for whatsoever); rather than mis-reject such a return, defer — the file
+  -- skips downstream via the out-of-fragment gate, exactly as it did before
+  -- this scan existed. A fully-in-fragment module has only modeled IO/proof
+  -- caps and no such escape, so an uncovered return cap there is a real
+  -- Check 1 violation (the M1 gap: e.g. `fn f(cap : Cap(IO.Console)) :
+  -- Cap(IO.Network)` under `needs IO.Console`). Params are left
+  -- unconditional so no existing signature-based reject changes.
   let retCaps :=
     if decls.any Decl.hasUnsupported then [] else decls.flatMap capsInReturnSignature
   let sigCaps := decls.flatMap capsInSignature ++ retCaps
-  match sigCaps.find? (fun c => !covered declared c) with
+  -- Finding I1: a cap in `selfDeclaredCaps` is covered regardless of
+  -- `needs` — march's self-declaration exemption (`typecheck.ml:6966-6970`)
+  -- lets a proof cap's own declaring module use it in its own signatures
+  -- (params OR returns, exactly like any other Check-1-scanned cap) without
+  -- repeating `needs Module.X`. `accept/t62`'s returned `Cap(Db.Migrated)`
+  -- under only `needs IO` is exactly this case, now covered here directly
+  -- rather than via the return-cap defer-gate above.
+  match sigCaps.find? (fun c => !covered declared c && !selfDeclaredCaps.contains c) with
   | some bad =>
       .violation s!"Check 1: `Cap({bad})` used in module `{modName}` but `{bad}` is not declared in `needs`"
   | none =>
   -- Check 5 — extern cap coverage
   let externCaps := decls.flatMap (fun d =>
-    match d with | .dextern (some c) => [c] | _ => [])
+    match d with | .dextern (some c) _ => [c] | _ => [])
   match externCaps.find? (fun c => !covered declared c) with
   | some bad =>
       .violation s!"Check 5: extern in module `{modName}` requires `Cap({bad})` but `{bad}` is not declared in `needs`"
@@ -334,6 +383,30 @@ def checkOneModule (modName : String) (decls : List Decl)
       | _ => false) with
   | some (.dfn name _ _ _) =>
       .violation s!"Check 8: fn `{name}` in module `{modName}` ends in `_migrate_state` but performs IO or its signature carries a capability"
+  | _ =>
+  -- Finding I2: EVERY extern block implies `Cap(IO.Foreign)` onto EVERY
+  -- extern fn it contains, UNCONDITIONALLY of that block's own declared
+  -- `ext_cap_ty` (`typecheck.ml:6941-6950`: `extern_cap_uses`'s `base =
+  -- [("IO.Foreign", sp)]` and, per extern fn, `own = if ef_blocking then
+  -- [...] else ["IO.Foreign"]` — both computed with no reference to
+  -- `ext_cap_ty` at all; the comment there literally reads "any DExtern →
+  -- needs IO.Foreign"). Verified empirically against `march --check`: an
+  -- extern block whose `ext_cap_ty` isn't even `Cap`-shaped at all (e.g.
+  -- `extern "libc" : Int do fn counter_migrate_state(...) ... end`, which
+  -- this checker's own `Decl.dextern` decodes with `capTy = none`) STILL
+  -- rejects a migrate-named fn inside it with the same "migrate_state must
+  -- be IO-free" error. So this checker's `capTy` (which drives Check 5's
+  -- SEPARATE `needs`-coverage obligation) must play NO role in Check 8 at
+  -- all — an extern fn whose name matches `is_migrate_fn_name` is a
+  -- violation whenever it sits in ANY extern block, `capTy` irrelevant (this
+  -- closes gap 2 in `bodyCallsIO`'s docstring above).
+  match decls.find? (fun d =>
+      match d with
+      | .dextern _ fnNames => fnNames.any isMigrateFnName
+      | _ => false) with
+  | some (.dextern _ fnNames) =>
+      let name := (fnNames.filter isMigrateFnName).headD "?"
+      .violation s!"Check 8: extern fn `{name}` in module `{modName}` ends in `_migrate_state` but every extern block implies `Cap(IO.Foreign)`"
   | _ => .ok
 
 /-- Walk the whole module tree, checking each module against its own needs. -/
@@ -349,9 +422,35 @@ partial def checkDecls (moduleCaps : List (String × List String)) : List Decl �
   | _ :: rest => checkDecls moduleCaps rest
 
 /-- Entry point. Also checks the top level as an implicit module, so a file
-with `needs`/`Cap(X)` outside any `mod` block is still checked. -/
+with `needs`/`Cap(X)` outside any `mod` block is still checked.
+
+**Finding I1's self-declaration exemption is computed HERE, and passed ONLY
+to this one top-level `checkOneModule` call — never to a nested `dmod`'s
+check via `checkDecls`.** This asymmetry is deliberate and empirically
+verified against march, not a simplification: march's own exemption
+(`typecheck.ml:6966-6970`, `env.proof_caps`) checks `declaring_mod =
+mod_name.txt` using whatever `env.proof_caps` the ENCLOSING scope's
+env-threading happens to carry at the point `check_module_needs` runs for
+that module — and for the FILE'S OWN entry module, that call
+(`typecheck.ml:10167`) uses `final_env`, threaded through the ENTIRE
+top-level decl list, so a proof cap the entry module declares directly IS
+visible to its own check. For ANY nested `dmod`, by contrast, march's
+`check_module_needs` call (`typecheck.ml:8650`) runs INSIDE that module's own
+`DMod` arm using the OUTER `env` captured BEFORE that module's own decls were
+folded — so a proof cap the NESTED module declares directly is NEVER visible
+to its own check, regardless of matching bare names. Verified directly
+against the `march` binary:
+`mod Db do proof cap Migrated; fn consume(m : Cap(Db.Migrated)) : Int do 1 end end`
+(entry module) — ACCEPTS; the identical shape one level down,
+`mod Top do mod Db do proof cap Migrated; fn consume(m : Cap(Db.Migrated)) : Int do 1 end end end`
+— REJECTS. So the exemption this checker models must be the SAME
+asymmetry: computed once from `m.decls`/`m.entryName` (the file's own entry
+module) and threaded only into the top-level `checkOneModule` call;
+`checkDecls`'s recursive calls keep their default `[]`. -/
 def checkCaps (m : Module) : CapResult :=
-  match checkOneModule "<top-level>" m.decls m.moduleCaps with
+  let selfDeclaredCaps :=
+    (declaredProofCapNames m.decls).map (fun n => s!"{m.entryName}.{n}")
+  match checkOneModule "<top-level>" m.decls m.moduleCaps selfDeclaredCaps with
   | .violation msg => .violation msg
   | .ok => checkDecls m.moduleCaps m.decls
 
@@ -406,14 +505,14 @@ def useCoveredByRoot : Module := {
 
 /-- Check 5: an extern declaring Cap(IO.Foreign) with no covering needs. -/
 def externUncovered : Module := {
-  decls := [Decl.dmod "F" [Decl.dextern (some "IO.Foreign")]],
+  decls := [Decl.dmod "F" [Decl.dextern (some "IO.Foreign") []]],
   schemes := [], insts := [], moduleCaps := [] }
 #eval checkCaps externUncovered
   -- expect: violation — Check 5
 
 /-- Check 5 satisfied. -/
 def externCovered : Module := {
-  decls := [Decl.dmod "F" [Decl.dneeds ["IO.Foreign"], Decl.dextern (some "IO.Foreign")]],
+  decls := [Decl.dmod "F" [Decl.dneeds ["IO.Foreign"], Decl.dextern (some "IO.Foreign") []]],
   schemes := [], insts := [], moduleCaps := [] }
 #eval checkCaps externCovered
   -- expect: ok
@@ -501,23 +600,85 @@ def noRt : Module := {
 #eval checkCaps noRt
   -- expect: ok
 
-/-- The gate that keeps accept/t62 safe: a module carrying an out-of-fragment
-declaration (here a bare `Decl.unsupported`, standing in for `proof cap
-Migrated`) does NOT get its return caps scanned. march covers t62's returned
-`Cap(Db.Migrated)` — under only `needs IO` — via the self-declaration
-exemption this checker does not model, and ACCEPTS. So `checkCaps` must NOT
-reject: it defers to the downstream out-of-fragment skip gate. Without the
-gate, the uncovered `Db.Migrated` return would wrongly reject an accept file. -/
-def retProofCapDeferred : Module := {
-  decls := [Decl.unsupported,   -- e.g. `proof cap Migrated`
+/-- The gate that still matters for a genuinely-unmodeled decl (NOT a proof
+cap — Finding I1 now models those directly via `selfDeclaredCaps`, see the
+three pins right below): a module carrying some OTHER out-of-fragment
+declaration (here a bare `Decl.unsupported`, standing in for e.g. an actor or
+interface this fragment has no representation for at all) does NOT get its
+return caps scanned, since this checker has no way to know whether that
+unmodeled construct covers the return some other way. `checkCaps` must NOT
+reject here: it defers to the downstream out-of-fragment skip gate. Without
+the gate, the uncovered `Vendor.Widget` return would wrongly reject a file
+this checker cannot actually judge. -/
+def retCapDeferredByOtherUnsupported : Module := {
+  decls := [Decl.unsupported,   -- e.g. an actor/interface decl
             Decl.dneeds ["IO"],
+    Decl.dfn "get_widget"
+      [("cap", Lin.unrestricted, some (Ty.con "Cap" [Ty.con "IO" []]))]
+      (some (Ty.con "Cap" [Ty.con "Vendor.Widget" []]))
+      (Term.lit (Lit.int 0) (Ty.con "Int" []))],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps retCapDeferredByOtherUnsupported  -- expect: ok (deferred, NOT rejected)
+example : (checkCaps retCapDeferredByOtherUnsupported).isViolation = false := by native_decide
+
+/-- Finding I1 pin (param case, the false-accept reproducer): a `proof cap`
+declared directly in the FILE'S OWN entry module, used in a PARAMETER of a fn
+in that same module, is self-covered — matching march's self-declaration
+exemption for the one shape it actually reaches (see `checkCaps`'s
+docstring). march ACCEPTS
+`mod Db do proof cap Migrated; fn consume(m : Cap(Db.Migrated)) : Int do 1 end end`
+even though `Db` declares no `needs Db.Migrated` (verified directly against
+`march --check`); `entryName := "Db"` here stands in for the real decoder
+populating it from the envelope's `module.name`. -/
+def selfDeclaredParamOk : Module := {
+  decls := [Decl.dproofcap "Migrated",
+    Decl.dfn "consume"
+      [("m", Lin.unrestricted, some (Ty.con "Cap" [Ty.con "Db.Migrated" []]))]
+      none
+      (Term.lit (Lit.int 1) (Ty.con "Int" []))],
+  schemes := [], insts := [], moduleCaps := [], entryName := "Db" }
+#eval checkCaps selfDeclaredParamOk  -- expect: ok
+example : (checkCaps selfDeclaredParamOk).isViolation = false := by native_decide
+
+/-- Finding I1 pin (return case): the same self-declaration exemption also
+covers a RETURN-position use — this is `accept/t62`'s actual shape
+(`Cap(Db.Migrated)` returned under only `needs IO`), now satisfied directly
+via `selfDeclaredCaps` rather than by deferring through the out-of-fragment
+gate (contrast `retCapDeferredByOtherUnsupported` above, which defers for an
+UNRELATED reason and would no longer even apply here — `Decl.dproofcap` is
+in-fragment). -/
+def selfDeclaredReturnOk : Module := {
+  decls := [Decl.dproofcap "Migrated", Decl.dneeds ["IO"],
     Decl.dfn "run_migrations"
       [("cap", Lin.unrestricted, some (Ty.con "Cap" [Ty.con "IO" []]))]
       (some (Ty.con "Cap" [Ty.con "Db.Migrated" []]))
       (Term.lit (Lit.int 0) (Ty.con "Int" []))],
-  schemes := [], insts := [], moduleCaps := [] }
-#eval checkCaps retProofCapDeferred  -- expect: ok (deferred, NOT rejected)
-example : (checkCaps retProofCapDeferred).isViolation = false := by native_decide
+  schemes := [], insts := [], moduleCaps := [], entryName := "Db" }
+#eval checkCaps selfDeclaredReturnOk  -- expect: ok
+example : (checkCaps selfDeclaredReturnOk).isViolation = false := by native_decide
+
+/-- Finding I1 pin (nested variant — must STILL reject): the identical
+`proof cap` + param shape, but with the declaring module NESTED one level
+inside another (`Top > Db`) instead of being the file's own entry module.
+Verified directly against `march --check`: this shape REJECTS even though the
+flat/entry-level shape above (`selfDeclaredParamOk`) ACCEPTS — see
+`checkCaps`'s docstring for the env-threading reason march itself treats
+these differently. `checkOneModule`'s recursive call for a nested `dmod`
+always passes `selfDeclaredCaps := []` (its default), so `Db`'s own
+`proof cap Migrated` never covers its own `Cap(Db.Migrated)` use here, and
+Check 1 correctly fires. -/
+def selfDeclaredNestedRejects : Module := {
+  decls := [Decl.dmod "Top" [
+    Decl.dmod "Db" [
+      Decl.dproofcap "Migrated",
+      Decl.dfn "consume"
+        [("m", Lin.unrestricted, some (Ty.con "Cap" [Ty.con "Db.Migrated" []]))]
+        none
+        (Term.lit (Lit.int 1) (Ty.con "Int" []))]]],
+  schemes := [], insts := [], moduleCaps := [], entryName := "Top" }
+#eval checkCaps selfDeclaredNestedRejects
+  -- expect: violation — Check 1, Db.Migrated not self-covered when nested
+example : (checkCaps selfDeclaredNestedRejects).isViolation = true := by native_decide
 
 /-- Check 8: a `*_migrate_state` fn whose body calls an IO builtin → violation. -/
 def migrateDoesIO : Module := {
@@ -609,6 +770,55 @@ def migrateDoesIONested : Module := {
 #eval checkCaps migrateDoesIONested   -- expect: violation naming Check 8
 example : (checkCaps migrateDoesIONested).isViolation = true := by native_decide
 
+/-- Finding I2 (the false-accept reproducer): an `extern` block that declares
+a `Cap(X)` and contains a fn whose name matches `is_migrate_fn_name` is a
+Check 8 violation, even though this checker has no representation of the
+extern fn's own body — march attributes `IO.Foreign` onto every extern fn in
+it (`typecheck.ml:6941-6950`), migrate-named or not. Mirrors
+`mod Counter do needs IO.Foreign; extern "libc" : Cap(IO.Foreign) do
+fn counter_migrate_state(old : Int) : Int end end`, which march rejects
+(exit 1) but the pre-fix checker accepted (exit 0). -/
+def externMigrateWithCapViolates : Module := {
+  decls := [Decl.dmod "Counter" [
+    Decl.dneeds ["IO.Foreign"],
+    Decl.dextern (some "IO.Foreign") ["counter_migrate_state"]]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps externMigrateWithCapViolates
+  -- expect: violation naming Check 8
+example : (checkCaps externMigrateWithCapViolates).isViolation = true := by native_decide
+
+/-- Finding I2, "no declared cap" case — STILL a violation, verified against
+`march` directly (NOT an accept, despite the task brief's working
+assumption): march's `extern_cap_uses` attributes `IO.Foreign` onto every
+extern fn UNCONDITIONALLY of `ext_cap_ty`'s shape (`typecheck.ml:6941-6950`'s
+`base`/`own` are computed with no reference to `ext_cap_ty` at all — the
+comment there literally reads "any DExtern → needs IO.Foreign"). Confirmed
+empirically: `extern "libc" : Int do fn counter_migrate_state(old : Int) :
+Int end` — `ext_cap_ty = Int`, not `Cap`-shaped at all, so this checker's own
+`capTy` decodes to `none` — STILL rejects with march's "migrate_state must be
+IO-free" (exit 1). So Check 8's extern arm must NOT be gated on `capTy`, and
+this fixture (`capTy = none`) must still violate. -/
+def externMigrateCapNoneStillViolates : Module := {
+  decls := [Decl.dmod "Counter" [
+    Decl.dextern none ["counter_migrate_state"]]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps externMigrateCapNoneStillViolates
+  -- expect: violation naming Check 8 (NOT ok — capTy is irrelevant here)
+example : (checkCaps externMigrateCapNoneStillViolates).isViolation = true := by native_decide
+
+/-- Finding I2, the genuine negative case (must NOT over-fire): an extern
+block whose fns DON'T match `is_migrate_fn_name` at all is never a Check 8
+concern regardless of `capTy` — Check 8 only ever tests migrate-NAMED fns.
+`needs IO.Foreign` here separately satisfies Check 5's own (unrelated)
+coverage obligation for the declared `Cap(IO.Foreign)`. -/
+def externCapNoMigrateSafe : Module := {
+  decls := [Decl.dmod "Counter" [
+    Decl.dneeds ["IO.Foreign"],
+    Decl.dextern (some "IO.Foreign") ["read_byte"]]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps externCapNoMigrateSafe   -- expect: ok
+example : (checkCaps externCapNoMigrateSafe).isViolation = false := by native_decide
+
 -- ---------------------------------------------------------------------
 -- Arity-fidelity re-review guards (a1-elaboration-checker-design review,
 -- task 4): `isRealtimeTagged`, `isExcludedCap` and `capsInTy`'s `Cap` arm
@@ -668,6 +878,45 @@ a capability path at all and must extract to `[]`, not `["Foo"]`. Mirrors the
 false-reject reproducer: `fn f(_c : Cap(Foo(Int))) : Int do 1 end` under a
 module defining `type Foo(a) = F(a)`. -/
 example : capsInTy (Ty.con "Cap" [Ty.con "Foo" [Ty.con "Int" []]]) = [] := by native_decide
+
+/-- Finding C1 pin (regression in `6c6c2f0`, this re-review): `capsInTy`'s
+`Cap` arm must be ARITY-1-ONLY, mirroring march's `cap_paths_in_surface_ty`,
+whose `Cap`-specific arm only ever matches `Ast.TyCon (con, [arg])` — a
+SINGLE type argument. `6c6c2f0` collapsed the fallthrough arm to
+`| .con "Cap" _ => []`, which matches `Cap` at ANY arity (including 2) and
+returns `[]` unconditionally — silently swallowing a `Cap(_)` nested inside a
+non-unary `Cap(...)` application instead of falling through to generic
+recursion the way march does. `Cap(Cap(IO.Network), Int)` — Cap applied to
+TWO arguments, the first itself `Cap(IO.Network)` — must extract
+`["IO.Network"]`, NOT `[]`: at arity 2, march's `Cap`-specific arm does not
+match at all, so `Ast.TyCon (_, args) -> List.concat_map
+cap_paths_in_surface_ty args` recurses into both arguments, and the first one
+IS a capability path. Unlike the Finding-3 guard just above (which pins the
+INNER argument's arity, already correct before `6c6c2f0`), this pins the
+`Cap` MARKER's OWN arity — the dimension `6c6c2f0` broke. Mirrors the
+false-accept reproducer: `fn f(_c : Cap(Cap(IO.Network), Int)) : Int do 1
+end`, which march rejects (`Cap(IO.Network)` uncovered) but the regressed
+checker silently accepted. -/
+example :
+    capsInTy (Ty.con "Cap" [Ty.con "Cap" [Ty.con "IO.Network" []], Ty.con "Int" []])
+      = ["IO.Network"]
+  := by native_decide
+
+/-- Finding C1 pin, `checkCaps`-level: the same arity-2 `Cap(Cap(IO.Network),
+Int)` shape, this time reaching `checkCaps` through a real (if minimal)
+module with no `needs` at all — so the nested `IO.Network` capability, if
+`capsInTy` ever regresses back to matching `Cap` at every arity, is uncovered
+and must surface as a Check 1 violation, not silently vanish. -/
+def capArityTwoViolation : Module := {
+  decls := [Decl.dmod "M" [
+    Decl.dfn "f"
+      [("_c", Lin.unrestricted,
+        some (Ty.con "Cap" [Ty.con "Cap" [Ty.con "IO.Network" []], Ty.con "Int" []]))]
+      none (Term.lit (Lit.int 1) (Ty.con "Int" []))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps capArityTwoViolation
+  -- expect: violation — Check 1, IO.Network uncovered (no `needs` at all)
+example : (checkCaps capArityTwoViolation).isViolation = true := by native_decide
 
 /-- Finding 4 pin: `capsInTy` must NOT descend into an applied `Tagged`'s
 payload at all — mirroring march's `cap_paths_in_surface_ty`, whose `Tagged`
