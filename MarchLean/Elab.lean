@@ -202,10 +202,30 @@ partial def decodeSurfaceTy (paramNames : List String) (j : Json) : Except Strin
       -- `CapCheck`'s Check 7 can inspect the second argument's constructor
       -- name to detect `Tagged(_, Realtime)`. (Slice (a) mapped this to
       -- `Ty.unsupported` — Check 7 was out of scope then, so the honest move
-      -- was to skip rather than silently ignore the tag. Now that Check 7 is
-      -- implemented, un-skipping is safe.) A hypothetical nullary `Tagged`
-      -- user ADT (none exists today) would stay a normal `Ty.con` here, same
-      -- as bare `Cap`.
+      -- was to skip rather than silently ignore the tag.) A hypothetical
+      -- nullary `Tagged` user ADT (none exists today) would stay a normal
+      -- `Ty.con` here, same as bare `Cap`.
+      --
+      -- Un-skipping is safe ONLY because `CapCheck.capsInTy` also consumes
+      -- decoded types and now carries its own explicit
+      -- `| .con "Tagged" _ => []` arm (matching march's `cap_paths_in_surface_ty`
+      -- carve-out for `Tagged`) placed ahead of its generic `.con` recursion.
+      -- Check 7 was NOT the only consumer of this decoded type — that was the
+      -- mistaken assumption the first time this arm was un-skipped, and it
+      -- opened a false-reject hole: `capsInTy`'s generic `.con` arm descended
+      -- into `Tagged`'s payload and found `Cap(_)` types nested inside a
+      -- `Tagged(Cap(X), Realtime)` annotation, rejecting files march accepts.
+      -- Any future change here must re-check every decoded-`Ty` consumer, not
+      -- just the one this change was written for.
+      --
+      -- One more consequence of un-skipping: a module whose ONLY
+      -- out-of-fragment marker used to be an applied `Tagged` annotation
+      -- previously decoded to `Ty.unsupported`, which made
+      -- `Decl.hasUnsupported` true for the enclosing decl and drove
+      -- `checkOneModule`'s return-cap fragment gate to defer (skip) on it.
+      -- Now that `Tagged` decodes to a real `Ty.con`, such a module has
+      -- `Decl.hasUnsupported = false` and the return-cap gate can fire on it
+      -- where it previously deferred.
       else if name == "Tagged" && !args.isEmpty then .ok (Ty.con "Tagged" args)
       else .ok (Ty.con name args)
   | "TyVar" =>

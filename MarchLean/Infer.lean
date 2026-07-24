@@ -360,7 +360,14 @@ metavariable whose binding level is strictly greater than `level`
 let/letfn-binding's level to achieve let-polymorphism; NO value
 restriction, any binder generalizes). `body` is the zonked type with
 quantified mvars left in place as `MTy.mvar id`; `instantiate` performs
-the actual substitution later, keyed by id. -/
+the actual substitution later, keyed by id.
+
+This function itself has no value restriction — but that does not mean the
+checker as a whole lacks one: see `demoteToLevel0`, which is called BEFORE
+`generalize` at a `cap_narrow` let-binding specifically to pin that binding's
+result to level 0 so this very function's level check makes it
+non-generalizable. Read the two together, not `generalize` alone, if the
+question is "does this checker apply a value restriction anywhere". -/
 def generalize (s : Supply) (level : Nat) (t : MTy) : InferM Scheme := do
   let zt ← zonk s t
   let (idsRev, classesRev) ← genCollect s level ([], []) zt

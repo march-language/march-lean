@@ -29,8 +29,25 @@ inductive CapResult where
   | violation (msg : String)
   deriving Repr, Inhabited
 
-/-- Every capability named by a `Cap(X)` type anywhere inside a type. -/
+/-- Every capability named by a `Cap(X)` type anywhere inside a type.
+
+**`Tagged` is deliberately NOT descended into**, mirroring march's own
+extractor: `cap_paths_in_surface_ty` (`typecheck.ml`) has an explicit arm
+`| Ast.TyCon (con, _) when con.txt = "Tagged" -> []` — an applied `Tagged(X,
+T)` is a phantom/policy tag, not a capability position, so march skips its
+arguments entirely rather than looking for `Cap(_)` inside `X`. Before this
+arm existed, an applied `Tagged` decoded to `Ty.unsupported` here (see
+`Elab.lean`'s `decodeSurfaceTy`), which this function's catch-all mapped to
+`[]` — the same `[]` result, but by accident: once `Tagged` started decoding
+to a real `Ty.con "Tagged" args` (to let Check 7 read the realtime marker),
+the generic `.con _ args => args.flatMap capsInTy` arm below would have
+started descending into `Tagged`'s payload and manufacturing false Check
+1/Check 8 rejects on any `Cap(_)` nested there (e.g.
+`Tagged(Cap(IO.Network), Realtime)`) even when march accepts, because march
+never looks inside `Tagged` at all. This arm must stay ahead of the generic
+`.con` arm below. -/
 partial def capsInTy : Ty → List String
+  | .con "Tagged" _ => []
   | .con "Cap" [.con x _] => [x]
   | .con _ args => args.flatMap capsInTy
   | .arrow a b  => capsInTy a ++ capsInTy b
@@ -51,9 +68,14 @@ def capsInSignature : Decl → List String
 
 /-- The caps a declaration's RETURN-type annotation mentions. march's Check 1
 scans `param_tys @ ret_tys`, so a `Cap(X)` in return position counts exactly
-like one in a parameter. Kept separate from `capsInSignature` because the
-return scan is GATED on the enclosing module being fully in fragment — see
-`checkOneModule`. -/
+like one in a parameter. Kept separate from `capsInSignature` because the two
+call sites gate it differently: for **Check 1**, `checkOneModule` calls this
+GATED on the enclosing module being fully in fragment (see its docstring for
+why — march's self-declaration exemption can cover a return cap through
+machinery this checker doesn't model). For **Check 8**, `checkOneModule`
+calls this UNGATED — correctly so, since march's own Check 8 tests
+`own_caps <> []` directly and is not subject to Check 1's self-declaration
+exemption at all. -/
 def capsInReturnSignature : Decl → List String
   | .dfn _ _ retAnnot _ =>
       match retAnnot with | some t => capsInTy t | none => []
@@ -101,9 +123,9 @@ example : isMigrateFnName "counter_migrate_state" = true := by native_decide
 
 /-- Does this term (a function body) directly call an IO builtin? A
 structural walk: an `app` whose callee is a `var` in `ioBuiltins` is a hit;
-otherwise recurse into every sub-term. This is the DIRECT-call approximation
-of march's transitive check (design §5) — it does not follow calls into user
-functions. Total over every `Term` constructor (`MarchLean/Syntax.lean`):
+otherwise recurse into every sub-term. This is a DIRECT-call scan only — it
+does not follow calls into user functions. Total over every `Term`
+constructor (`MarchLean/Syntax.lean`):
 `lit`/`var`/`unsupported` are the only genuine leaves; every other
 constructor recurses into all of its `Term`/`List Term`/`List (Pattern ×
 Term)` children so an IO call nested arbitrarily deep (inside a `let`,
@@ -123,13 +145,39 @@ checker regression.
 
 **Remaining Check-8 fidelity gaps (tracked here, not fixed):**
 1. Direct-call only, as noted above — this scan does not follow
-   `migrate_state → user fn → IO`, whereas march's `own_cap_closures`
-   accumulation is transitive across the call graph.
+   `migrate_state → user fn → IO`. **This is NOT a one-sided gap: march does
+   not follow it either.** `own_cap_closures` is written in exactly one
+   place — `record_fn_caps` (`typecheck.ml:6847-6849`) — which merges
+   `own_caps @ prior` for the SAME qualified function name; none of its three
+   feeders (signature caps, `body_cap_uses` via `calls_in_expr`, extern caps)
+   walks the call graph into a *different* function. Confirmed empirically:
+   `fn helper(x : Int) : Int do println("side effect") x end` /
+   `fn counter_migrate_state(old : Int) : Int do helper(old) end` is ACCEPTED
+   by march (exit 0) despite `helper` performing IO. So
+   `migrate → user fn → IO` is a SHARED BLIND SPOT, not a checker-only
+   weakness: both march and this checker miss it, and — because
+   `march-lean-check` is a differential oracle that can only ever surface
+   *disagreements* between the two sides — no amount of corpus running will
+   ever reveal this gap. That makes it strictly more important to record
+   here than an ordinary one-sided fidelity gap would be. A future
+   maintainer must NOT "close" this by adding transitive call-graph analysis
+   to this checker: doing so would make this checker MORE precise than
+   march and thereby *introduce* a fresh divergence (a false reject) rather
+   than remove one. If transitive migrate-state checking is ever wanted,
+   march itself must implement it first, and this checker should follow.
 2. Extern migrate fns are not modelled: march also flags a `DExtern` fn whose
    name matches `is_migrate_fn_name` (`typecheck.ml:7226-7234`), attributing
    it `IO.Foreign` (plus `IO.Foreign.Blocking` under `blocking`) regardless of
    body. This checker has no representation of extern function bodies/caps
-   for that case and does not check it. -/
+   for that case and does not check it.
+3. A multi-clause fn (0 or 2+ clauses) whose name ends in `_migrate_state`
+   decodes to `Decl.unsupported` (`Elab.lean`), never a `dfn` — it is
+   therefore never seen by this scan at all and escapes Check 8 entirely.
+   Safe in practice (the file is driven to skip downstream via the
+   out-of-fragment gate before this would matter), but worth recording
+   alongside the other two gaps above. march, by contrast, concatenates
+   parameters across all clauses of a multi-clause fn
+   (`typecheck.ml:7172-7178`, `:6853-6857`) and checks the merged signature. -/
 partial def bodyCallsIO : Term → Bool
   | .lit _ _ => false
   | .var _ _ _ => false
@@ -214,7 +262,12 @@ def checkOneModule (modName : String) (decls : List Decl)
   -- hold allocation-, IO-, or panic-capable capabilities. Signature-level
   -- only (`dfn` param annotations) — this checker does not scan bodies
   -- (that is Check 1b, warning-only in march and deliberately not modelled;
-  -- see the module docstring above).
+  -- see the module docstring above). Also, as with Check 8 (see
+  -- `bodyCallsIO`'s docstring), a multi-clause fn (0 or 2+ clauses) whose
+  -- name would otherwise match decodes to `Decl.unsupported`, never a
+  -- `dfn` — it is never seen by this scan and escapes Check 7 entirely;
+  -- march instead concatenates params across all clauses
+  -- (`typecheck.ml:7172-7178`, `:6853-6857`) before checking.
   let isRealtimeTagged : Ty → Bool
     | .con "Tagged" [_, .con "Realtime" _] => true
     | _ => false
