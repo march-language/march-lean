@@ -70,4 +70,4 @@ tuple/record/list literal.
 IO-freedom) in `MarchLean/CapCheck.lean` (`bodyCallsIO`) and cross-checking
 its behavior against march's `calls_in_expr` line by line.
 
-**Status.** reported upstream: NOT YET
+**Status.** reported upstream: https://github.com/march-language/march/issues/82 (filed 2026-07-24)

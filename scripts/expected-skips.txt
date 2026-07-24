@@ -64,7 +64,6 @@ accept/t58_revoke_cap_typechecks.march                         # out-of-fragment
 accept/t59_cap_no_panic_guarded_guardless_catchall.march       # out-of-fragment construct in a declaration
 accept/t60_nested_id_polymorphic.march                         # out-of-fragment construct in a declaration
 accept/t62_mint_cap_public_declaring.march                     # out-of-fragment construct in a declaration
-accept/t63_proof_cap_passthrough.march                         # out-of-fragment construct in a declaration
 accept/t67_linear_field_arith_single.march                     # out-of-fragment construct in a declaration
 accept/t68_linear_send_consumes.march                          # out-of-fragment construct in a declaration
 accept/t69_sibling_own_ctor.march                              # out-of-fragment construct in a declaration
