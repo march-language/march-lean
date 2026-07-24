@@ -106,7 +106,33 @@ def checkOneModule (modName : String) (decls : List Decl)
   match unmet.head? with
   | some (m, r) =>
       .violation s!"Check 4: module `{modName}` imports `{m}` which requires `Cap({r})`, but `{r}` is not declared in `needs`"
-  | none => .ok
+  | none =>
+  -- Check 7 — realtime exclusion (typecheck.ml:7162-7182). A fn whose
+  -- PARAMETER signature carries BOTH a `Tagged(_, Realtime)` type and a
+  -- `Cap(X)` with X ∈ {Alloc, IO, Panic} (the excluded roots — NOT other IO
+  -- sub-caps like `IO.Network`) is rejected: realtime functions may not also
+  -- hold allocation-, IO-, or panic-capable capabilities. Signature-level
+  -- only (`dfn` param annotations) — this checker does not scan bodies
+  -- (that is Check 1b, warning-only in march and deliberately not modelled;
+  -- see the module docstring above).
+  let isRealtimeTagged : Ty → Bool
+    | .con "Tagged" [_, .con "Realtime" _] => true
+    | _ => false
+  let isExcludedCap : Ty → Bool
+    | .con "Cap" [.con r _] => r == "Alloc" || r == "IO" || r == "Panic"
+    | _ => false
+  let paramTysOf : Decl → List Ty
+    | .dfn _ params _ _ => params.filterMap (fun (_, _, a) => a)
+    | _ => []
+  match decls.find? (fun d =>
+      (paramTysOf d).any isRealtimeTagged && (paramTysOf d).any isExcludedCap) with
+  | some (.dfn name params _ _) =>
+      let excludedName :=
+        match (params.filterMap (fun (_, _, a) => a)).find? isExcludedCap with
+        | some (.con "Cap" [.con r _]) => r
+        | _ => "?"
+      .violation s!"Check 7: fn `{name}` in module `{modName}` takes a `Tagged(_, Realtime)` param and an excluded `Cap({excludedName})` param (Alloc|IO|Panic are excluded alongside a realtime tag)"
+  | _ => .ok
 
 /-- Walk the whole module tree, checking each module against its own needs. -/
 partial def checkDecls (moduleCaps : List (String × List String)) : List Decl → CapResult
@@ -233,6 +259,45 @@ def retCapCovered : Module := {
   schemes := [], insts := [], moduleCaps := [] }
 #eval checkCaps retCapCovered  -- expect: ok
 example : (checkCaps retCapCovered).isViolation = false := by native_decide
+
+/-- Check 7 (reject/t41-shaped): a fn with BOTH a `Tagged(_, Realtime)` param
+and a `Cap(IO)` param — one of the three excluded roots — is a violation. -/
+def rtExcluded : Module := {
+  decls := [Decl.dmod "RT" [
+    Decl.dneeds ["IO"],
+    Decl.dfn "step"
+      [("_d", Lin.unrestricted, some (Ty.con "Tagged" [Ty.con "Int" [], Ty.con "Realtime" []])),
+       ("_c", Lin.unrestricted, some (Ty.con "Cap" [Ty.con "IO" []]))]
+      none (Term.lit (Lit.int 1) (Ty.con "Int" []))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps rtExcluded
+  -- expect: violation — Check 7, `Cap(IO)` excluded alongside the realtime tag
+
+/-- Check 7 requires BOTH conditions: a realtime-tagged param alongside a
+NON-excluded cap (`IO.Network`, not a root `IO`/`Alloc`/`Panic`) must NOT be
+flagged. -/
+def rtSafe : Module := {
+  decls := [Decl.dmod "RT" [
+    Decl.dneeds ["IO"],
+    Decl.dfn "step"
+      [("_d", Lin.unrestricted, some (Ty.con "Tagged" [Ty.con "Int" [], Ty.con "Realtime" []])),
+       ("_c", Lin.unrestricted, some (Ty.con "Cap" [Ty.con "IO.Network" []]))]
+      none (Term.lit (Lit.int 1) (Ty.con "Int" []))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps rtSafe
+  -- expect: ok — IO.Network is not an excluded root
+
+/-- Check 7's other half: an excluded cap with NO realtime-tagged param must
+NOT be flagged (this is just an ordinary Check-1-covered `Cap(IO)` use). -/
+def noRt : Module := {
+  decls := [Decl.dmod "RT" [
+    Decl.dneeds ["IO"],
+    Decl.dfn "step"
+      [("_c", Lin.unrestricted, some (Ty.con "Cap" [Ty.con "IO" []]))]
+      none (Term.lit (Lit.int 1) (Ty.con "Int" []))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps noRt
+  -- expect: ok
 
 /-- The gate that keeps accept/t62 safe: a module carrying an out-of-fragment
 declaration (here a bare `Decl.unsupported`, standing in for `proof cap

@@ -196,13 +196,17 @@ partial def decodeSurfaceTy (paramNames : List String) (j : Json) : Except Strin
       -- plain `Ty.con name args` path below. A capability is always
       -- `Cap(permission)`; a bare `Cap` never is. -/
       if name == "Cap" && !args.isEmpty then .ok (Ty.con "Cap" args)
-      -- `Tagged(_, Realtime)` drives march's Check 7 realtime exclusion, out
-      -- of A3 slice (a)'s fragment: an applied `Tagged` (mirroring the `Cap`
-      -- carve-out above) decodes to `Ty.unsupported` so the whole file
-      -- honestly skips rather than being silently accepted against a rule
-      -- A3 does not model. A hypothetical nullary `Tagged` user ADT (none
-      -- exists today) would stay a normal `Ty.con` here, same as bare `Cap`.
-      else if name == "Tagged" && !args.isEmpty then .ok Ty.unsupported
+      -- `Tagged(_, Realtime)` drives march's Check 7 realtime exclusion (A3
+      -- slice (b)). An applied `Tagged` (mirroring the `Cap` carve-out above)
+      -- decodes to `Ty.con "Tagged" args`, preserving both arguments, so
+      -- `CapCheck`'s Check 7 can inspect the second argument's constructor
+      -- name to detect `Tagged(_, Realtime)`. (Slice (a) mapped this to
+      -- `Ty.unsupported` — Check 7 was out of scope then, so the honest move
+      -- was to skip rather than silently ignore the tag. Now that Check 7 is
+      -- implemented, un-skipping is safe.) A hypothetical nullary `Tagged`
+      -- user ADT (none exists today) would stay a normal `Ty.con` here, same
+      -- as bare `Cap`.
+      else if name == "Tagged" && !args.isEmpty then .ok (Ty.con "Tagged" args)
       else .ok (Ty.con name args)
   | "TyVar" =>
       let (name, _) ← decodeName (← field j "name")
@@ -831,11 +835,13 @@ private def collisionEnvelope (nestedName : String) : String :=
   | .ok j    => IO.println (repr (decodeOptAnnot j))
   -- expect: Except.ok (some (Ty.con "Cap" []))
 
--- A3 fix: an APPLIED `Tagged(Int, Realtime)` param annotation decodes to a
--- type containing `Ty.unsupported`, driving `Ty.hasUnsupported = true` — the
--- realtime-tag construct that feeds march's Check 7 (realtime exclusion) is
--- out of A3's fragment, so the whole file must skip (reject/t41), not be
--- wrongly accepted for ignoring the tag.
+-- A3 slice (b): an APPLIED `Tagged(Int, Realtime)` param annotation now
+-- decodes to `Ty.con "Tagged" [Ty.con "Int" [], Ty.con "Realtime" []]` —
+-- preserving both arguments (neither `Int` nor `Realtime` is itself
+-- unsupported) — so `Ty.hasUnsupported = false` and the file is NOT skipped
+-- on this construct alone. `CapCheck`'s Check 7 (realtime exclusion) is what
+-- now polices `Tagged(_, Realtime)` combined with an excluded `Cap`
+-- (reject/t41), not the out-of-fragment skip gate (slice (a)'s behaviour).
 #eval show IO Unit from do
   let j := Json.parse r#"{"ty":{"kind":"TyCon","name":{"txt":"Tagged","span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}},"args":[{"kind":"TyCon","name":{"txt":"Int","span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}},"args":[]},{"kind":"TyCon","name":{"txt":"Realtime","span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}},"args":[]}]}}"#
   match j with
@@ -844,7 +850,7 @@ private def collisionEnvelope (nestedName : String) : String :=
       match decodeOptAnnot j with
       | .error e => IO.println s!"decode failed: {e}"
       | .ok none => IO.println "UNEXPECTED: none"
-      | .ok (some t) => IO.println s!"hasUnsupported={t.hasUnsupported}"
-  -- expect: hasUnsupported=true
+      | .ok (some t) => IO.println s!"decoded={repr t}, hasUnsupported={t.hasUnsupported}"
+  -- expect: decoded=Ty.con "Tagged" [Ty.con "Int" [], Ty.con "Realtime" []], hasUnsupported=false
 
 end MarchLean.Elab.Test
