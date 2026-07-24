@@ -692,6 +692,30 @@ partial def inferPattern (s : Supply) (ctx : Ctx) : Pattern → MTy → InferM (
       pure (bindss.foldl (· ++ ·) [])
   | .unsupported, _ => throw "infer: unsupported pattern (should have been skip-gated)"
 
+/-- Demote every unbound metavariable reachable in `t` to level 0, march's
+`demote_to_monomorphic` (`typecheck.ml:4684-4694`). Used for the result of a
+`cap_narrow(...)` application: because an application is expansive, its result
+must never let-generalize. `generalize` only quantifies unbound vars whose
+level is strictly greater than the level it generalizes at, so pinning them to
+level 0 (the outermost, never-generalized level) keeps `let x = cap_narrow(e)`
+monomorphic — its single use is the only thing that pins the cap var, exactly
+like march. Mirrors `zonk`'s structural walk, `repr`-ing at every node so
+nested mvars (e.g. the `X` in `Cap(X)`) are reached, not just the top one. -/
+partial def demoteToLevel0 (s : Supply) (t : MTy) : InferM Unit := do
+  match ← repr s t with
+  | .mvar id => do
+      match ← getMVar s id with
+      | .unbound id' level classes =>
+          if level > 0 then setMVar s id' (.unbound id' 0 classes)
+      | .link t' => demoteToLevel0 s t'   -- unreachable after `repr`, but total
+  | .con _ args => args.forM (demoteToLevel0 s)
+  | .arrow a b => do demoteToLevel0 s a; demoteToLevel0 s b
+  | .tuple ts => ts.forM (demoteToLevel0 s)
+  | .record fs => fs.forM (fun (_, t) => demoteToLevel0 s t)
+  | .lin _ t => demoteToLevel0 s t
+  | .natOp _ a b => do demoteToLevel0 s a; demoteToLevel0 s b
+  | .nat _ => pure ()
+
 /-- Infer the type of a `Term`, threading the arena `s` and context `ctx`.
 One explicit arm per constructor (no wildcard); `.unsupported` `throw`s
 defensively (Task 6's gate removes such nodes before inference runs). Every
@@ -717,6 +741,17 @@ partial def infer (s : Supply) (ctx : Ctx) : Term → InferM MTy
       let argTys ← args.mapM (infer s ctx)
       let rho ← freshMVar s ctx.level
       unify s fnTy (argTys.foldr MTy.arrow rho)
+      -- march's value restriction for `cap_narrow` (typecheck.ml:4684-4694,
+      -- `demote_to_monomorphic`): a `cap_narrow(...)` application is
+      -- expansive, so its result must never let-generalize. Demoting every
+      -- metavariable reachable in `rho` to level 0 means the enclosing
+      -- `let`'s `generalize` (which only quantifies vars whose level is
+      -- strictly greater than the level it generalizes at) can never pick
+      -- them up — the enclosing binder's one use is the only thing that
+      -- ever pins the cap var, exactly like march. See `demoteToLevel0`.
+      match fn with
+      | .var "cap_narrow" _ _ => demoteToLevel0 s rho
+      | _ => pure ()
       pure rho
   | .lam params body _ => do
       let paramMTys ← params.mapM (fun _ => freshMVar s ctx.level)
