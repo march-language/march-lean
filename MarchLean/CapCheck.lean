@@ -45,10 +45,25 @@ started descending into `Tagged`'s payload and manufacturing false Check
 1/Check 8 rejects on any `Cap(_)` nested there (e.g.
 `Tagged(Cap(IO.Network), Realtime)`) even when march accepts, because march
 never looks inside `Tagged` at all. This arm must stay ahead of the generic
-`.con` arm below. -/
+`.con` arm below.
+
+**The `Cap` arm requires its argument to be a NULLARY constructor**, mirroring
+march exactly: `cap_paths_in_surface_ty` matches
+`Ast.TyCon (con, [arg]) when con.txt = "Cap"` and then, inside that arm,
+`| Ast.TyCon (name, []) -> [name.txt] | _ -> []` (`typecheck.ml:1617-1620`) —
+a `Cap(_)` whose argument carries type arguments (e.g. `Cap(Foo(Int))`) is
+NOT a capability path at all and march's whole `Cap` arm returns `[]` for it,
+without falling through to generic recursion into the argument's own
+sub-terms. The explicit `| .con "Cap" _ => []` arm below is required to match
+that: without it, a non-nullary `Cap(_)` argument would fall through to the
+generic `.con _ args => args.flatMap capsInTy` arm and this function would
+wrongly recurse into the argument's payload (and could still surface a
+`Cap(_)` nested further inside, e.g. `Cap(Foo(Cap(IO)))`, that march itself
+never looks for). -/
 partial def capsInTy : Ty → List String
   | .con "Tagged" _ => []
-  | .con "Cap" [.con x _] => [x]
+  | .con "Cap" [.con x []] => [x]
+  | .con "Cap" _ => []
   | .con _ args => args.flatMap capsInTy
   | .arrow a b  => capsInTy a ++ capsInTy b
   | .tuple ts   => ts.flatMap capsInTy
@@ -268,11 +283,20 @@ def checkOneModule (modName : String) (decls : List Decl)
   -- `dfn` — it is never seen by this scan and escapes Check 7 entirely;
   -- march instead concatenates params across all clauses
   -- (`typecheck.ml:7172-7178`, `:6853-6857`) before checking.
+  --
+  -- Both predicates below require their inner constructor to be NULLARY,
+  -- matching march's own patterns exactly:
+  -- `Ast.TyCon ({txt="Tagged";_}, [_; Ast.TyCon ({txt="Realtime";_}, [])])`
+  -- and `Ast.TyCon ({txt="Cap";_}, [Ast.TyCon ({txt=("Alloc"|"IO"|"Panic");_},
+  -- [])])` (`typecheck.ml:7163`, `:7167`). A `Tagged(_, Realtime(X))` or
+  -- `Cap(IO(X))` with a non-nullary tag/cap name is NOT a match for march —
+  -- matching on a wildcard arg list here would over-match and manufacture a
+  -- false Check 7 reject on a program march accepts.
   let isRealtimeTagged : Ty → Bool
-    | .con "Tagged" [_, .con "Realtime" _] => true
+    | .con "Tagged" [_, .con "Realtime" []] => true
     | _ => false
   let isExcludedCap : Ty → Bool
-    | .con "Cap" [.con r _] => r == "Alloc" || r == "IO" || r == "Panic"
+    | .con "Cap" [.con r []] => r == "Alloc" || r == "IO" || r == "Panic"
     | _ => false
   let paramTysOf : Decl → List Ty
     | .dfn _ params _ _ => params.filterMap (fun (_, _, a) => a)
@@ -282,7 +306,7 @@ def checkOneModule (modName : String) (decls : List Decl)
   | some (.dfn name params _ _) =>
       let excludedName :=
         match (params.filterMap (fun (_, _, a) => a)).find? isExcludedCap with
-        | some (.con "Cap" [.con r _]) => r
+        | some (.con "Cap" [.con r []]) => r
         | _ => "?"
       .violation s!"Check 7: fn `{name}` in module `{modName}` takes a `Tagged(_, Realtime)` param and an excluded `Cap({excludedName})` param (Alloc|IO|Panic are excluded alongside a realtime tag)"
   | _ =>
@@ -584,5 +608,90 @@ def migrateDoesIONested : Module := {
   schemes := [], insts := [], moduleCaps := [] }
 #eval checkCaps migrateDoesIONested   -- expect: violation naming Check 8
 example : (checkCaps migrateDoesIONested).isViolation = true := by native_decide
+
+-- ---------------------------------------------------------------------
+-- Arity-fidelity re-review guards (a1-elaboration-checker-design review,
+-- task 4): `isRealtimeTagged`, `isExcludedCap` and `capsInTy`'s `Cap` arm
+-- each used to accept a wildcard where march requires a NULLARY
+-- constructor, manufacturing a live false reject. Each guard below pins one
+-- of those fixes so a future regression is caught at build time rather than
+-- silently reopening a false-reject hole.
+
+/-- Finding 1 pin: `isRealtimeTagged` must require the `Realtime` tag itself
+to be NULLARY, mirroring march's
+`Ast.TyCon ({txt="Realtime";_}, [])` (`typecheck.ml:7163`). A fn taking BOTH a
+`Tagged(_, Realtime(Int))` (non-nullary tag — e.g. a user-defined
+`type Realtime(a) = R(a)`) AND an excluded `Cap(IO)` param must NOT be a
+Check 7 violation: march's own pattern does not match a parametrised
+`Realtime`, so it does not treat this fn as realtime-tagged at all. Mirrors
+the false-reject reproducer:
+`fn step(_d : Tagged(Int, Realtime(Int)), _c : Cap(IO)) : Int do 1 end`
+under a module defining `type Realtime(a) = R(a)`. -/
+def rtTagNonNullarySafe : Module := {
+  decls := [Decl.dmod "RT" [
+    Decl.dneeds ["IO"],
+    Decl.dfn "step"
+      [("_d", Lin.unrestricted,
+        some (Ty.con "Tagged" [Ty.con "Int" [], Ty.con "Realtime" [Ty.con "Int" []]])),
+       ("_c", Lin.unrestricted, some (Ty.con "Cap" [Ty.con "IO" []]))]
+      none (Term.lit (Lit.int 1) (Ty.con "Int" []))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps rtTagNonNullarySafe
+  -- expect: ok — Realtime(Int) is not a nullary `Realtime` tag
+example : (checkCaps rtTagNonNullarySafe).isViolation = false := by native_decide
+
+/-- Finding 2 pin: `isExcludedCap` must require the excluded cap name itself
+to be NULLARY, mirroring march's
+`Ast.TyCon ({txt=("Alloc"|"IO"|"Panic");_}, [])` (`typecheck.ml:7167`). A fn
+taking a genuinely realtime-tagged param (`Tagged(_, Realtime)`, nullary tag)
+alongside `Cap(IO(Int))` — a user-defined generic `IO(a)` type, NOT the
+nullary `IO` capability root — must NOT be a Check 7 violation: march's
+pattern does not match a parametrised `IO`. Mirrors the false-reject
+reproducer (accepted by march: `type Realtime = RT` / `type IO(a) = IOBox(a)`
+/ `fn step(_d : Tagged(Int, Realtime), _c : Cap(IO(Int))) : Int do 1 end`). -/
+def excludedCapNonNullarySafe : Module := {
+  decls := [Decl.dmod "RT" [
+    Decl.dneeds ["IO"],
+    Decl.dfn "step"
+      [("_d", Lin.unrestricted, some (Ty.con "Tagged" [Ty.con "Int" [], Ty.con "Realtime" []])),
+       ("_c", Lin.unrestricted, some (Ty.con "Cap" [Ty.con "IO" [Ty.con "Int" []]]))]
+      none (Term.lit (Lit.int 1) (Ty.con "Int" []))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps excludedCapNonNullarySafe
+  -- expect: ok — Cap(IO(Int)) is not the nullary `Cap(IO)` excluded root
+example : (checkCaps excludedCapNonNullarySafe).isViolation = false := by native_decide
+
+/-- Finding 3 pin: `capsInTy`'s `Cap` arm must require its argument to be a
+NULLARY constructor, mirroring march's `cap_paths_in_surface_ty`
+(`typecheck.ml:1617-1620`): `Cap(Foo(Int))` — a non-nullary argument — is not
+a capability path at all and must extract to `[]`, not `["Foo"]`. Mirrors the
+false-reject reproducer: `fn f(_c : Cap(Foo(Int))) : Int do 1 end` under a
+module defining `type Foo(a) = F(a)`. -/
+example : capsInTy (Ty.con "Cap" [Ty.con "Foo" [Ty.con "Int" []]]) = [] := by native_decide
+
+/-- Finding 4 pin: `capsInTy` must NOT descend into an applied `Tagged`'s
+payload at all — mirroring march's `cap_paths_in_surface_ty`, whose `Tagged`
+arm returns `[]` unconditionally rather than falling through to generic
+recursion. Direct unit on the extractor itself: a `Cap(IO.Network)` nested
+inside `Tagged(_, Realtime)` must extract to `[]`, not `["IO.Network"]`. -/
+example :
+    capsInTy (Ty.con "Tagged" [Ty.con "Cap" [Ty.con "IO.Network" []], Ty.con "Realtime" []]) = []
+  := by native_decide
+
+/-- Finding 4 pin, `checkCaps`-level: a module declaring NO `needs` at all,
+whose only `Cap(_)` mention is nested inside a `Tagged(_, Realtime)` param,
+must be `ok` — if `capsInTy` were ever changed to descend into `Tagged`
+again, this fixture's `Cap(IO.Network)` would surface as an uncovered Check 1
+violation (there is no `needs` to cover it) and this guard would fail. -/
+def tagPayloadCapIgnored : Module := {
+  decls := [Decl.dmod "M" [
+    Decl.dfn "f"
+      [("_x", Lin.unrestricted,
+        some (Ty.con "Tagged" [Ty.con "Cap" [Ty.con "IO.Network" []], Ty.con "Realtime" []]))]
+      none (Term.lit (Lit.int 1) (Ty.con "Int" []))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps tagPayloadCapIgnored
+  -- expect: ok — the nested Cap(IO.Network) is never extracted from inside Tagged
+example : (checkCaps tagPayloadCapIgnored).isViolation = false := by native_decide
 
 end MarchLean.CapCheck

@@ -40,7 +40,10 @@ for migrate-state functions is that they must be IO-free.
 
 **Reproducer.**
 ```march
-fn counter_migrate_state(old : Int) : (Unit, Int) do (println("hi"), old) end
+mod Counter do
+  needs IO.Console
+  fn counter_migrate_state(old : Int) : (Unit, Int) do (println("hi"), old) end
+end
 ```
 - march (`--check` / `--emit-core-ast`): exit 0 (ACCEPT) — the `println`
   inside the `ETuple` is invisible to `calls_in_expr`.
@@ -50,7 +53,13 @@ fn counter_migrate_state(old : Int) : (Unit, Int) do (println("hi"), old) end
   flags Check 8.
 
 **march's source location.** `lib/typecheck/typecheck.ml`, `calls_in_expr`,
-lines 6739–6768 (catch-all `| _ -> acc`; no `ETuple`/`ERecord`/`EList` arm).
+lines 6740–6769 (catch-all `| _ -> acc`; no `ETuple`/`ERecord`/`EList` arm).
+This function is called from Check 8's body scan at line 6909
+(`calls_in_expr [] clause.Ast.fc_body`). Note the file defines **two**
+functions named `calls_in_expr`: this one at line 6740, and an unrelated
+second `let rec calls_in_expr` at line 8063 (used later in the file, by the
+panic-surface/no-panic check, not by Check 8). All references above are to
+the first one, at line 6740.
 
 **Which side is wrong.** march. The checker's total walk is the correct
 behavior per march's own documented Check 8 invariant; march's traversal has
