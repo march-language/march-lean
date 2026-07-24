@@ -831,7 +831,13 @@ def builtins (s : Supply) : InferM (List (String × EnvEntry)) := do
   -- Eq-constrained equality: ∀a:Eq. a→a→Bool
   for name in ["==", "!="] do
     out := (name, .scheme (← mkPoly1 s [Class.eq] (fun a => arr a (arr a b)))) :: out
+  -- Capability-narrowing: ∀a. Cap(IO)→Cap(a)  (typecheck.ml:1972)
+  let cap := fun (t : MTy) => MTy.con "Cap" [t]
+  let capIO := cap (MTy.con "IO" [])
+  out := ("cap_narrow", .scheme (← mkPoly1 s [] (fun a => arr capIO (cap a)))) :: out
   pure <| out ++ [
+    -- The IO capability root, threaded from the entry point. (typecheck.ml:1971)
+    mono "root_cap" capIO,
     -- Monomorphic operators / prelude functions.
     mono "%"  (arr i (arr i i)),
     mono "+." (arr f (arr f f)), mono "-." (arr f (arr f f)),
@@ -1207,6 +1213,47 @@ the pending `Num` constraint discharged via a module-style flow succeeds
   | .ok _ => IO.println "op-num-ok: true"
   | .error e => IO.println s!"op-num-ok-FAIL: {e}"
 -- expected: op-num-ok: true
+
+/- Capability-narrowing builtins (A3 slice b, Task 1): a module-level
+`fn boot(root : Cap(IO)) : Cap(IO.Network) do cap_narrow(root) end` infers
+with no unbound-variable throw for `cap_narrow`/`root_cap`. Modeled as a
+`dfn` run through `inferModule'`, exactly like `op-num-ok` above. -/
+#eval show IO Unit from do
+  let s ← Supply.new
+  let capIO : Ty := Ty.con "Cap" [Ty.con "IO" []]
+  let capNet : Ty := Ty.con "Cap" [Ty.con "IO.Network" []]
+  let boot : Decl := .dfn "boot" [("root", .unrestricted, some capIO)] (some capNet)
+    (Term.app (Term.var "cap_narrow" dSpan dTy) [Term.var "root" dSpan dTy] dTy)
+  let m : Module := { decls := [boot], schemes := [], insts := [] }
+  match ← (inferModule' s m).run with
+  | .ok _ => IO.println "cap-narrow-module-ok: true"
+  | .error e => IO.println s!"cap-narrow-module-FAIL: {e}"
+-- expected: cap-narrow-module-ok: true
+
+/- Same shape as above, but checking that `cap_narrow`'s polymorphic result
+actually unifies with the `Cap(IO.Network)` return annotation (`inferModule'`
+ignores `retAnnot`, so this unify is done explicitly here — see its doc
+comment above `.dfn`'s case). `λ(root : Cap(IO)). cap_narrow(root)` infers to
+`Cap(IO) → ?a`; unifying `?a` with `Cap(IO.Network)` and zonking must yield
+exactly `Cap(IO) → Cap(IO.Network)`. -/
+#eval show IO Unit from do
+  let s ← Supply.new
+  let ctx ← freshCtx s
+  let capIO : Ty := Ty.con "Cap" [Ty.con "IO" []]
+  let boot := Term.lam [("root", .unrestricted, some capIO)]
+    (Term.app (Term.var "cap_narrow" dSpan dTy) [Term.var "root" dSpan dTy] dTy) dTy
+  match ← (do
+      let t ← infer s ctx boot
+      let bodyTy := match t with | .arrow _ r => r | other => other
+      let retMTy ← tyToMTy s [] (Ty.con "Cap" [Ty.con "IO.Network" []])
+      unify s bodyTy retMTy
+      zonk s t
+    ).run with
+  | .ok (.arrow (.con "Cap" [.con "IO" []]) (.con "Cap" [.con "IO.Network" []])) =>
+      IO.println "cap-narrow-unify-ok: true"
+  | .ok _ => IO.println "cap-narrow-unify-FAIL: wrong shape"
+  | .error e => IO.println s!"cap-narrow-unify-ERROR: {e}"
+-- expected: cap-narrow-unify-ok: true
 
 end Test
 end MarchLean.Infer
