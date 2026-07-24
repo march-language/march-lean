@@ -57,6 +57,64 @@ def capsInReturnSignature : Decl → List String
 def declaredNeeds (decls : List Decl) : List String :=
   decls.flatMap (fun d => match d with | .dneeds ps => ps | _ => [])
 
+/-- IO-effectful builtin names — the subset of march's builtin→cap table
+(`typecheck.ml:1498-1590`) whose cap begins `IO`. Copied verbatim from the
+live table (Task 3 Step 1; extracted to `.superpowers/sdd/io-builtins.txt`),
+NOT pinned by count. Any call to one of these inside a `*_migrate_state` body
+is an IO effect (Check 8). -/
+def ioBuiltins : List String :=
+  [ "csv_next_row", "csv_open", "dir_exists", "dir_list", "dir_mkdir",
+    "dir_mkdir_p", "dir_rm_rf", "dir_rmdir", "dns_resolve", "file_append",
+    "file_copy", "file_delete", "file_exists", "file_open", "file_read",
+    "file_read_chunk", "file_read_line", "file_rename", "file_stat",
+    "file_write", "get_work_pool", "http_server_listen", "http_server_spawn_n",
+    "http_server_wait", "print", "println", "process_argv", "process_cwd",
+    "process_env", "process_exit", "process_kill_proc", "process_pid",
+    "process_read_line", "process_set_env", "process_spawn_async",
+    "process_spawn_lines", "process_spawn_sync", "process_wait_proc",
+    "process_write", "random_bytes", "signal_raise_self", "signal_unwatch",
+    "signal_watch", "stdlib_random_bytes", "task_spawn", "task_spawn_link",
+    "task_spawn_steal", "task_spawn_with_cancel", "tcp_accept", "tcp_connect",
+    "tcp_listen", "tcp_recv_all", "tcp_recv_chunk", "tcp_recv_chunked_frame",
+    "tcp_recv_exact", "tcp_recv_http", "tcp_recv_http_headers", "tcp_send_all",
+    "tls_accept", "tls_client_ctx", "tls_connect", "tls_negotiated_alpn",
+    "tls_peer_cn", "tls_read", "tls_server_ctx", "tls_write", "unix_time",
+    "unix_time_ms", "uuid_v4", "uuid_v7", "vault_drop", "vault_get",
+    "vault_incr", "vault_keys", "vault_new", "vault_ns_drop", "vault_ns_get",
+    "vault_ns_set", "vault_push_capped", "vault_put_new", "vault_set",
+    "vault_set_ttl", "vault_size", "vault_update", "vault_whereis", "ws_recv",
+    "ws_select", "ws_send" ]
+
+/-- march's `is_migrate_fn_name` (`typecheck.ml:6780-6781`): the name ends in
+the literal suffix `_migrate_state`. A SUFFIX test, not a substring test —
+`"migrate_state_helper"` must NOT match. -/
+def isMigrateFnName (n : String) : Bool := n.endsWith "_migrate_state"
+
+/-- Does this term (a function body) directly call an IO builtin? A
+structural walk: an `app` whose callee is a `var` in `ioBuiltins` is a hit;
+otherwise recurse into every sub-term. This is the DIRECT-call approximation
+of march's transitive check (design §5) — it does not follow calls into user
+functions. Total over every `Term` constructor (`MarchLean/Syntax.lean`):
+`lit`/`var`/`unsupported` are the only genuine leaves; every other
+constructor recurses into all of its `Term`/`List Term`/`List (Pattern ×
+Term)` children so an IO call nested arbitrarily deep (inside a `let`,
+`match` arm, tuple, record, etc.) is still found. -/
+partial def bodyCallsIO : Term → Bool
+  | .lit _ _ => false
+  | .var _ _ _ => false
+  | .app (.var n _ _) args _ => ioBuiltins.contains n || args.any bodyCallsIO
+  | .app fn args _ => bodyCallsIO fn || args.any bodyCallsIO
+  | .lam _ body _ => bodyCallsIO body
+  | .let_ _ _ _ rhs body _ => bodyCallsIO rhs || bodyCallsIO body
+  | .letfn _ _ _ _ fnBody body _ => bodyCallsIO fnBody || bodyCallsIO body
+  | .ite cond then_ else_ _ => bodyCallsIO cond || bodyCallsIO then_ || bodyCallsIO else_
+  | .con _ args _ => args.any bodyCallsIO
+  | .tuple elems _ => elems.any bodyCallsIO
+  | .record fields _ => fields.any (fun (_, e) => bodyCallsIO e)
+  | .field record _ _ _ => bodyCallsIO record
+  | .match_ scrut arms _ => bodyCallsIO scrut || arms.any (fun (_, e) => bodyCallsIO e)
+  | .unsupported _ => false
+
 /-- Is `used` covered by any declared need? Reflexive and directional. -/
 def covered (declared : List String) (used : String) : Bool :=
   declared.any (fun need => capSubsumes need used)
@@ -132,6 +190,18 @@ def checkOneModule (modName : String) (decls : List Decl)
         | some (.con "Cap" [.con r _]) => r
         | _ => "?"
       .violation s!"Check 7: fn `{name}` in module `{modName}` takes a `Tagged(_, Realtime)` param and an excluded `Cap({excludedName})` param (Alloc|IO|Panic are excluded alongside a realtime tag)"
+  | _ =>
+  -- Check 8 — migrate-state IO-freedom (typecheck.ml:6771-6846). A fn whose
+  -- name ends in `_migrate_state` may not directly call an IO builtin in its
+  -- own body. Scoped to THIS module's own `dfn` decls only — an actor's
+  -- handler body is out of fragment (decodes to `Decl.unsupported`, not a
+  -- `dfn`), so it is never seen here regardless of what it calls.
+  match decls.find? (fun d =>
+      match d with
+      | .dfn name _ _ body => isMigrateFnName name && bodyCallsIO body
+      | _ => false) with
+  | some (.dfn name _ _ _) =>
+      .violation s!"Check 8: fn `{name}` in module `{modName}` ends in `_migrate_state` but its body performs IO"
   | _ => .ok
 
 /-- Walk the whole module tree, checking each module against its own needs. -/
@@ -316,5 +386,38 @@ def retProofCapDeferred : Module := {
   schemes := [], insts := [], moduleCaps := [] }
 #eval checkCaps retProofCapDeferred  -- expect: ok (deferred, NOT rejected)
 example : (checkCaps retProofCapDeferred).isViolation = false := by native_decide
+
+/-- Check 8: a `*_migrate_state` fn whose body calls an IO builtin → violation. -/
+def migrateDoesIO : Module := {
+  decls := [Decl.dmod "Counter" [
+    Decl.dneeds ["IO.Console"],
+    Decl.dfn "counter_migrate_state" [("old", Lin.unrestricted, some (Ty.con "Int" []))] none
+      (Term.app (Term.var "println" ⟨"f",0,0,0,0⟩ (Ty.con "Unit" []))
+                [Term.lit (Lit.str "x") (Ty.con "String" [])] (Ty.con "Unit" []))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps migrateDoesIO   -- expect: violation naming Check 8
+example : (checkCaps migrateDoesIO).isViolation = true := by native_decide
+
+/-- A `*_migrate_state` fn with an IO-free body → ok. -/
+def migratePure : Module := {
+  decls := [Decl.dmod "Counter" [
+    Decl.dneeds ["IO.Console"],
+    Decl.dfn "counter_migrate_state" [("old", Lin.unrestricted, some (Ty.con "Int" []))] none
+      (Term.var "old" ⟨"f",0,0,0,0⟩ (Ty.con "Int" []))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps migratePure   -- expect: ok
+example : (checkCaps migratePure).isViolation = false := by native_decide
+
+/-- A NON-migrate fn that calls `println` → ok (scan is gated on the name
+suffix — Check 8 must not fire on ordinary functions). -/
+def plainDoesIO : Module := {
+  decls := [Decl.dmod "Counter" [
+    Decl.dneeds ["IO.Console"],
+    Decl.dfn "helper" [("old", Lin.unrestricted, some (Ty.con "Int" []))] none
+      (Term.app (Term.var "println" ⟨"f",0,0,0,0⟩ (Ty.con "Unit" []))
+                [Term.lit (Lit.str "x") (Ty.con "String" [])] (Ty.con "Unit" []))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps plainDoesIO   -- expect: ok
+example : (checkCaps plainDoesIO).isViolation = false := by native_decide
 
 end MarchLean.CapCheck
