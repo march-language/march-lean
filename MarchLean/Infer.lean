@@ -1290,5 +1290,39 @@ exactly `Cap(IO) → Cap(IO.Network)`. -/
   | .error e => IO.println s!"cap-narrow-unify-ERROR: {e}"
 -- expected: cap-narrow-unify-ok: true
 
+/- VALUE RESTRICTION — the discriminating test for `demoteToLevel0`.
+
+`let net = cap_narrow(root) in (net, net)` must make `net` MONOMORPHIC: both
+uses share one metavariable, so unifying the first component with
+`Cap(IO.Network)` and the second with `Cap(IO.Console)` must FAIL.
+
+Without the demotion `net` would let-generalize to `∀a. Cap(a)`, each use
+would instantiate its own fresh var, and BOTH unifications would wrongly
+succeed. A single-use body cannot tell the two apart (one use instantiates
+once either way), which is why this test binds two uses. Verified to have
+teeth: stubbing out the `demoteToLevel0` call makes this print FALSE.
+march rejects the same program for the same reason (typecheck.ml:4684). -/
+#eval show IO Unit from do
+  let s ← Supply.new
+  let ctx ← freshCtx s
+  let capIO : Ty := Ty.con "Cap" [Ty.con "IO" []]
+  let netUse := Term.var "net" dSpan dTy
+  let boot := Term.lam [("root", .unrestricted, some capIO)]
+    (Term.let_ "net" .unrestricted none
+      (Term.app (Term.var "cap_narrow" dSpan dTy) [Term.var "root" dSpan dTy] dTy)
+      (Term.tuple [netUse, netUse] dTy) dTy) dTy
+  match ← (do
+      let t ← infer s ctx boot
+      let tupTy := match t with | .arrow _ r => r | other => other
+      let (a, b) := match tupTy with
+        | .tuple [x, y] => (x, y)
+        | other => (other, other)
+      unify s a (← tyToMTy s [] (Ty.con "Cap" [Ty.con "IO.Network" []]))
+      unify s b (← tyToMTy s [] (Ty.con "Cap" [Ty.con "IO.Console" []]))
+    ).run with
+  | .error _ => IO.println "value-restriction-ok: true"
+  | .ok _    => IO.println "value-restriction-ok: FALSE (net wrongly polymorphic)"
+-- expected: value-restriction-ok: true
+
 end Test
 end MarchLean.Infer
