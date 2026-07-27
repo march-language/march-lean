@@ -517,7 +517,81 @@ def checkOneModule (modName : String) (decls : List Decl)
   | some (.dextern _ fnNames) =>
       let name := (fnNames.filter isMigrateFnName).headD "?"
       .violation s!"Check 8: extern fn `{name}` in module `{modName}` ends in `_migrate_state` but every extern block implies `Cap(IO.Foreign)`"
-  | _ => .ok
+  | _ =>
+  -- A3 slice (c), Task 2 — the five behavioral capability checks. A module
+  -- declares zero or more of these via a sibling `Decl.dopts [...]`; each
+  -- scans only THIS module's own `dfn`/`dlet` bodies/decls (never a nested
+  -- `dmod`'s — `checkDecls` recurses into those separately, each against its
+  -- own `dopts`, so a parent's declared caps never govern a child's
+  -- functions).
+  --
+  -- **`Decl.dlet` bodies are scanned here too, alongside `Decl.dfn`.** march's
+  -- own `check_pure_module`/`check_deterministic_module`/`check_no_panic_module`
+  -- (`typecheck.ml`) all iterate `Ast.DFn` ONLY — a plain `Ast.DLet` is never
+  -- scanned by any of the three. But `Elab.decodeDecl`'s `DFn` arm (Task 1
+  -- infra, unchanged here — this file may only touch `CapCheck.lean`) collapses
+  -- a ZERO-PARAM `fn` clause to `Decl.dlet name body` (`"0-param clause: a
+  -- plain value binding"`), discarding the fact that it originated from an
+  -- `Ast.DFn` in march's real AST rather than an `Ast.DLet`. march's own
+  -- `--emit-core-ast` still tags a 0-param fn `"kind":"DFn"` — verified
+  -- directly: `fn fail() : Int do panic("boom") end` emits `DFn`, not `DLet`
+  -- — so a 0-param `cap no_panic`/`pure`/`deterministic` fn (e.g.
+  -- `reject/t42`'s `fail()`, `t46`'s `gen()`, `t47`'s `ts()`) is a march-real
+  -- `DFn` that this checker would otherwise silently drop from the scan
+  -- entirely (falling through to a downstream skip on the unbound builtin
+  -- name, never surfacing the capability violation at all). Scanning `dlet`
+  -- bodies here recovers exactly those 0-param fns. The cost, since this
+  -- checker cannot recover the lost DFn/DLet distinction from `Decl.dlet`
+  -- alone: a genuine top-level `let x = ...` binding (a real `Ast.DLet`,
+  -- which march's three checks never scan) sitting directly in a
+  -- `pure`/`deterministic`/`no_panic` module and calling a banned name would
+  -- be a FALSE REJECT here that march itself would accept. This is a
+  -- one-sided fidelity gap in the conservative direction (reject when march
+  -- accepts) rather than the unsound direction (accept when march rejects),
+  -- and is not exercised by any fixture in this corpus (every `dlet` in the
+  -- accept/reject fixtures below and in `specs/lang/types` is a folded
+  -- 0-param `fn`, never a bare module-level `let`). A future fix belongs in
+  -- `Elab.lean`'s decoder (e.g. a dedicated `Decl.dzerofn` constructor
+  -- preserving the distinction), not here.
+  let opts := decls.flatMap (fun d => match d with | .dopts o => o | _ => [])
+  let dfns := decls.filterMap (fun d => match d with
+    | .dfn name _ _ body => some (name, body)
+    | .dlet name body => some (name, body)
+    | _ => none)
+  -- `pure` (typecheck.ml:8232): bans EVERY name in `builtinCaps` (the whole
+  -- builtin→cap table, IO/Alloc/Panic alike) UNION the four extra names that
+  -- are side-effecting but not in that table: `spawn`, `send`, `exit`,
+  -- `read_byte`.
+  let pureBanned := builtinCaps.map (·.1) ++ ["spawn", "send", "exit", "read_byte"]
+  match if opts.contains "pure" then dfns.find? (fun (_, body) => bodyCalls pureBanned body) else none with
+  | some (name, _) =>
+      .violation s!"cap pure: fn `{name}` in module `{modName}` performs a side effect"
+  | none =>
+  -- `deterministic` (`:8297`, `is_nondeterministic_cap` `:8213`): bans ONLY
+  -- the builtins whose cap is `IO.Clock` or `IO.Random` (6 names) — NOT the
+  -- whole `builtinCaps` table, which would false-reject ordinary IO.
+  let detBanned := (builtinCaps.filter (fun (_, c) => c == "IO.Clock" || c == "IO.Random")).map (·.1)
+  match if opts.contains "deterministic" then dfns.find? (fun (_, body) => bodyCalls detBanned body) else none with
+  | some (name, _) =>
+      .violation s!"cap deterministic: fn `{name}` in module `{modName}` performs a non-deterministic operation"
+  | none =>
+  -- `no_extern` (`:8255`): the module's own decls contain a `Decl.dextern`.
+  if opts.contains "no_extern" && decls.any (fun d => match d with | .dextern _ _ => true | _ => false) then
+    .violation s!"cap no_extern: module `{modName}` contains an extern block"
+  else
+  -- `no_alloc` (`refinecheck/no_alloc.ml`): a `dfn` body constructs a
+  -- tuple/record/non-nullary-con/lambda.
+  match if opts.contains "no_alloc" then dfns.find? (fun (_, body) => bodyAllocates body) else none with
+  | some (name, _) =>
+      .violation s!"cap no_alloc: fn `{name}` in module `{modName}` allocates"
+  | none =>
+  -- `no_panic`, explicit-panic half only (`:8108`) — a `dfn` body directly
+  -- calls `panic`. Exhaustiveness (the OTHER half of `no_panic`) is Task 3,
+  -- not modelled here.
+  match if opts.contains "no_panic" then dfns.find? (fun (_, body) => bodyCalls ["panic"] body) else none with
+  | some (name, _) =>
+      .violation s!"cap no_panic: fn `{name}` in module `{modName}` may panic (explicit panic)"
+  | none => .ok
 
 /-- Walk the whole module tree, checking each module against its own needs. -/
 partial def checkDecls (moduleCaps : List (String × List String)) : List Decl → CapResult
@@ -1070,5 +1144,123 @@ example : bodyCalls ["println"]
 -- bodyAllocates: a tuple allocates; a bare literal does not.
 example : bodyAllocates (Term.tuple [] (Ty.con "Unit" [])) = true := by native_decide
 example : bodyAllocates (Term.lit (Lit.int 1) (Ty.con "Int" [])) = false := by native_decide
+
+-- ---------------------------------------------------------------------
+-- A3 slice (c), Task 2: the five behavioral-cap checks — pure,
+-- deterministic, no_extern, no_alloc, and no_panic's explicit-panic half.
+-- A module declares a cap via a sibling `Decl.dopts [...]`.
+
+/-- `pure`: a `dfn` body calling `println` (a plain `builtinCaps` name, not
+one of the four extra pure-only bans) is a violation. -/
+def purePrintln : Module := {
+  decls := [Decl.dmod "P" [
+    Decl.dopts ["pure"],
+    Decl.dfn "f" []
+      none
+      (Term.app (Term.var "println" ⟨"f",0,0,0,0⟩ (Ty.con "Unit" []))
+                [Term.lit (Lit.str "x") (Ty.con "String" [])] (Ty.con "Unit" []))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps purePrintln   -- expect: violation naming `pure`
+example : (checkCaps purePrintln).isViolation = true := by native_decide
+
+/-- `pure`: an arithmetic-only body (no builtin/side-effecting call at all) →
+ok. -/
+def pureArithmetic : Module := {
+  decls := [Decl.dmod "P" [
+    Decl.dopts ["pure"],
+    Decl.dfn "f" []
+      none
+      (Term.app (Term.var "int_abs" ⟨"f",0,0,0,0⟩ (Ty.con "Int" []))
+                [Term.lit (Lit.int (-1)) (Ty.con "Int" [])] (Ty.con "Int" []))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps pureArithmetic   -- expect: ok
+example : (checkCaps pureArithmetic).isViolation = false := by native_decide
+
+/-- `deterministic`: a body calling `unix_time_ms` (`IO.Clock`) → violation. -/
+def deterministicUnixTimeMs : Module := {
+  decls := [Decl.dmod "D" [
+    Decl.dopts ["deterministic"],
+    Decl.dfn "f" []
+      none
+      (Term.app (Term.var "unix_time_ms" ⟨"f",0,0,0,0⟩ (Ty.con "Int" []))
+                [] (Ty.con "Int" []))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps deterministicUnixTimeMs   -- expect: violation naming `deterministic`
+example : (checkCaps deterministicUnixTimeMs).isViolation = true := by native_decide
+
+/-- `deterministic`: a body calling `int_abs` — an ordinary non-`IO.Clock`/
+`IO.Random` builtin — must NOT be flagged (the ban set is the 6-name
+Clock/Random subset, not the whole `builtinCaps` table). -/
+def deterministicIntAbs : Module := {
+  decls := [Decl.dmod "D" [
+    Decl.dopts ["deterministic"],
+    Decl.dfn "f" []
+      none
+      (Term.app (Term.var "int_abs" ⟨"f",0,0,0,0⟩ (Ty.con "Int" []))
+                [Term.lit (Lit.int (-1)) (Ty.con "Int" [])] (Ty.con "Int" []))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps deterministicIntAbs   -- expect: ok
+example : (checkCaps deterministicIntAbs).isViolation = false := by native_decide
+
+/-- `no_extern`: a module declaring `no_extern` with a `Decl.dextern` sibling
+→ violation. -/
+def noExternWithExtern : Module := {
+  decls := [Decl.dmod "E" [
+    Decl.dopts ["no_extern"],
+    Decl.dextern none ["foreign_fn"]]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps noExternWithExtern   -- expect: violation naming `no_extern`
+example : (checkCaps noExternWithExtern).isViolation = true := by native_decide
+
+/-- `no_extern`: a module declaring `no_extern` with NO extern block at all →
+ok. -/
+def noExternWithoutExtern : Module := {
+  decls := [Decl.dmod "E" [
+    Decl.dopts ["no_extern"],
+    Decl.dfn "f" [] none (Term.lit (Lit.int 1) (Ty.con "Int" []))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps noExternWithoutExtern   -- expect: ok
+example : (checkCaps noExternWithoutExtern).isViolation = false := by native_decide
+
+/-- `no_alloc`: a `dfn` returning a `Term.tuple` → violation. -/
+def noAllocTuple : Module := {
+  decls := [Decl.dmod "A" [
+    Decl.dopts ["no_alloc"],
+    Decl.dfn "f" [] none (Term.tuple [] (Ty.con "Unit" []))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps noAllocTuple   -- expect: violation naming `no_alloc`
+example : (checkCaps noAllocTuple).isViolation = true := by native_decide
+
+/-- `no_alloc`: a `dfn` returning a bare `int` literal → ok. -/
+def noAllocArithmetic : Module := {
+  decls := [Decl.dmod "A" [
+    Decl.dopts ["no_alloc"],
+    Decl.dfn "f" [] none (Term.lit (Lit.int 1) (Ty.con "Int" []))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps noAllocArithmetic   -- expect: ok
+example : (checkCaps noAllocArithmetic).isViolation = false := by native_decide
+
+/-- `no_panic`, panic half: a `dfn` body calling `panic` → violation. -/
+def noPanicExplicitPanic : Module := {
+  decls := [Decl.dmod "NP" [
+    Decl.dopts ["no_panic"],
+    Decl.dfn "f" []
+      none
+      (Term.app (Term.var "panic" ⟨"f",0,0,0,0⟩ (Ty.con "Unit" []))
+                [Term.lit (Lit.str "boom") (Ty.con "String" [])] (Ty.con "Unit" []))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps noPanicExplicitPanic   -- expect: violation naming `no_panic`
+example : (checkCaps noPanicExplicitPanic).isViolation = true := by native_decide
+
+/-- `no_panic`, panic half: a `dfn` body with no `panic` call at all → ok
+(exhaustiveness — the OTHER half of `no_panic` — is Task 3, not modelled
+here). -/
+def noPanicSafe : Module := {
+  decls := [Decl.dmod "NP" [
+    Decl.dopts ["no_panic"],
+    Decl.dfn "f" [] none (Term.lit (Lit.int 1) (Ty.con "Int" []))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps noPanicSafe   -- expect: ok
+example : (checkCaps noPanicSafe).isViolation = false := by native_decide
 
 end MarchLean.CapCheck
