@@ -126,33 +126,107 @@ exemption (Finding I1) — see that function's docstring. -/
 def declaredProofCapNames (decls : List Decl) : List String :=
   decls.flatMap (fun d => match d with | .dproofcap n => [n] | _ => [])
 
-/-- IO-effectful builtin names — the subset of march's builtin→cap table
-(`typecheck.ml:1498-1590`) whose cap begins `IO`. Copied verbatim from the
-live table (Task 3 Step 1; extracted to `.superpowers/sdd/io-builtins.txt`),
-NOT pinned by count. Any call to one of these inside a `*_migrate_state` body
-is an IO effect (Check 8). -/
-def ioBuiltins : List String :=
-  [ "csv_next_row", "csv_open", "dir_exists", "dir_list", "dir_mkdir",
-    "dir_mkdir_p", "dir_rm_rf", "dir_rmdir", "dns_resolve", "file_append",
-    "file_copy", "file_delete", "file_exists", "file_open", "file_read",
-    "file_read_chunk", "file_read_line", "file_rename", "file_stat",
-    "file_write", "get_work_pool", "http_server_listen", "http_server_spawn_n",
-    "http_server_wait", "print", "println", "process_argv", "process_cwd",
-    "process_env", "process_exit", "process_kill_proc", "process_pid",
-    "process_read_line", "process_set_env", "process_spawn_async",
-    "process_spawn_lines", "process_spawn_sync", "process_wait_proc",
-    "process_write", "random_bytes", "signal_raise_self", "signal_unwatch",
-    "signal_watch", "stdlib_random_bytes", "task_spawn", "task_spawn_link",
-    "task_spawn_steal", "task_spawn_with_cancel", "tcp_accept", "tcp_connect",
-    "tcp_listen", "tcp_recv_all", "tcp_recv_chunk", "tcp_recv_chunked_frame",
-    "tcp_recv_exact", "tcp_recv_http", "tcp_recv_http_headers", "tcp_send_all",
-    "tls_accept", "tls_client_ctx", "tls_connect", "tls_negotiated_alpn",
-    "tls_peer_cn", "tls_read", "tls_server_ctx", "tls_write", "unix_time",
-    "unix_time_ms", "uuid_v4", "uuid_v7", "vault_drop", "vault_get",
-    "vault_incr", "vault_keys", "vault_new", "vault_ns_drop", "vault_ns_get",
-    "vault_ns_set", "vault_push_capped", "vault_put_new", "vault_set",
-    "vault_set_ttl", "vault_size", "vault_update", "vault_whereis", "ws_recv",
-    "ws_select", "ws_send" ]
+/-- march's builtin→cap table (`typecheck.ml:1497-…`, `builtin_cap_table`),
+copied VERBATIM — every `(name, cap)` pair whose cap begins `IO`, `Alloc` or
+`Panic` (A3 slice (c) Task 1 Step 1's extraction command against the live
+`march` source), NOT pinned by count and NOT hand-typed. `ioBuiltins` below is
+exactly this table's name projection, kept so Check 8's existing references
+are unchanged. -/
+def builtinCaps : List (String × String) :=
+  [ ("println", "IO.Console"),
+    ("print", "IO.Console"),
+    ("file_exists", "IO.FileRead"),
+    ("file_read", "IO.FileRead"),
+    ("file_open", "IO.FileRead"),
+    ("file_read_line", "IO.FileRead"),
+    ("file_read_chunk", "IO.FileRead"),
+    ("file_stat", "IO.FileRead"),
+    ("dir_exists", "IO.FileRead"),
+    ("dir_list", "IO.FileRead"),
+    ("csv_open", "IO.FileRead"),
+    ("csv_next_row", "IO.FileRead"),
+    ("file_write", "IO.FileWrite"),
+    ("file_append", "IO.FileWrite"),
+    ("file_delete", "IO.FileWrite"),
+    ("file_rename", "IO.FileWrite"),
+    ("dir_mkdir", "IO.FileWrite"),
+    ("dir_mkdir_p", "IO.FileWrite"),
+    ("dir_rmdir", "IO.FileWrite"),
+    ("dir_rm_rf", "IO.FileWrite"),
+    ("file_copy", "IO.FileSystem"),
+    ("tcp_connect", "IO.NetConnect"),
+    ("tcp_send_all", "IO.NetConnect"),
+    ("tcp_recv_all", "IO.NetConnect"),
+    ("tcp_recv_exact", "IO.NetConnect"),
+    ("tcp_recv_http", "IO.NetConnect"),
+    ("tcp_recv_http_headers", "IO.NetConnect"),
+    ("tcp_recv_chunk", "IO.NetConnect"),
+    ("tcp_recv_chunked_frame", "IO.NetConnect"),
+    ("ws_recv", "IO.WebSocket"),
+    ("ws_send", "IO.WebSocket"),
+    ("ws_select", "IO.WebSocket"),
+    ("dns_resolve", "IO.Network"),
+    ("tcp_listen", "IO.NetListen"),
+    ("tcp_accept", "IO.NetListen"),
+    ("http_server_listen", "IO.NetListen"),
+    ("http_server_spawn_n", "IO.NetListen"),
+    ("http_server_wait", "IO.NetListen"),
+    ("process_env", "IO.Process"),
+    ("process_set_env", "IO.Process"),
+    ("process_cwd", "IO.Process"),
+    ("process_argv", "IO.Process"),
+    ("process_pid", "IO.Process"),
+    ("process_exit", "IO.Process"),
+    ("process_spawn_sync", "IO.Process"),
+    ("process_spawn_lines", "IO.Process"),
+    ("process_spawn_async", "IO.Process"),
+    ("process_read_line", "IO.Process"),
+    ("process_write", "IO.Process"),
+    ("process_kill_proc", "IO.Process"),
+    ("process_wait_proc", "IO.Process"),
+    ("unix_time", "IO.Clock"),
+    ("unix_time_ms", "IO.Clock"),
+    ("uuid_v7", "IO.Clock"),
+    ("random_bytes", "IO.Random"),
+    ("stdlib_random_bytes", "IO.Random"),
+    ("uuid_v4", "IO.Random"),
+    ("signal_watch", "IO.Signal"),
+    ("signal_unwatch", "IO.Signal"),
+    ("signal_raise_self", "IO.Signal"),
+    ("task_spawn", "IO.Spawn"),
+    ("task_spawn_link", "IO.Spawn"),
+    ("task_spawn_steal", "IO.Spawn"),
+    ("task_spawn_with_cancel", "IO.Spawn"),
+    ("get_work_pool", "IO.Spawn"),
+    ("vault_new", "IO.Mut"),
+    ("vault_set", "IO.Mut"),
+    ("vault_set_ttl", "IO.Mut"),
+    ("vault_get", "IO.Mut"),
+    ("vault_drop", "IO.Mut"),
+    ("vault_update", "IO.Mut"),
+    ("vault_put_new", "IO.Mut"),
+    ("vault_incr", "IO.Mut"),
+    ("vault_push_capped", "IO.Mut"),
+    ("vault_ns_set", "IO.Mut"),
+    ("vault_ns_get", "IO.Mut"),
+    ("vault_ns_drop", "IO.Mut"),
+    ("vault_keys", "IO.Mut"),
+    ("vault_whereis", "IO.Mut"),
+    ("vault_size", "IO.Mut"),
+    ("tls_client_ctx", "IO.NetConnect.TLS"),
+    ("tls_server_ctx", "IO.NetConnect.TLS"),
+    ("tls_connect", "IO.NetConnect.TLS"),
+    ("tls_accept", "IO.NetConnect.TLS"),
+    ("tls_read", "IO.NetConnect.TLS"),
+    ("tls_write", "IO.NetConnect.TLS"),
+    ("tls_negotiated_alpn", "IO.NetConnect.TLS"),
+    ("tls_peer_cn", "IO.NetConnect.TLS") ]
+
+/-- IO-effectful builtin names — the name projection of `builtinCaps`. Kept as
+its own definition (rather than inlining `builtinCaps.map (·.1)` at every call
+site) so Check 8's existing references (`bodyCallsIO`, `checkOneModule`) are
+unchanged by this refactor. -/
+def ioBuiltins : List String := builtinCaps.map (·.1)
 
 /-- march's `is_migrate_fn_name` (`typecheck.ml:6780-6781`): the name ends in
 the literal suffix `_migrate_state`. A SUFFIX test, not a substring test —
@@ -162,15 +236,20 @@ def isMigrateFnName (n : String) : Bool := n.endsWith "_migrate_state"
 example : isMigrateFnName "migrate_state_helper" = false := by native_decide
 example : isMigrateFnName "counter_migrate_state" = true := by native_decide
 
-/-- Does this term (a function body) directly call an IO builtin? A
-structural walk: an `app` whose callee is a `var` in `ioBuiltins` is a hit;
-otherwise recurse into every sub-term. This is a DIRECT-call scan only — it
-does not follow calls into user functions. Total over every `Term`
+/-- Does this term (a function body) directly apply a `var` whose name is in
+`banned`? A structural walk: an `app` whose callee is a `var` in `banned` is a
+hit; otherwise recurse into every sub-term. This is a DIRECT-call scan only —
+it does not follow calls into user functions. Total over every `Term`
 constructor (`MarchLean/Syntax.lean`):
 `lit`/`var`/`unsupported` are the only genuine leaves; every other
 constructor recurses into all of its `Term`/`List Term`/`List (Pattern ×
-Term)` children so an IO call nested arbitrarily deep (inside a `let`,
+Term)` children so a banned call nested arbitrarily deep (inside a `let`,
 `match` arm, tuple, record, etc.) is still found.
+
+Generalised (A3 slice (c) Task 1) from the original `bodyCallsIO`, which
+hardcoded `ioBuiltins` as the banned set — `bodyCallsIO` below is now a thin
+specialisation (`bodyCalls ioBuiltins`) kept so Check 8's existing call site
+is unchanged.
 
 **This walk is DELIBERATELY MORE TOTAL than march's own `calls_in_expr`
 (`typecheck.ml:6737-6768`), and that is not a bug to fix here.** march's
@@ -179,7 +258,7 @@ so a call nested inside a tuple/record/list literal is invisible to it. E.g.
 `(println("hi"), old)` as a migrate body: march's Check 8 ACCEPTS (the
 `println` inside the `ETuple` is never visited by `calls_in_expr`), while this
 checker's exhaustive walk correctly finds it and REJECTS. Do not narrow
-`bodyCallsIO` to match march's gap — that gap looks like a genuine march bug,
+`bodyCalls` to match march's gap — that gap looks like a genuine march bug,
 and surfacing exactly this kind of divergence is what this oracle is for. A
 mismatch of this shape should be triaged as a **march finding**, not a
 checker regression.
@@ -229,20 +308,20 @@ checker regression.
    alongside the other two gaps above. march, by contrast, concatenates
    parameters across all clauses of a multi-clause fn
    (`typecheck.ml:7172-7178`, `:6853-6857`) and checks the merged signature. -/
-partial def bodyCallsIO : Term → Bool
+partial def bodyCalls (banned : List String) : Term → Bool
   | .lit _ _ => false
   | .var _ _ _ => false
-  | .app (.var n _ _) args _ => ioBuiltins.contains n || args.any bodyCallsIO
-  | .app fn args _ => bodyCallsIO fn || args.any bodyCallsIO
-  | .lam _ body _ => bodyCallsIO body
-  | .let_ _ _ _ rhs body _ => bodyCallsIO rhs || bodyCallsIO body
-  | .letfn _ _ _ _ fnBody body _ => bodyCallsIO fnBody || bodyCallsIO body
-  | .ite cond then_ else_ _ => bodyCallsIO cond || bodyCallsIO then_ || bodyCallsIO else_
-  | .con _ args _ => args.any bodyCallsIO
-  | .tuple elems _ => elems.any bodyCallsIO
-  | .record fields _ => fields.any (fun (_, e) => bodyCallsIO e)
-  | .field record _ _ _ => bodyCallsIO record
-  | .match_ scrut arms _ => bodyCallsIO scrut || arms.any (fun (_, e) => bodyCallsIO e)
+  | .app (.var n _ _) args _ => banned.contains n || args.any (bodyCalls banned)
+  | .app fn args _ => bodyCalls banned fn || args.any (bodyCalls banned)
+  | .lam _ body _ => bodyCalls banned body
+  | .let_ _ _ _ rhs body _ => bodyCalls banned rhs || bodyCalls banned body
+  | .letfn _ _ _ _ fnBody body _ => bodyCalls banned fnBody || bodyCalls banned body
+  | .ite c t e _ => bodyCalls banned c || bodyCalls banned t || bodyCalls banned e
+  | .con _ args _ => args.any (bodyCalls banned)
+  | .tuple elems _ => elems.any (bodyCalls banned)
+  | .record fields _ => fields.any (fun (_, e) => bodyCalls banned e)
+  | .field record _ _ _ => bodyCalls banned record
+  | .match_ scrut arms _ => bodyCalls banned scrut || arms.any (fun (_, e) => bodyCalls banned e)
   -- LOAD-BEARING: this arm is safe returning `false` (rather than `true`,
   -- which would be the conservative choice) ONLY because
   -- `MarchLeanCheck.lean`'s `run` invokes `CapCheck.checkCaps` BEFORE the
@@ -254,6 +333,37 @@ partial def bodyCallsIO : Term → Bool
   -- arm itself reports "no IO here". If the driver is ever reordered so the
   -- skip gate runs before (or independently of) `checkCaps`, this arm
   -- becomes a false accept and must be revisited.
+  | .unsupported _ => false
+
+/-- `bodyCallsIO`, kept as a thin specialisation of `bodyCalls` over
+`ioBuiltins` so Check 8's existing call site (`checkOneModule`) is unchanged
+by this refactor. -/
+def bodyCallsIO (t : Term) : Bool := bodyCalls ioBuiltins t
+
+/-- Does this term (a function body) allocate — construct a tuple, record,
+non-nullary `con`, or `lam`? A sibling total walk to `bodyCalls`, for the
+upcoming `no_alloc` behavioral cap (A3 slice (c)): `true` at `.tuple _ _`,
+`.record _ _`, `.con _ (_ :: _) _` (a NON-EMPTY arg list — a nullary
+constructor, e.g. `None`, allocates nothing, mirroring march's `no_alloc.ml`),
+and `.lam _ _ _` (a closure allocation); recurses into every other
+constructor's children looking for a nested allocation; `.lit`/`.var`/
+`.unsupported` are the only genuine leaves. Enumerates all 13 `Term`
+constructors explicitly — no catch-all — matching `bodyCalls`'s exhaustiveness
+discipline. -/
+partial def bodyAllocates : Term → Bool
+  | .lit _ _ => false
+  | .var _ _ _ => false
+  | .app fn args _ => bodyAllocates fn || args.any bodyAllocates
+  | .lam _ _ _ => true
+  | .let_ _ _ _ rhs body _ => bodyAllocates rhs || bodyAllocates body
+  | .letfn _ _ _ _ fnBody body _ => bodyAllocates fnBody || bodyAllocates body
+  | .ite c t e _ => bodyAllocates c || bodyAllocates t || bodyAllocates e
+  | .con _ [] _ => false
+  | .con _ (_ :: _) _ => true
+  | .tuple _ _ => true
+  | .record _ _ => true
+  | .field record _ _ _ => bodyAllocates record
+  | .match_ scrut arms _ => bodyAllocates scrut || arms.any (fun (_, e) => bodyAllocates e)
   | .unsupported _ => false
 
 /-- Is `used` covered by any declared need? Reflexive and directional. -/
@@ -942,5 +1052,23 @@ def tagPayloadCapIgnored : Module := {
 #eval checkCaps tagPayloadCapIgnored
   -- expect: ok — the nested Cap(IO.Network) is never extracted from inside Tagged
 example : (checkCaps tagPayloadCapIgnored).isViolation = false := by native_decide
+
+-- ---------------------------------------------------------------------
+-- A3 slice (c), Task 1 (infrastructure): `builtinCaps` carries caps; the name
+-- projection equals the old `ioBuiltins` set. The generalised walk
+-- (`bodyCalls`) and its sibling (`bodyAllocates`) are total over every `Term`
+-- constructor. This task adds NO new check.
+
+-- builtinCaps carries caps; the name projection equals the old ioBuiltins set.
+example : builtinCaps.any (fun (n, c) => n == "println" && c == "IO.Console") := by native_decide
+example : builtinCaps.any (fun (n, c) => n == "unix_time_ms" && c == "IO.Clock") := by native_decide
+-- generalised walk: bodyCalls finds a banned direct call (through a tuple).
+example : bodyCalls ["println"]
+  (Term.tuple [Term.app (Term.var "println" ⟨"f",0,0,0,0⟩ (Ty.con "Unit" []))
+                        [Term.lit (Lit.str "x") (Ty.con "String" [])] (Ty.con "Unit" [])]
+              (Ty.con "Unit" [])) = true := by native_decide
+-- bodyAllocates: a tuple allocates; a bare literal does not.
+example : bodyAllocates (Term.tuple [] (Ty.con "Unit" [])) = true := by native_decide
+example : bodyAllocates (Term.lit (Lit.int 1) (Ty.con "Int" [])) = false := by native_decide
 
 end MarchLean.CapCheck

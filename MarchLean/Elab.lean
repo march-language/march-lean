@@ -453,7 +453,7 @@ def declBindingName : Decl → Option String
   | .dfn n _ _ _ => some n
   | .dlet n _ => some n
   | .dtype n _ _ => some n
-  | .dmod _ _ | .dneeds _ | .duse _ | .dextern _ _ | .dproofcap _ | .unsupported => none
+  | .dmod _ _ | .dneeds _ | .duse _ | .dextern _ _ | .dproofcap _ | .dopts _ | .unsupported => none
 
 /-- Every binding name reachable once Task 4 flattens the tree (`dmod` is
 transparent to inference — its decls splice into the enclosing scope,
@@ -475,10 +475,11 @@ def hasNameCollision (decls : List Decl) : Bool :=
 /-- Decode a top-level `decl` node. `DFn`/`DLet`/`DType` are the A1 term/type
 fragment; `DMod`/`DNeeds`/`DUse`/`DExtern`/`DProofCap` are the A3
 module-structure and capability-declaration fragment (Task 2; `DProofCap`
-added for Finding I1 — see `Decl.dproofcap`). Every other decl kind (`DActor`,
-`DProtocol`, `DSig`, `DInterface`, `DImpl`, `DAlias`, `DOpts`,
-`DAlwaysLinearType`, `DTransitions`, `DApp`, `DDeriving`, `DSatisfy`, `DTest`,
-`DDescribe`, `DSetup`, `DSetupAll`) decodes to `Decl.unsupported`. -/
+added for Finding I1 — see `Decl.dproofcap`); `DOpts` is the A3 slice (c)
+behavioral-capability-cap declaration fragment (Task 1 — see `Decl.dopts`).
+Every other decl kind (`DActor`, `DProtocol`, `DSig`, `DInterface`, `DImpl`,
+`DAlias`, `DAlwaysLinearType`, `DTransitions`, `DApp`, `DDeriving`, `DSatisfy`,
+`DTest`, `DDescribe`, `DSetup`, `DSetupAll`) decodes to `Decl.unsupported`. -/
 partial def decodeDecl (j : Json) : Except String Decl := do
   match ← kindOf j with
   | "DFn" => do
@@ -638,6 +639,13 @@ partial def decodeDecl (j : Json) : Except String Decl := do
       -- In-fragment (Finding I1): see `Decl.dproofcap`'s docstring.
       let (name, _) ← decodeName (← field j "name")
       .ok (Decl.dproofcap name)
+  | "DOpts" => do
+      -- `opts no_panic, ...` — a bare list of cap names (verified shape:
+      -- `{"kind":"DOpts","opts":["no_panic"],"span":{…}}`; `opts` is a plain
+      -- `List String`, not a list of name objects like `DNeeds.paths`).
+      let optsJ ← (← field j "opts").getArr?.mapError (fun _ => "DOpts.opts")
+      let opts ← optsJ.toList.mapM str
+      .ok (Decl.dopts opts)
   | _ => .ok Decl.unsupported
 
 partial def decodeConstraint (j : Json) : Except String Constraint := do
@@ -806,6 +814,17 @@ open Lean MarchLean.Elab MarchLean.Syntax
   | .error e => IO.println s!"parse failed: {e}"
   | .ok j    => IO.println (repr (decodeDecl j))
   -- expect: Except.ok (Decl.dproofcap "Migrated")
+
+-- A3 slice (c) Task 1: DOpts decodes to Decl.dopts, carrying the bare cap
+-- names (verified real emitter shape for `opts no_panic`:
+-- `{"kind":"DOpts","opts":["no_panic"],"span":{...}}` — `opts` is a plain
+-- `List String`, not a list of name objects).
+#eval show IO Unit from do
+  let j := Json.parse r#"{"kind":"DOpts","opts":["no_panic"],"span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}}"#
+  match j with
+  | .error e => IO.println s!"parse failed: {e}"
+  | .ok j    => IO.println (repr (decodeDecl j))
+  -- expect: Except.ok (Decl.dopts ["no_panic"])
 
 -- DMod: nested module, name + recursive decls (here containing a DNeeds).
 #eval show IO Unit from do

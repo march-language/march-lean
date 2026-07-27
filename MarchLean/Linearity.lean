@@ -203,7 +203,7 @@ def checkDecl : Decl → CheckResult
   -- `dmod` is inert-but-unreachable here: `checkLinearity` flattens nested
   -- `dmod`s via `flattenDecls` before this is ever called, so its children
   -- already appear as top-level decls.
-  | .dmod .. | .dneeds _ | .duse _ | .dextern .. | .dproofcap _ => .ok
+  | .dmod .. | .dneeds _ | .duse _ | .dextern .. | .dproofcap _ | .dopts _ => .ok
   | .unsupported => .ok
 
 /-- Flattens nested `dmod` bodies into the enclosing scope first — linearity

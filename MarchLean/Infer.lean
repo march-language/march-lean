@@ -921,7 +921,7 @@ def inferModule' (s : Supply) (m : Module) : InferM (List (Span × MTy)) := do
     -- (splicing them into this same loop) is what will make them visible
     -- to inference; until then they're simply not type-checked, same as
     -- any other not-yet-spliced-in scope.
-    | .dmod .. | .dneeds .. | .duse .. | .dextern .. | .dproofcap .. => pure ()
+    | .dmod .. | .dneeds .. | .duse .. | .dextern .. | .dproofcap .. | .dopts .. => pure ()
     | .dlet name rhs => do
         let t ← infer s { ctx with level := ctx.level + 1 } rhs
         let sch ← generalize s ctx.level t

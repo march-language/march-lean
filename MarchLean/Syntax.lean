@@ -229,6 +229,12 @@ inductive Decl where
   (see `CapCheck.checkCaps`'s docstring on `entryName` for the precise,
   narrower-than-it-looks scope of that exemption). -/
   | dproofcap (name : String)
+  /-- `opts no_panic, ...` — a declaration's behavioral-capability-cap
+  self-declaration list (A3 slice (c)), as bare cap names (e.g. `"no_panic"`).
+  In-fragment (`hasUnsupported = false`): the real emitted JSON is
+  `{"kind":"DOpts","opts":["no_panic"],"span":{…}}` (verified), and `opts` is
+  a plain `List String` — no further decoding needed. -/
+  | dopts (opts : List String)
   | unsupported
   deriving Repr, Inhabited
 
@@ -253,6 +259,7 @@ partial def Decl.hasUnsupported : Decl → Bool
   | .duse _ => false
   | .dextern _ _ => false
   | .dproofcap _ => false
+  | .dopts _ => false
 
 /-- Splice nested `dmod` decls into a single flat list, for the passes that
 treat a module as a transparent scope (inference, linearity). Cap checking
