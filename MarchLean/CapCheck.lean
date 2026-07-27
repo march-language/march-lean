@@ -520,43 +520,31 @@ def checkOneModule (modName : String) (decls : List Decl)
   | _ =>
   -- A3 slice (c), Task 2 — the five behavioral capability checks. A module
   -- declares zero or more of these via a sibling `Decl.dopts [...]`; each
-  -- scans only THIS module's own `dfn`/`dlet` bodies/decls (never a nested
-  -- `dmod`'s — `checkDecls` recurses into those separately, each against its
-  -- own `dopts`, so a parent's declared caps never govern a child's
-  -- functions).
+  -- scans only THIS module's own `dfn` bodies/decls (never a nested `dmod`'s
+  -- — `checkDecls` recurses into those separately, each against its own
+  -- `dopts`, so a parent's declared caps never govern a child's functions).
   --
-  -- **`Decl.dlet` bodies are scanned here too, alongside `Decl.dfn`.** march's
-  -- own `check_pure_module`/`check_deterministic_module`/`check_no_panic_module`
-  -- (`typecheck.ml`) all iterate `Ast.DFn` ONLY — a plain `Ast.DLet` is never
-  -- scanned by any of the three. But `Elab.decodeDecl`'s `DFn` arm (Task 1
-  -- infra, unchanged here — this file may only touch `CapCheck.lean`) collapses
-  -- a ZERO-PARAM `fn` clause to `Decl.dlet name body` (`"0-param clause: a
-  -- plain value binding"`), discarding the fact that it originated from an
-  -- `Ast.DFn` in march's real AST rather than an `Ast.DLet`. march's own
-  -- `--emit-core-ast` still tags a 0-param fn `"kind":"DFn"` — verified
-  -- directly: `fn fail() : Int do panic("boom") end` emits `DFn`, not `DLet`
-  -- — so a 0-param `cap no_panic`/`pure`/`deterministic` fn (e.g.
-  -- `reject/t42`'s `fail()`, `t46`'s `gen()`, `t47`'s `ts()`) is a march-real
-  -- `DFn` that this checker would otherwise silently drop from the scan
-  -- entirely (falling through to a downstream skip on the unbound builtin
-  -- name, never surfacing the capability violation at all). Scanning `dlet`
-  -- bodies here recovers exactly those 0-param fns. The cost, since this
-  -- checker cannot recover the lost DFn/DLet distinction from `Decl.dlet`
-  -- alone: a genuine top-level `let x = ...` binding (a real `Ast.DLet`,
-  -- which march's three checks never scan) sitting directly in a
-  -- `pure`/`deterministic`/`no_panic` module and calling a banned name would
-  -- be a FALSE REJECT here that march itself would accept. This is a
-  -- one-sided fidelity gap in the conservative direction (reject when march
-  -- accepts) rather than the unsound direction (accept when march rejects),
-  -- and is not exercised by any fixture in this corpus (every `dlet` in the
-  -- accept/reject fixtures below and in `specs/lang/types` is a folded
-  -- 0-param `fn`, never a bare module-level `let`). A future fix belongs in
-  -- `Elab.lean`'s decoder (e.g. a dedicated `Decl.dzerofn` constructor
-  -- preserving the distinction), not here.
+  -- **`dfn` ONLY — no `Decl.dlet` scan here.** march's own
+  -- `check_pure_module`/`check_deterministic_module`/`check_no_panic_module`
+  -- (`typecheck.ml`) all iterate `Ast.DFn` ONLY; a plain `Ast.DLet` (a real
+  -- top-level `let x = ...` binding) is never scanned by any of the three, so
+  -- scanning `Decl.dlet` bodies here would false-reject a
+  -- `pure`/`deterministic`/`no_panic` module whose only "violation" is a
+  -- side-effecting top-level `let` — a file march itself accepts (confirmed:
+  -- `mod P do cap pure; let x = println("side effect") end` — march exit 0,
+  -- a `dlet`-scanning checker exit 1). An earlier version of this file
+  -- carried exactly that `Decl.dlet` scan, as a workaround for
+  -- `Elab.decodeDecl`'s `DFn` arm folding a ZERO-PARAM `fn` clause to
+  -- `Decl.dlet name body`, which hid 0-param fns (`reject/t42`'s `fail()`,
+  -- `t46`'s `gen()`, `t47`'s `ts()`) from a `dfn`-only scan. That fold has
+  -- since been fixed at the source (`Elab.lean`'s `DFn` arm now decodes a
+  -- 0-param clause to `Decl.dfn name [] retTy body`, an empty-param `dfn`,
+  -- not a `dlet`), so the workaround is no longer needed and has been
+  -- removed: a 0-param fn is a real `dfn` again and this scan finds it
+  -- without also catching genuine top-level `let`s march never looks at.
   let opts := decls.flatMap (fun d => match d with | .dopts o => o | _ => [])
   let dfns := decls.filterMap (fun d => match d with
     | .dfn name _ _ body => some (name, body)
-    | .dlet name body => some (name, body)
     | _ => none)
   -- `pure` (typecheck.ml:8232): bans EVERY name in `builtinCaps` (the whole
   -- builtin→cap table, IO/Alloc/Panic alike) UNION the four extra names that

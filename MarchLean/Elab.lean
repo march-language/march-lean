@@ -526,9 +526,26 @@ partial def decodeDecl (j : Json) : Except String Decl := do
             match paramsOpt with
             | none => .ok Decl.unsupported
             | some [] =>
-                -- 0-param clause: a plain value binding.
+                -- 0-param clause: still a genuine `Ast.DFn` in march's real
+                -- AST (verified directly: `fn fail() : Int do panic("boom")
+                -- end` emits `"kind":"DFn"`, never `"kind":"DLet"`), NOT an
+                -- `Ast.DLet`. march's behavioral-cap checks
+                -- (`check_pure_module`/`check_deterministic_module`/
+                -- `check_no_panic_module`, `typecheck.ml`) scan `Ast.DFn`
+                -- ONLY — folding a 0-param clause to `Decl.dlet` (the old
+                -- A2-era convenience) hid it from any `dfn`-only scan.
+                -- Decoding it to `Decl.dfn name [] retTy body` instead — an
+                -- empty param list, not a currying trick — keeps it visible
+                -- to `CapCheck`'s dfn-only scan, matching march's own
+                -- DFn-only behavioral scan exactly, and also lets it carry
+                -- its `retTy` annotation into Check 1's return-cap scan
+                -- (previously dropped for the 0-param case; see
+                -- `capsInReturnSignature`'s docstring). A genuine top-level
+                -- `Ast.DLet` (a real `let x = ...` binding, JSON
+                -- `{"kind":"DLet",...}`) is unaffected — it still decodes via
+                -- the separate `"DLet"` arm below to `Decl.dlet`.
                 let body ← decodeTerm bodyJ
-                .ok (Decl.dlet name body)
+                .ok (Decl.dfn name [] retTy body)
             | some params =>
                 -- N-ary: carry the whole param list directly (no currying),
                 -- plus the (in-fragment) return annotation for Check 1.
