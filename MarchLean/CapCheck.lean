@@ -340,16 +340,23 @@ partial def bodyCalls (banned : List String) : Term → Bool
 by this refactor. -/
 def bodyCallsIO (t : Term) : Bool := bodyCalls ioBuiltins t
 
-/-- Does this term (a function body) allocate — construct a tuple, record,
-non-nullary `con`, or `lam`? A sibling total walk to `bodyCalls`, for the
-upcoming `no_alloc` behavioral cap (A3 slice (c)): `true` at `.tuple _ _`,
-`.record _ _`, `.con _ (_ :: _) _` (a NON-EMPTY arg list — a nullary
-constructor, e.g. `None`, allocates nothing, mirroring march's `no_alloc.ml`),
-and `.lam _ _ _` (a closure allocation); recurses into every other
+/-- Does this term (a function body) allocate — construct a NON-EMPTY tuple,
+record, non-nullary `con`, or `lam`? A sibling total walk to `bodyCalls`, for
+the `no_alloc` behavioral cap (A3 slice (c)): `true` at `.tuple (_ :: _) _`
+(a NON-EMPTY tuple — `no_alloc.ml:20`'s `ETuple ([], _) -> ()` explicitly
+exempts the EMPTY tuple, i.e. unit `()`, from being an allocation; a bare
+`.tuple [] _` is therefore `false`, matched FIRST so it is not shadowed by the
+general non-empty arm), `.record _ _` (march's `ERecord` arm has no such
+exemption — even an empty record literal `{}` always errors, unconditionally
+of `fields`), `.con _ (_ :: _) _` (a NON-EMPTY arg list — a nullary
+constructor, e.g. `None`, allocates nothing, mirroring march's `ECon (_, [],
+_)` no-op arm), and `.lam _ _ _` (a closure allocation, unconditionally —
+march's `ELam` arm has no exemption either); recurses into every other
 constructor's children looking for a nested allocation; `.lit`/`.var`/
 `.unsupported` are the only genuine leaves. Enumerates all 13 `Term`
-constructors explicitly — no catch-all — matching `bodyCalls`'s exhaustiveness
-discipline. -/
+constructors explicitly (14 pattern arms, since `.tuple` is split into an
+empty and a non-empty case) — no catch-all — matching `bodyCalls`'s
+exhaustiveness discipline. -/
 partial def bodyAllocates : Term → Bool
   | .lit _ _ => false
   | .var _ _ _ => false
@@ -360,7 +367,8 @@ partial def bodyAllocates : Term → Bool
   | .ite c t e _ => bodyAllocates c || bodyAllocates t || bodyAllocates e
   | .con _ [] _ => false
   | .con _ (_ :: _) _ => true
-  | .tuple _ _ => true
+  | .tuple [] _ => false           -- unit `()` is not an allocation (no_alloc.ml:20)
+  | .tuple (_ :: _) _ => true      -- non-empty tuple always allocates
   | .record _ _ => true
   | .field record _ _ _ => bodyAllocates record
   | .match_ scrut arms _ => bodyAllocates scrut || arms.any (fun (_, e) => bodyAllocates e)
@@ -1129,8 +1137,14 @@ example : bodyCalls ["println"]
   (Term.tuple [Term.app (Term.var "println" ⟨"f",0,0,0,0⟩ (Ty.con "Unit" []))
                         [Term.lit (Lit.str "x") (Ty.con "String" [])] (Ty.con "Unit" [])]
               (Ty.con "Unit" [])) = true := by native_decide
--- bodyAllocates: a tuple allocates; a bare literal does not.
-example : bodyAllocates (Term.tuple [] (Ty.con "Unit" [])) = true := by native_decide
+-- bodyAllocates: a NON-EMPTY tuple allocates; a bare literal does not; the
+-- EMPTY tuple (unit `()`) is exempt (`no_alloc.ml:20`'s `ETuple ([], _) ->
+-- ()`), matching march exactly — see the false-reject this closes at
+-- `noAllocEmptyTupleOk` below.
+example : bodyAllocates
+  (Term.tuple [Term.lit (Lit.int 1) (Ty.con "Int" []), Term.lit (Lit.int 2) (Ty.con "Int" [])]
+              (Ty.con "Unit" [])) = true := by native_decide
+example : bodyAllocates (Term.tuple [] (Ty.con "Unit" [])) = false := by native_decide
 example : bodyAllocates (Term.lit (Lit.int 1) (Ty.con "Int" [])) = false := by native_decide
 
 -- ---------------------------------------------------------------------
@@ -1210,14 +1224,30 @@ def noExternWithoutExtern : Module := {
 #eval checkCaps noExternWithoutExtern   -- expect: ok
 example : (checkCaps noExternWithoutExtern).isViolation = false := by native_decide
 
-/-- `no_alloc`: a `dfn` returning a `Term.tuple` → violation. -/
+/-- `no_alloc`: a `dfn` returning a NON-EMPTY `Term.tuple` → violation. -/
 def noAllocTuple : Module := {
+  decls := [Decl.dmod "A" [
+    Decl.dopts ["no_alloc"],
+    Decl.dfn "f" [] none
+      (Term.tuple [Term.lit (Lit.int 1) (Ty.con "Int" []), Term.lit (Lit.int 2) (Ty.con "Int" [])]
+                  (Ty.con "Unit" []))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps noAllocTuple   -- expect: violation naming `no_alloc`
+example : (checkCaps noAllocTuple).isViolation = true := by native_decide
+
+/-- `no_alloc`: a `dfn` returning the EMPTY tuple `()` (unit) → ok. Pins the
+false-reject fix: `no_alloc.ml:20`'s `ETuple ([], _) -> ()` explicitly exempts
+unit from being an allocation, so `bodyAllocates` must NOT flag it — prior to
+this fix, `.tuple _ _ => true` flagged EVERY tuple including the empty one,
+manufacturing a false reject on `mod NA do cap no_alloc fn f() : () do () end
+end` (march accepts, march-lean-check rejected). -/
+def noAllocEmptyTupleOk : Module := {
   decls := [Decl.dmod "A" [
     Decl.dopts ["no_alloc"],
     Decl.dfn "f" [] none (Term.tuple [] (Ty.con "Unit" []))]],
   schemes := [], insts := [], moduleCaps := [] }
-#eval checkCaps noAllocTuple   -- expect: violation naming `no_alloc`
-example : (checkCaps noAllocTuple).isViolation = true := by native_decide
+#eval checkCaps noAllocEmptyTupleOk   -- expect: ok
+example : (checkCaps noAllocEmptyTupleOk).isViolation = false := by native_decide
 
 /-- `no_alloc`: a `dfn` returning a bare `int` literal → ok. -/
 def noAllocArithmetic : Module := {
