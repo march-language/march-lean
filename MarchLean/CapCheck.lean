@@ -119,6 +119,19 @@ def capsInReturnSignature : Decl → List String
 def declaredNeeds (decls : List Decl) : List String :=
   decls.flatMap (fun d => match d with | .dneeds ps => ps | _ => [])
 
+/-- march's `has_foreign` (`typecheck.ml:9037-9042`, inside
+`check_no_extern_module`), mirrored exactly: a `needs` path (here, one dotted
+string like `"IO.Foreign"` or `"IO.Foreign.Blocking"` — `Elab.lean`'s `DNeeds`
+decoder joins each path's segments with `"."`) counts toward `cap no_extern`
+when its FIRST segment is literally `"IO"` and `"Foreign"` appears among the
+REMAINING segments — `needs Foreign` alone (no `IO` prefix) or `needs
+IO.NetForeign` (a different later segment) do NOT match, exactly as march's
+`first.txt = "IO" && List.exists (fun p -> p.txt = "Foreign") rest` does not. -/
+def hasForeignNeed (path : String) : Bool :=
+  match path.splitOn "." with
+  | first :: rest => first == "IO" && rest.contains "Foreign"
+  | [] => false
+
 /-- The bare names of proof caps this module declares DIRECTLY — a sibling
 `Decl.dproofcap` in its OWN `decls` (not one declared inside a nested
 `dmod`). Used only by `checkCaps` to build the top-level self-declaration
@@ -431,9 +444,119 @@ def bindLetFacts (name : String) (rhs : Term) (facts : DivFacts) : DivFacts :=
   | some n => (name, n) :: retireDivFacts [name] facts
   | none => retireDivFacts [name] facts
 
-/-- Is `divisor` statically known to be zero? Resolves ONLY a bare `0`
-literal, or a `var` whose `DivFacts` entry (an in-scope `let` bound to a
-literal) is `0`. Any OTHER shape — an unresolved parameter, a non-linear or
+/-- A guard condition in scope, paired with a `negated` flag — march's `dctx.path`
+(`division_safety.ml`'s `dctx.path : (A.expr * bool) list`). `negated = true`
+means we are on the ELSE side of the `if` that produced this entry, so the fact
+actually in scope is `not cond`, not `cond` itself. Populated ONLY by
+`divisionUnsafe`'s `.ite` arm (the then-branch pushes `(cond, false)`, the
+else-branch pushes `(cond, true)`), mirroring march's `EIf` arm in
+`iter_div_sites`. -/
+abbrev DivPath := List (Term × Bool)
+
+/-- Does `t` mention any name in `names` anywhere in its subtree? A DELIBERATELY
+over-approximate structural walk (does not exclude occurrences under a nested
+binder of the same name), mirroring march's `expr_mentions`
+(`refine_check.ml:1696`) — `path_shadow`'s sole caller, which explains in its
+own comment why over-approximating is the safe direction here: this function
+is used only to DISCARD a path fact when the name it is about gets rebound, so
+over-approximating loses information (silence) rather than inventing a false
+proof. Total over every `Term` constructor, matching `bodyCalls`/
+`bodyAllocates`'s exhaustiveness discipline. -/
+partial def termMentionsAny (names : List String) : Term → Bool
+  | .lit _ _ => false
+  | .var n _ _ => names.contains n
+  | .app fn args _ => termMentionsAny names fn || args.any (termMentionsAny names)
+  | .lam _ body _ => termMentionsAny names body
+  | .let_ _ _ _ rhs body _ => termMentionsAny names rhs || termMentionsAny names body
+  | .letfn _ _ _ _ fnBody body _ => termMentionsAny names fnBody || termMentionsAny names body
+  | .ite c t e _ => termMentionsAny names c || termMentionsAny names t || termMentionsAny names e
+  | .con _ args _ => args.any (termMentionsAny names)
+  | .tuple elems _ => elems.any (termMentionsAny names)
+  | .record fields _ => fields.any (fun (_, e) => termMentionsAny names e)
+  | .field record _ _ _ => termMentionsAny names record
+  | .match_ scrut arms _ => termMentionsAny names scrut || arms.any (fun (_, e) => termMentionsAny names e)
+  | .unsupported _ => false
+
+/-- Drop every path entry whose condition mentions a name in `names` — march's
+`path_shadow` (`refine_check.ml:1747`), called from `divisionUnsafe`'s binding
+arms alongside `retireDivFacts` so a rebinding retires BOTH channels: a guard
+about the outer `d` must not survive to describe an inner, rebound `d`. -/
+def retireDivPath (names : List String) (path : DivPath) : DivPath :=
+  if names.isEmpty then path else path.filter (fun (c, _) => !termMentionsAny names c)
+
+/-- march's `path_proves_nonzero` (`division_safety.ml:290`), copied faithfully
+— a NO-SOLVER syntactic scan of `path`'s guard conditions for a proof that
+`var ≠ 0`. Handles exactly march's patterns: a direct `var != 0` / `0 != var`;
+a negated `var == 0` (the else-branch of `if var == 0 do .. else .. end`,
+where `negated = true` dualises `==` to `!=`); and the four one-sided
+inequalities `var > n` / `var >= n` / `var < n` / `var <= n` (or their
+literal-on-the-left mirror image, normalised via `flip`) whenever the literal
+`n` pins `var` strictly to one side of zero. `dual` mirrors march's `dual`
+(negating the comparison operator itself when `negated`); `flip` mirrors
+march's `flip` (swapping `n op var` to `var (flip op) n` before `proves` is
+applied); `proves` mirrors march's `proves`. No Z3, no refined-parameter
+channel — this checker never models march's `Refine.discharge` fallback, only
+the syntactic fast-path that runs ahead of it. -/
+def pathProvesNonzero (var : String) (path : DivPath) : Bool :=
+  let dual : String → Option String
+    | "==" => some "!="
+    | "!=" => some "=="
+    | "<"  => some ">="
+    | ">=" => some "<"
+    | ">"  => some "<="
+    | "<=" => some ">"
+    | _    => none
+  let flip : String → String
+    | "<"  => ">"
+    | ">"  => "<"
+    | "<=" => ">="
+    | ">=" => "<="
+    | op   => op
+  let proves : String → Int → Bool
+    | "!=", n => n == 0
+    | "==", n => n != 0
+    | ">",  n => n ≥ 0
+    | ">=", n => n ≥ 1
+    | "<",  n => n ≤ 0
+    | "<=", n => n ≤ -1
+    | _, _    => false
+  let isVar : Term → Bool
+    | .var x _ _ => x == var
+    | _          => false
+  path.any (fun (cond, negated) =>
+    match cond with
+    | .app (.var op0 _ _) [a, b] _ =>
+        -- Mirrors march's `match int_of b, int_of a with | Some n, _ when
+        -- is_var a -> .. | _, Some n when is_var b -> ..`: the SECOND arm is
+        -- tried whenever the first's guard fails, independent of whether
+        -- `int_of b` matched at all — NOT a sequential if/else on `intLitOf b`
+        -- alone, which would skip the second arm too eagerly.
+        let normalized : Option (String × Int) :=
+          match intLitOf b with
+          | some n =>
+              if isVar a then some (op0, n)
+              else match intLitOf a with
+                | some n2 => if isVar b then some (flip op0, n2) else none
+                | none    => none
+          | none =>
+              match intLitOf a with
+              | some n2 => if isVar b then some (flip op0, n2) else none
+              | none    => none
+        match normalized with
+        | none => false
+        | some (op, n) =>
+            match (if negated then dual op else some op) with
+            | none => false
+            | some op' => proves op' n
+    | _ => false)
+
+/-- Is `divisor` statically known to be zero? Resolves a bare `0` literal
+unconditionally, or a `var` — but for a `var`, march's `check_var_divisor`
+consults `path_proves_nonzero` FIRST (a guard proving the divisor non-zero
+wins outright, even over a stale-looking `let`-to-zero fact) and only falls
+back to the `DivFacts` (`let`-to-literal) lookup when the path is silent — see
+`divisionUnsafe`'s docstring for why this ordering matters (Finding C1). Any
+OTHER shape — an unresolved parameter with no proving guard, a non-linear or
 otherwise-complex expression, a variable with no tracked literal at all —
 answers `false`, DELIBERATELY: march's solver path (`division_safety.ml`'s
 `smt_of` / `Refine.discharge`, reflecting the divisor and any
@@ -443,43 +566,62 @@ ACCEPT something march would reject via Z3, never the reverse. That is the
 safe direction for a differential oracle with no solver: an under-reject
 surfaces downstream as an ordinary MISMATCH to triage, never a silent wrong
 verdict stronger than what was actually checked. -/
-def divisorIsZero (facts : DivFacts) (divisor : Term) : Bool :=
+def divisorIsZero (facts : DivFacts) (path : DivPath) (divisor : Term) : Bool :=
   match intLitOf divisor with
   | some n => n == 0
   | none =>
     match divisor with
     | .var n _ _ =>
-        match facts.find? (fun (m, _) => m == n) with
-        | some (_, v) => v == 0
-        | none => false
+        if pathProvesNonzero n path then false
+        else
+          match facts.find? (fun (m, _) => m == n) with
+          | some (_, v) => v == 0
+          | none => false
     | _ => false
 
 /-- Division-safety scan for `cap no_panic` (`refinecheck/division_safety.ml`,
-A3 slice (c) Task 2b) — the LITERAL-ZERO-WITH-SHADOWING fragment only, no
-SMT. Walks a `dfn` body threading `DivFacts` (the `let`-to-literal map),
-answering `true` the moment a division/modulo site's divisor (`divOps`,
-SECOND argument) is statically zero: a bare `0`, or a `var` whose tracked
-value is `0`.
+A3 slice (c) Task 2b, path-conditions fix Finding C1) — the
+LITERAL-ZERO-WITH-SHADOWING-AND-PATH-CONDITIONS fragment, no SMT. Walks a
+`dfn` body threading a `DivFacts` (the `let`-to-literal map) AND a `DivPath`
+(the enclosing guard conditions, march's `dctx.path`), answering `true` the
+moment a division/modulo site's divisor (`divOps`, SECOND argument) is
+statically zero: a bare `0`, or a `var` whose tracked value is `0` and whose
+enclosing path does NOT prove it non-zero (`divisorIsZero`).
 
 **Shadowing is the entire point of this checker** — `reject/t123`'s corpus
 comment documents a real runtime panic (past `--check` with exit 0) from
 exactly this omission. Every binder here — `let_` (a rebinding of `name`),
-`lam`/`letfn` params, and match-arm binders — RETIRES (`retireDivFacts`) the
-names it shadows from the incoming facts BEFORE contributing anything of its
-own, so an outer `let d = <lit>` can never be misread as still describing an
-inner, rebound `d`. This is exactly `reject/t123`'s shape: `if d == 0 do 0
-else let d = 0; 10 / d end` — the fact `not (d == 0)` is about the OUTER
-parameter, not the inner `let d = 0`, so the `else` branch's `let` must retire
-whatever the outer scope believed about `d` before recording the fresh
-literal fact.
+`lam`/`letfn` params, and match-arm binders — RETIRES (`retireDivFacts` AND
+`retireDivPath`) the names it shadows from BOTH the incoming facts and the
+incoming path BEFORE contributing anything of its own, so an outer `let d =
+<lit>` (or an outer guard mentioning `d`) can never be misread as still
+describing an inner, rebound `d`. This is exactly `reject/t123`'s shape: `if d
+== 0 do 0 else let d = 0; 10 / d end` — the fact `not (d == 0)` (equivalently,
+`d != 0`, from `pathProvesNonzero`'s dualisation of the else-branch) is about
+the OUTER parameter, not the inner `let d = 0`, so the `else` branch's `let`
+must retire whatever the outer scope believed about `d` — from BOTH channels
+— before recording the fresh literal fact. `noPanicShadowedGuard` below still
+pins this exact shape as a violation, now for the right reason: not because
+path conditions are unmodelled, but because shadowing retires the outer path
+fact before the inner zero fact is ever consulted.
 
-**No path-condition tracking.** march also proves a divisor non-zero from
-guard conditions (`if d != 0 do 10 / d`, `dctx.path`) — this checker does not
-model that channel at all, and does not need to: `divisorIsZero` never FLAGS
-an unresolved divisor (see its own docstring), so a guarded-but-unresolved
-division simply falls through as "not proven unsafe" without needing a guard
-to excuse it. Path conditions only ever matter for AVOIDING a false reject on
-an unresolved divisor, and this checker never rejects one in the first place.
+**Path-condition tracking (Finding C1).** march's `check_var_divisor`
+consults `path_proves_nonzero` BEFORE the `let`-value lookup — a guard proving
+the divisor non-zero wins outright, even when a `let` in the SAME scope (not
+retired by shadowing) would otherwise read as a zero fact. `divisorIsZero`
+mirrors that ordering exactly. `divisionUnsafe`'s `.ite` arm pushes `(cond,
+false)` onto the path for the then-branch and `(cond, true)` (negated) for the
+else-branch — march's `dctx.path` entries, with their `negated` flag, are
+built the exact same way. `pathProvesNonzero` (defined above) is march's own
+`path_proves_nonzero`, copied faithfully: `d != 0`, `0 != d`, a negated `d ==
+0`, and the four one-sided inequalities (`d > 0`, `d >= 1`, `d < 0`, `d <=
+-1`, or their literal-on-the-left mirror images) all prove non-zero; anything
+else is silent (never a false proof — see `pathProvesNonzero`'s own
+docstring). Prior to this fix, this checker modeled NO path-condition channel
+at all and so FALSE-REJECTED a `let`-bound literal-zero divisor under a guard
+that march itself accepts as proven non-zero (e.g. `let d = 0; if d != 0 do 10
+/ d else 0 end`) — the worst class of divergence for a differential oracle,
+since it cries wolf on a program march accepts.
 
 **Out of scope, permanently, without a solver:** refined-parameter divisors
 (march's Int-refinement syntactic fast-path and Z3 discharge) and non-linear
@@ -492,7 +634,7 @@ corpus table — `t120`/`t119`/`t121`/`t122` all stay downstream SKIPS for
 unrelated out-of-fragment reasons, so this particular gap has not yet been
 observed to surface on its own; if it ever does on a fully in-fragment file,
 that is a finding to TRIAGE, not a bug in this function). -/
-partial def divisionUnsafe (facts : DivFacts) : Term → Bool
+partial def divisionUnsafe (facts : DivFacts) (path : DivPath) : Term → Bool
   | .lit _ _ => false
   | .var _ _ _ => false
   | .app fn args _ =>
@@ -501,26 +643,32 @@ partial def divisionUnsafe (facts : DivFacts) : Term → Bool
         | .var op _ _ =>
             divOps.contains op &&
               (match args[1]? with
-               | some divisor => divisorIsZero facts divisor
+               | some divisor => divisorIsZero facts path divisor
                | none => false)
         | _ => false
-      hereBad || divisionUnsafe facts fn || args.any (divisionUnsafe facts)
+      hereBad || divisionUnsafe facts path fn || args.any (divisionUnsafe facts path)
   | .lam params body _ =>
-      divisionUnsafe (retireDivFacts (params.map (·.1)) facts) body
+      let names := params.map (·.1)
+      divisionUnsafe (retireDivFacts names facts) (retireDivPath names path) body
   | .let_ name _ _ rhs body _ =>
-      divisionUnsafe facts rhs || divisionUnsafe (bindLetFacts name rhs facts) body
+      divisionUnsafe facts path rhs ||
+        divisionUnsafe (bindLetFacts name rhs facts) (retireDivPath [name] path) body
   | .letfn name param _ _ fnBody body _ =>
-      divisionUnsafe (retireDivFacts [name, param] facts) fnBody ||
-        divisionUnsafe (retireDivFacts [name] facts) body
+      divisionUnsafe (retireDivFacts [name, param] facts) (retireDivPath [name, param] path) fnBody ||
+        divisionUnsafe (retireDivFacts [name] facts) (retireDivPath [name] path) body
   | .ite c t e _ =>
-      divisionUnsafe facts c || divisionUnsafe facts t || divisionUnsafe facts e
-  | .con _ args _ => args.any (divisionUnsafe facts)
-  | .tuple elems _ => elems.any (divisionUnsafe facts)
-  | .record fields _ => fields.any (fun (_, e) => divisionUnsafe facts e)
-  | .field record _ _ _ => divisionUnsafe facts record
+      divisionUnsafe facts path c ||
+        divisionUnsafe facts ((c, false) :: path) t ||
+        divisionUnsafe facts ((c, true) :: path) e
+  | .con _ args _ => args.any (divisionUnsafe facts path)
+  | .tuple elems _ => elems.any (divisionUnsafe facts path)
+  | .record fields _ => fields.any (fun (_, e) => divisionUnsafe facts path e)
+  | .field record _ _ _ => divisionUnsafe facts path record
   | .match_ scrut arms _ =>
-      divisionUnsafe facts scrut ||
-        arms.any (fun (p, e) => divisionUnsafe (retireDivFacts (patBinderNames p) facts) e)
+      divisionUnsafe facts path scrut ||
+        arms.any (fun (p, e) =>
+          let names := patBinderNames p
+          divisionUnsafe (retireDivFacts names facts) (retireDivPath names path) e)
   | .unsupported _ => false
 
 /-- Is `used` covered by any declared need? Reflexive and directional. -/
@@ -533,10 +681,14 @@ that, since each module is checked against its OWN declared needs).
 `"Db.Migrated"`) that Check 1 must treat as covered regardless of `needs`,
 per Finding I1's self-declaration exemption — see `checkCaps`'s docstring for
 why this is passed in ONLY at the top-level call and always `[]` for a
-nested `dmod`. -/
+nested `dmod`. `inheritedCaps` is the subset of `inheritableBehavioralCaps`
+(below) an ENCLOSING module has declared or itself inherited — Finding I3;
+see this function's `pure`/`deterministic`/`no_extern`/`no_panic`-explicit-panic
+gates below for how it is combined with this module's own `opts`. -/
 def checkOneModule (modName : String) (decls : List Decl)
     (moduleCaps : List (String × List String))
-    (selfDeclaredCaps : List String := []) : CapResult :=
+    (selfDeclaredCaps : List String := [])
+    (inheritedCaps : List String := []) : CapResult :=
   let declared := declaredNeeds decls
   -- Check 1 — signature Cap(X) coverage over `param_tys @ ret_tys`
   -- (march's `check_module_needs`). Parameter caps are ALWAYS scanned.
@@ -677,9 +829,46 @@ def checkOneModule (modName : String) (decls : List Decl)
   | _ =>
   -- A3 slice (c), Task 2 — the five behavioral capability checks. A module
   -- declares zero or more of these via a sibling `Decl.dopts [...]`; each
-  -- scans only THIS module's own `dfn` bodies/decls (never a nested `dmod`'s
-  -- — `checkDecls` recurses into those separately, each against its own
-  -- `dopts`, so a parent's declared caps never govern a child's functions).
+  -- scans only THIS module's own `dfn` bodies/decls — `checkDecls` recurses
+  -- into a nested `dmod` separately, against that child's OWN `opts` PLUS
+  -- whatever it inherits from here (`inheritedCaps`, threaded in by
+  -- `checkDecls`'s recursive call — see Finding I3 below).
+  --
+  -- **Finding I3 — `pure`/`deterministic`/`no_extern`/`no_panic`'s
+  -- explicit-panic half ARE inherited by nested modules; `no_alloc` and
+  -- `no_panic`'s division-safety half are NOT.** march threads
+  -- `pure_mod`/`deterministic_mod`/`no_extern_mod`/`no_panic_mod` on its `env`
+  -- (`typecheck.ml:636-644`); a nested `DMod`'s own env is derived from the
+  -- OUTER env via `{ env with local_fns = ...; current_module = ...;
+  -- cap_qual_prefix = ... }` (`typecheck.ml:9336-9339`, no `_mod` field
+  -- mentioned) and the four flags are set to `true` by `DOpts` handling
+  -- (`:10182-10185`) but NEVER reset to `false` — so once set on an
+  -- ancestor, a flag stays `true` all the way down, and `check_pure_module`
+  -- /`check_deterministic_module`/`check_no_extern_module`/
+  -- `check_no_panic_module` (its explicit-panic-call half) all run against
+  -- `inner_env`'s (inherited) flags, not a re-derivation from the nested
+  -- module's own `decls` (`:9484-9491`). Verified directly against `march`:
+  -- `mod Outer do cap pure; needs IO.Console; mod Inner do needs IO.Console;
+  -- fn g(c : Cap(IO.Console)) : () do println("io") end end; fn f() : Int do
+  -- 1 end end` REJECTS (`Inner.g`'s `println` violates the INHERITED `pure`),
+  -- even though `Inner` itself declares no `cap pure` at all. Same shape for
+  -- `no_extern` and a nested `extern` block.
+  --
+  -- The exception is deliberate and empirically verified, not an oversight:
+  -- `no_alloc` (`refinecheck/no_alloc.ml:71-81`) and the DIVISION-SAFETY half
+  -- of `no_panic` (`refinecheck/division_safety.ml:522-533`, `check_decls`)
+  -- are SEPARATE passes over the raw `Ast.decl` tree, outside march's
+  -- `env`-threading entirely — each RE-DERIVES its own `no_alloc`/`no_panic`
+  -- boolean by scanning `decls` (the CURRENT module's own decl list) for a
+  -- `DOpts` sibling on every recursive `DMod` call, with no inherited
+  -- parameter at all (`division_safety.ml`'s own comment: "A nested module
+  -- re-derives its own `cap` directive: capabilities do not inherit
+  -- inward"). Verified directly against `march`: a nested allocating fn under
+  -- a `cap no_alloc` parent, and a nested `10 / 0` under a `cap no_panic`
+  -- parent, BOTH still ACCEPT (exit 0) — the parent's cap does not reach
+  -- them. So `inheritedCaps` below is consulted ONLY for the four inheritable
+  -- gates; `no_alloc` and the division-safety `no_panic` gate stay scoped to
+  -- this module's own `opts`, exactly as before.
   --
   -- **`dfn` ONLY — no `Decl.dlet` scan here.** march's own
   -- `check_pure_module`/`check_deterministic_module`/`check_no_panic_module`
@@ -700,6 +889,12 @@ def checkOneModule (modName : String) (decls : List Decl)
   -- removed: a 0-param fn is a real `dfn` again and this scan finds it
   -- without also catching genuine top-level `let`s march never looks at.
   let opts := decls.flatMap (fun d => match d with | .dopts o => o | _ => [])
+  -- Finding I3: the EFFECTIVE set for the four inheritable gates
+  -- (`pure`/`deterministic`/`no_extern`/`no_panic`-explicit-panic) is this
+  -- module's own `opts` UNION whatever it inherits from an enclosing module
+  -- — see the docstring above this block. `no_alloc` and the division-safety
+  -- half of `no_panic` deliberately keep consulting `opts` alone, below.
+  let effective := opts ++ inheritedCaps
   let dfns := decls.filterMap (fun d => match d with
     | .dfn name _ _ body => some (name, body)
     | _ => none)
@@ -708,7 +903,7 @@ def checkOneModule (modName : String) (decls : List Decl)
   -- are side-effecting but not in that table: `spawn`, `send`, `exit`,
   -- `read_byte`.
   let pureBanned := builtinCaps.map (·.1) ++ ["spawn", "send", "exit", "read_byte"]
-  match if opts.contains "pure" then dfns.find? (fun (_, body) => bodyCalls pureBanned body) else none with
+  match if effective.contains "pure" then dfns.find? (fun (_, body) => bodyCalls pureBanned body) else none with
   | some (name, _) =>
       .violation s!"cap pure: fn `{name}` in module `{modName}` performs a side effect"
   | none =>
@@ -716,46 +911,110 @@ def checkOneModule (modName : String) (decls : List Decl)
   -- the builtins whose cap is `IO.Clock` or `IO.Random` (6 names) — NOT the
   -- whole `builtinCaps` table, which would false-reject ordinary IO.
   let detBanned := (builtinCaps.filter (fun (_, c) => c == "IO.Clock" || c == "IO.Random")).map (·.1)
-  match if opts.contains "deterministic" then dfns.find? (fun (_, body) => bodyCalls detBanned body) else none with
+  match if effective.contains "deterministic" then dfns.find? (fun (_, body) => bodyCalls detBanned body) else none with
   | some (name, _) =>
       .violation s!"cap deterministic: fn `{name}` in module `{modName}` performs a non-deterministic operation"
   | none =>
-  -- `no_extern` (`:8255`): the module's own decls contain a `Decl.dextern`.
-  if opts.contains "no_extern" && decls.any (fun d => match d with | .dextern _ _ => true | _ => false) then
-    .violation s!"cap no_extern: module `{modName}` contains an extern block"
+  -- `no_extern` (`:9026`, `check_no_extern_module`) rejects on EITHER of two
+  -- conditions (Finding C2 — the second arm was previously missing entirely):
+  -- (1) the module's own decls contain a `Decl.dextern`, OR (2) the module
+  -- declares a `needs` whose path's FIRST segment is `"IO"` and some LATER
+  -- segment is `"Foreign"` (`needs IO.Foreign`, `needs IO.Foreign.Blocking`,
+  -- …) — march's `has_foreign`, mirrored exactly by `hasForeignNeed` below.
+  -- `declared` (bound at the top of this function from `declaredNeeds decls`)
+  -- is exactly this module's own dotted `needs` paths, so arm (2) reuses it
+  -- rather than re-scanning `decls`.
+  if effective.contains "no_extern" &&
+      (decls.any (fun d => match d with | .dextern _ _ => true | _ => false) ||
+       declared.any hasForeignNeed) then
+    .violation s!"cap no_extern: module `{modName}` contains an extern block or declares `needs IO.Foreign`"
   else
   -- `no_alloc` (`refinecheck/no_alloc.ml`): a `dfn` body constructs a
-  -- tuple/record/non-nullary-con/lambda.
+  -- tuple/record/non-nullary-con/lambda. NOT inherited (Finding I3's
+  -- exception) — `opts` alone, never `effective`.
   match if opts.contains "no_alloc" then dfns.find? (fun (_, body) => bodyAllocates body) else none with
   | some (name, _) =>
       .violation s!"cap no_alloc: fn `{name}` in module `{modName}` allocates"
   | none =>
   -- `no_panic`, explicit-panic half (`:8108`) — a `dfn` body directly calls
   -- `panic`. Exhaustiveness (a further half of `no_panic`) is Task 3, not
-  -- modelled here.
-  match if opts.contains "no_panic" then dfns.find? (fun (_, body) => bodyCalls ["panic"] body) else none with
+  -- modelled here. INHERITED (Finding I3) — `check_no_panic_module` runs
+  -- against the env-threaded, monotone `no_panic_mod` flag, so `effective`.
+  --
+  -- **Finding I4 (documented, NOT implemented): this bans only `"panic"`,
+  -- one of march's ~26-name panic surface.** march's
+  -- `panic_surface_all_direct` ∪ `panic_surface_stdlib` (`typecheck.ml:8784-
+  -- 8804`) is `panic`/`panic_`/`todo_`/`unreachable_`/`unwrap`/`expect`/
+  -- `head`/`tail`/`last` (9 direct names) UNION 17 qualified names —
+  -- `List.nth`/`List.hd`/`List.tl`/`List.head`/`List.last`/`List.min_elt`/
+  -- `List.max_elt`/`Option.unwrap`/`Option.expect`/`Result.unwrap`/
+  -- `Result.expect`/`Result.unwrap_err`/`Array.get`/`Array.set`/
+  -- `String.slice_bytes`/`String.nth`/`NativeArray.get`/`NativeArray.set`.
+  -- Every one of those 25 OTHER names is currently unbound in this checker's
+  -- modeled fragment (no qualified-call decoding, no stdlib call surface at
+  -- all), so a file calling one of them skips downstream via the
+  -- out-of-fragment gate rather than reaching this scan — no live divergence
+  -- TODAY. If any of those 25 names ever enters the modeled fragment (e.g.
+  -- qualified calls are decoded, or `unwrap`/`head`/etc. become recognised
+  -- builtins) WITHOUT this ban set being widened to match, a `cap no_panic`
+  -- module calling one becomes a FALSE ACCEPT here (march rejects, this
+  -- checker doesn't) — the same shape of gap `divisionUnsafe`'s docstring
+  -- documents for its own solver-free scope boundary. Do NOT close this by
+  -- guessing at the missing 25 names without re-deriving them from march's
+  -- live source, the way `builtinCaps` above was extracted.
+  --
+  -- **march's transitive fixpoint (`typecheck.ml:8902-8934`) is also
+  -- unmodelled, but BENIGN, not a gap to track.** march additionally flags a
+  -- fn that calls a LOCAL fn which itself directly hits the panic surface
+  -- (transitively, to a fixpoint). This checker's `dfns.find?` already finds
+  -- the DIRECTLY-panicking callee itself (every top-level `dfn` in the
+  -- module is scanned independently), so the module-level verdict this
+  -- oracle reports (violation vs. ok) already agrees with march's even
+  -- without following the call graph into the caller — only the SPECIFIC fn
+  -- blamed in the message could differ, which this checker's whole-file
+  -- accept/reject comparison never observes.
+  match if effective.contains "no_panic" then dfns.find? (fun (_, body) => bodyCalls ["panic"] body) else none with
   | some (name, _) =>
       .violation s!"cap no_panic: fn `{name}` in module `{modName}` may panic (explicit panic)"
   | none =>
   -- `no_panic`, division-safety half (`refinecheck/division_safety.ml`, A3
-  -- slice (c) Task 2b) — the literal-zero-with-shadowing fragment; see
-  -- `divisionUnsafe`'s docstring for the solver-free scope boundary.
-  match if opts.contains "no_panic" then dfns.find? (fun (_, body) => divisionUnsafe [] body) else none with
+  -- slice (c) Task 2b) — the literal-zero-with-shadowing-and-path-conditions
+  -- fragment; see `divisionUnsafe`'s docstring for the solver-free scope
+  -- boundary. NOT inherited (Finding I3's exception, same reasoning as
+  -- `no_alloc` above) — `opts` alone, never `effective`.
+  match if opts.contains "no_panic" then dfns.find? (fun (_, body) => divisionUnsafe [] [] body) else none with
   | some (name, _) =>
       .violation s!"cap no_panic: fn `{name}` in module `{modName}` may panic (division by zero literal)"
   | none => .ok
 
-/-- Walk the whole module tree, checking each module against its own needs. -/
-partial def checkDecls (moduleCaps : List (String × List String)) : List Decl → CapResult
+/-- The behavioral caps march inherits down into a nested `dmod` (Finding
+I3) — the four whose march-side check reads an env-threaded, monotone flag
+rather than re-deriving from the nested module's own `decls`. `no_alloc` and
+`no_panic`'s division-safety half are deliberately absent from this list —
+see `checkOneModule`'s docstring for the empirically-verified exception. -/
+def inheritableBehavioralCaps : List String := ["pure", "deterministic", "no_extern", "no_panic"]
+
+/-- Walk the whole module tree, checking each module against its own needs.
+`inherited` is the subset of `inheritableBehavioralCaps` accumulated from
+every ENCLOSING module (Finding I3) — `[]` at the top level (`checkCaps`
+below), and for a nested `dmod`, its own `opts` unioned into `inherited`
+before recursing into ITS children, so the inheritance is transitive: a
+grandchild sees a `cap pure` declared on its grandparent just as march's
+monotone env flag would. -/
+partial def checkDecls (moduleCaps : List (String × List String))
+    (inherited : List String) : List Decl → CapResult
   | [] => .ok
   | .dmod name inner :: rest =>
-      match checkOneModule name inner moduleCaps with
+      match checkOneModule name inner moduleCaps (inheritedCaps := inherited) with
       | .violation m => .violation m
       | .ok =>
-        match checkDecls moduleCaps inner with   -- nested modules
+        let ownOpts := inner.flatMap (fun d => match d with | .dopts o => o | _ => [])
+        let childInherited :=
+          (inherited ++ ownOpts).filter inheritableBehavioralCaps.contains
+        match checkDecls moduleCaps childInherited inner with   -- nested modules
         | .violation m => .violation m
-        | .ok => checkDecls moduleCaps rest
-  | _ :: rest => checkDecls moduleCaps rest
+        | .ok => checkDecls moduleCaps inherited rest
+  | _ :: rest => checkDecls moduleCaps inherited rest
 
 /-- Entry point. Also checks the top level as an implicit module, so a file
 with `needs`/`Cap(X)` outside any `mod` block is still checked.
@@ -788,7 +1047,16 @@ def checkCaps (m : Module) : CapResult :=
     (declaredProofCapNames m.decls).map (fun n => s!"{m.entryName}.{n}")
   match checkOneModule "<top-level>" m.decls m.moduleCaps selfDeclaredCaps with
   | .violation msg => .violation msg
-  | .ok => checkDecls m.moduleCaps m.decls
+  | .ok =>
+    -- Finding I3: the top-level (entry) module is threaded through the SAME
+    -- env-based `check_decl` fold march uses for a nested `dmod`, so a
+    -- behavioral cap declared OUTSIDE any `mod` block (a top-level `Decl.dopts`
+    -- sibling in `m.decls`) inherits into a nested `mod` exactly like a
+    -- `cap pure` declared on any other enclosing module would — there is no
+    -- asymmetry here the way Finding I1's self-declaration exemption has one.
+    let topOpts := m.decls.flatMap (fun d => match d with | .dopts o => o | _ => [])
+    let topInherited := topOpts.filter inheritableBehavioralCaps.contains
+    checkDecls m.moduleCaps topInherited m.decls
 
 end MarchLean.CapCheck
 
@@ -1380,6 +1648,107 @@ def noExternWithoutExtern : Module := {
 #eval checkCaps noExternWithoutExtern   -- expect: ok
 example : (checkCaps noExternWithoutExtern).isViolation = false := by native_decide
 
+/-- Finding C2 (the false-accept reproducer): a `no_extern` module declaring
+`needs IO.Foreign` — no `Decl.dextern` at all — is STILL a violation. march's
+`check_no_extern_module` has TWO arms; this checker previously implemented
+only the `Decl.dextern` one. Mirrors
+`mod NoFFI do cap no_extern; needs IO.Foreign; fn ping(host : String) : Int do
+string_length(host) end end`, which march rejects (exit 1) but the pre-fix
+checker accepted (exit 0). -/
+def noExternWithForeignNeed : Module := {
+  decls := [Decl.dmod "NoFFI" [
+    Decl.dopts ["no_extern"],
+    Decl.dneeds ["IO.Foreign"],
+    Decl.dfn "ping" [("host", Lin.unrestricted, some (Ty.con "String" []))] none
+      (Term.lit (Lit.int 1) (Ty.con "Int" []))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps noExternWithForeignNeed   -- expect: violation naming `no_extern`
+example : (checkCaps noExternWithForeignNeed).isViolation = true := by native_decide
+
+/-- Finding C2, a longer path under `IO.Foreign` also matches — `needs
+IO.Foreign.Blocking` — mirroring march's `has_foreign`, which looks for
+`"Foreign"` ANYWHERE among the path's segments after `"IO"`, not only as the
+immediate second segment. -/
+def noExternWithForeignBlockingNeed : Module := {
+  decls := [Decl.dmod "NoFFI" [
+    Decl.dopts ["no_extern"],
+    Decl.dneeds ["IO.Foreign.Blocking"],
+    Decl.dfn "f" [] none (Term.lit (Lit.int 1) (Ty.con "Int" []))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps noExternWithForeignBlockingNeed   -- expect: violation naming `no_extern`
+example : (checkCaps noExternWithForeignBlockingNeed).isViolation = true := by native_decide
+
+/-- Finding C2, the negative case (must NOT over-fire): `needs IO.Network` —
+`"IO"` first segment, but no `"Foreign"` segment at all — must NOT trip the
+new arm. This is `accept/t56_cap_no_extern_ok`'s exact shape. -/
+def noExternWithNonForeignIONeed : Module := {
+  decls := [Decl.dmod "NoFFIService" [
+    Decl.dopts ["no_extern"],
+    Decl.dneeds ["IO.Network"],
+    Decl.dfn "ping"
+      [("_cap", Lin.unrestricted, some (Ty.con "Cap" [Ty.con "IO.Network" []])),
+       ("host", Lin.unrestricted, some (Ty.con "String" []))]
+      none (Term.lit (Lit.int 1) (Ty.con "Int" []))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps noExternWithNonForeignIONeed   -- expect: ok
+example : (checkCaps noExternWithNonForeignIONeed).isViolation = false := by native_decide
+
+-- ---------------------------------------------------------------------
+-- Finding I3 pins: `pure`/`deterministic`/`no_extern`/`no_panic`-explicit-panic
+-- ARE inherited by a nested `dmod`; `no_alloc` and `no_panic`-division-safety
+-- are NOT. See `checkOneModule`'s docstring for the march-side justification.
+
+/-- The false-accept reproducer: `Outer` declares `cap pure`; `Inner` (nested,
+declaring no cap of its own) has a fn that performs IO. march REJECTS — the
+inherited `pure` flag governs `Inner.g` too — but a checker that scans each
+`dmod`'s own `opts` only would accept. Mirrors
+`mod Outer do cap pure; needs IO.Console; mod Inner do needs IO.Console; fn
+g(c : Cap(IO.Console)) : () do println("io") end end; fn f() : Int do 1 end
+end`. -/
+def pureInheritedIntoNestedModule : Module := {
+  decls := [Decl.dmod "Outer" [
+    Decl.dopts ["pure"],
+    Decl.dneeds ["IO.Console"],
+    Decl.dmod "Inner" [
+      Decl.dneeds ["IO.Console"],
+      Decl.dfn "g" [("c", Lin.unrestricted, some (Ty.con "Cap" [Ty.con "IO.Console" []]))]
+        none
+        (Term.app (Term.var "println" ⟨"f",0,0,0,0⟩ (Ty.con "Unit" []))
+                  [Term.lit (Lit.str "io") (Ty.con "String" [])] (Ty.con "Unit" []))],
+    Decl.dfn "f" [] none (Term.lit (Lit.int 1) (Ty.con "Int" []))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps pureInheritedIntoNestedModule   -- expect: violation naming `pure`
+example : (checkCaps pureInheritedIntoNestedModule).isViolation = true := by native_decide
+
+/-- Same shape for `no_extern`: `Outer` declares `cap no_extern`; a nested
+`Inner` (no cap of its own) contains an `extern` block. march REJECTS. -/
+def noExternInheritedIntoNestedModule : Module := {
+  decls := [Decl.dmod "Outer" [
+    Decl.dopts ["no_extern"],
+    Decl.dmod "Inner" [
+      Decl.dextern none ["foreign_fn"]]]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps noExternInheritedIntoNestedModule   -- expect: violation naming `no_extern`
+example : (checkCaps noExternInheritedIntoNestedModule).isViolation = true := by native_decide
+
+/-- The exception, half 1: `no_alloc` does NOT inherit. `Outer` declares `cap
+no_alloc`; nested `Inner` (no cap of its own) allocates (a non-empty tuple).
+march ACCEPTS — `no_alloc.ml`'s `check_decls` re-derives its own `no_alloc`
+boolean from EACH module's own `decls`, with no inherited parameter at all. -/
+def noAllocNotInheritedIntoNestedModule : Module := {
+  decls := [Decl.dmod "Outer" [
+    Decl.dopts ["no_alloc"],
+    Decl.dmod "Inner" [
+      Decl.dfn "f" [] none
+        (Term.tuple [Term.lit (Lit.int 1) (Ty.con "Int" []), Term.lit (Lit.int 2) (Ty.con "Int" [])]
+                    (Ty.con "Unit" []))]]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps noAllocNotInheritedIntoNestedModule   -- expect: ok
+example : (checkCaps noAllocNotInheritedIntoNestedModule).isViolation = false := by native_decide
+
+-- `noPanicDivisionNotInheritedIntoNestedModule` (Finding I3's other
+-- exception half) is defined further below, alongside `divTerm`/`divIntTy`.
+
 /-- `no_alloc`: a `dfn` returning a NON-EMPTY `Term.tuple` → violation. -/
 def noAllocTuple : Module := {
   decls := [Decl.dmod "A" [
@@ -1448,6 +1817,24 @@ output), so `rhs` is the divisor. -/
 def divTerm (lhs rhs : Term) : Term :=
   Term.app (Term.var "/" divSp divIntTy) [lhs, rhs] divIntTy
 
+/-- Finding I3's other exception half: `no_panic`'s DIVISION-SAFETY check does
+NOT inherit (even though its explicit-panic half DOES — see
+`pureInheritedIntoNestedModule`/`noExternInheritedIntoNestedModule` above for
+the inherited side, and `noAllocNotInheritedIntoNestedModule` for the sibling
+exception). `Outer` declares `cap no_panic`; nested `Inner` (no cap of its
+own) divides by a literal zero. march ACCEPTS — `division_safety.ml`'s
+`check_decls` re-derives its own `no_panic` boolean per module, exactly like
+`no_alloc.ml`. -/
+def noPanicDivisionNotInheritedIntoNestedModule : Module := {
+  decls := [Decl.dmod "Outer" [
+    Decl.dopts ["no_panic"],
+    Decl.dmod "Inner" [
+      Decl.dfn "f" [] none
+        (divTerm (Term.lit (Lit.int 10) divIntTy) (Term.lit (Lit.int 0) divIntTy))]]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps noPanicDivisionNotInheritedIntoNestedModule   -- expect: ok
+example : (checkCaps noPanicDivisionNotInheritedIntoNestedModule).isViolation = false := by native_decide
+
 /-- A bare `10 / 0` literal divisor → violation. -/
 def noPanicDivLiteralZero : Module := {
   decls := [Decl.dmod "NP" [
@@ -1471,10 +1858,15 @@ def noPanicDivLetZero : Module := {
 example : (checkCaps noPanicDivLetZero).isViolation = true := by native_decide
 
 /-- `reject/t123`'s exact shape: outer param `d`, `if d == 0 do 0 else let d =
-0; 10 / d end` — the INNER shadowing `let` is what makes this unsafe; the
-`not (d == 0)` fact from the `if` guard is about the OUTER parameter, and this
-checker never models path conditions in the first place (see
-`divisionUnsafe`'s docstring), so it plays no role here either way. -/
+0; 10 / d end` — the INNER shadowing `let` is what makes this unsafe. The `if`
+guard's `d == 0` DOES get pushed onto the path for the else-branch (negated,
+so `pathProvesNonzero` would read it as `d != 0`) — this checker now models
+that channel (Finding C1) — but the fact is about the OUTER parameter `d`,
+and the inner `let d = 0` RETIRES it (`retireDivPath`) before recording the
+fresh literal-zero fact, exactly as it already retired the OUTER `DivFacts`
+entry. So the guard plays no role here, but for the right reason now: not
+because path conditions are unmodelled, but because shadowing correctly
+discards a fact about a name that no longer refers to the same value. -/
 def noPanicShadowedGuard : Module := {
   decls := [Decl.dmod "ShadowedGuard" [
     Decl.dopts ["no_panic"],
@@ -1490,6 +1882,68 @@ def noPanicShadowedGuard : Module := {
   schemes := [], insts := [], moduleCaps := [] }
 #eval checkCaps noPanicShadowedGuard   -- expect: violation
 example : (checkCaps noPanicShadowedGuard).isViolation = true := by native_decide
+
+-- ---------------------------------------------------------------------
+-- Finding C1 pins: a `let`-bound literal-zero divisor guarded (NOT shadowed
+-- — the SAME `d` the guard is about) by a condition `pathProvesNonzero`
+-- recognises must be `ok`, not a violation. Prior to this fix, `divisorIsZero`
+-- consulted ONLY `DivFacts` and had no path channel at all, so all three of
+-- these false-rejected (checker exit 1, march exit 0) — the worst class of
+-- divergence for a differential oracle. Each mirrors one of march's
+-- `path_proves_nonzero` patterns directly.
+
+/-- `let d = 0; if d != 0 do 10 / d else 0 end` → ok (direct `!=` pattern). -/
+def noPanicGuardedNotEqualSafe : Module := {
+  decls := [Decl.dmod "Z" [
+    Decl.dopts ["no_panic"],
+    Decl.dfn "f" [] none
+      (Term.let_ "d" Lin.unrestricted none (Term.lit (Lit.int 0) divIntTy)
+        (Term.ite
+          (Term.app (Term.var "!=" divSp divIntTy)
+            [Term.var "d" divSp divIntTy, Term.lit (Lit.int 0) divIntTy] divIntTy)
+          (divTerm (Term.lit (Lit.int 10) divIntTy) (Term.var "d" divSp divIntTy))
+          (Term.lit (Lit.int 0) divIntTy)
+          divIntTy)
+        divIntTy)]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps noPanicGuardedNotEqualSafe   -- expect: ok
+example : (checkCaps noPanicGuardedNotEqualSafe).isViolation = false := by native_decide
+
+/-- `let d = 0; if d == 0 do 0 else 10 / d end` → ok (negated `==`, dualised
+to `!=` on the else-branch). -/
+def noPanicGuardedNegatedEqualSafe : Module := {
+  decls := [Decl.dmod "Z" [
+    Decl.dopts ["no_panic"],
+    Decl.dfn "f" [] none
+      (Term.let_ "d" Lin.unrestricted none (Term.lit (Lit.int 0) divIntTy)
+        (Term.ite
+          (Term.app (Term.var "==" divSp divIntTy)
+            [Term.var "d" divSp divIntTy, Term.lit (Lit.int 0) divIntTy] divIntTy)
+          (Term.lit (Lit.int 0) divIntTy)
+          (divTerm (Term.lit (Lit.int 10) divIntTy) (Term.var "d" divSp divIntTy))
+          divIntTy)
+        divIntTy)]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps noPanicGuardedNegatedEqualSafe   -- expect: ok
+example : (checkCaps noPanicGuardedNegatedEqualSafe).isViolation = false := by native_decide
+
+/-- `let d = 0; if d > 0 do 10 / d else 0 end` → ok (one-sided inequality
+implies non-zero). -/
+def noPanicGuardedGreaterThanSafe : Module := {
+  decls := [Decl.dmod "Z" [
+    Decl.dopts ["no_panic"],
+    Decl.dfn "f" [] none
+      (Term.let_ "d" Lin.unrestricted none (Term.lit (Lit.int 0) divIntTy)
+        (Term.ite
+          (Term.app (Term.var ">" divSp divIntTy)
+            [Term.var "d" divSp divIntTy, Term.lit (Lit.int 0) divIntTy] divIntTy)
+          (divTerm (Term.lit (Lit.int 10) divIntTy) (Term.var "d" divSp divIntTy))
+          (Term.lit (Lit.int 0) divIntTy)
+          divIntTy)
+        divIntTy)]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps noPanicGuardedGreaterThanSafe   -- expect: ok
+example : (checkCaps noPanicGuardedGreaterThanSafe).isViolation = false := by native_decide
 
 /-- `let d = 5; 10 / d` → ok (a non-zero literal is trivially safe). -/
 def noPanicDivLetNonZero : Module := {

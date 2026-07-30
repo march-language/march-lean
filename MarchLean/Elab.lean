@@ -497,9 +497,13 @@ partial def decodeDecl (j : Json) : Except String Decl := do
       -- threaded onto `Decl.dfn.retAnnot` so `CapCheck` can scan it for
       -- Check 1: march scans `param_tys @ ret_tys` (`check_module_needs`), and
       -- a `Cap(X)` in RETURN position is exactly the coverage gap this closes.
-      -- (`Decl.dlet` — the 0-param case — still carries no return field, so a
-      -- 0-param `fn () : Cap(X)` drops its return annotation as before; the M1
-      -- gap is about multi-param `Decl.dfn`s.)
+      -- (Commit `e671226` changed exactly this for the 0-param case: a
+      -- 0-param clause below now decodes to `Decl.dfn name [] retTy body` —
+      -- an empty-param `dfn`, not a `Decl.dlet` — so a 0-param `fn () :
+      -- Cap(X)` DOES carry its return annotation into Check 1's scan, same
+      -- as any N-ary `dfn`. `Decl.dlet` is reserved for a genuine top-level
+      -- `let x = ...` binding, which has no return annotation at all — see
+      -- the comment on the 0-param arm ~20 lines below.)
       let retTy ← (match fn.getObjVal? "ret_ty" with
         | .ok v => if v.isNull then pure none else do
             let t ← decodeSurfaceTy [] v
