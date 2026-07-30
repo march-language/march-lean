@@ -374,6 +374,155 @@ partial def bodyAllocates : Term → Bool
   | .match_ scrut arms _ => bodyAllocates scrut || arms.any (fun (_, e) => bodyAllocates e)
   | .unsupported _ => false
 
+/-- Division operators march's own division-safety pass flags
+(`refinecheck/division_safety.ml:25`, `div_ops`), copied VERBATIM. A division
+site is an `app` whose callee is a `var` named here; per the emitted envelope
+(verified directly against `reject/t123_cap_no_panic_shadowed_guard`'s
+`--emit-core-ast` output for `10 / d`: `EApp{fn=EVar"/", args=[ELit 10,
+EVar d]}`), the DIVISOR is the SECOND argument (`args[1]`, `lhs / rhs` with
+`rhs` the divisor) — not the first. -/
+def divOps : List String :=
+  [ "/", "%", "int_div", "int_mod", "int_div_euclid", "int_mod_euclid" ]
+
+/-- Names currently known to be bound to a literal `Int` value, from an
+in-scope `let`. march's equivalent channel is `dctx.lets`
+(`division_safety.ml:167`); this checker models ONLY that channel — not the
+`path`/refined-parameter channels — as a plain association list keyed on the
+bare variable name (see `divisionUnsafe`'s docstring for why those other two
+channels are out of scope here). -/
+abbrev DivFacts := List (String × Int)
+
+/-- Drop every fact about a name in `names`. march's `retire`
+(`division_safety.ml:173`) exists precisely so a rebinding of a name can never
+leave a STALE outer fact attributed to a fresh inner value — see
+`divisionUnsafe`'s docstring, and `reject/t123`'s own corpus comment, for the
+runtime panic this omission caused in practice. Every binding-introducing
+`Term` arm of `divisionUnsafe` calls this BEFORE extending the facts with
+anything the new binder itself provides. -/
+def retireDivFacts (names : List String) (facts : DivFacts) : DivFacts :=
+  facts.filter (fun (n, _) => !names.contains n)
+
+/-- The bare names a `Pattern` binds (match/destructuring binders), so a match
+arm can retire them from `DivFacts` before descending — mirrors march's
+`Refine_check.pat_binders`. Total over every `Pattern` constructor
+(`MarchLean/Syntax.lean`); `wild`/`lit`/`unsupported` bind nothing. -/
+partial def patBinderNames : Pattern → List String
+  | .wild => []
+  | .var n _ => [n]
+  | .con _ args => args.flatMap patBinderNames
+  | .tuple elems => elems.flatMap patBinderNames
+  | .lit _ => []
+  | .record fields => fields.flatMap (fun (_, p) => patBinderNames p)
+  | .as n p => n :: patBinderNames p
+  | .unsupported => []
+
+/-- The literal `Int` value of a term, if it directly is one. -/
+def intLitOf : Term → Option Int
+  | .lit (.int n) _ => some n
+  | _ => none
+
+/-- The updated `DivFacts` after a `let name = rhs` binding: retire the old
+`name` entry, then record a fresh one when — and only when — `rhs` is itself a
+literal (march's `bind_let`, `division_safety.ml:183`). A non-literal `rhs`
+retires and offers nothing in exchange, the same "unresolved" fallback
+`divisorIsZero` treats as safe — never a false fact. -/
+def bindLetFacts (name : String) (rhs : Term) (facts : DivFacts) : DivFacts :=
+  match intLitOf rhs with
+  | some n => (name, n) :: retireDivFacts [name] facts
+  | none => retireDivFacts [name] facts
+
+/-- Is `divisor` statically known to be zero? Resolves ONLY a bare `0`
+literal, or a `var` whose `DivFacts` entry (an in-scope `let` bound to a
+literal) is `0`. Any OTHER shape — an unresolved parameter, a non-linear or
+otherwise-complex expression, a variable with no tracked literal at all —
+answers `false`, DELIBERATELY: march's solver path (`division_safety.ml`'s
+`smt_of` / `Refine.discharge`, reflecting the divisor and any
+refined-parameter assumptions into a Z3 query) is OUT OF SCOPE here — this
+checker imports no SMT solver — and `false` here can only make this checker
+ACCEPT something march would reject via Z3, never the reverse. That is the
+safe direction for a differential oracle with no solver: an under-reject
+surfaces downstream as an ordinary MISMATCH to triage, never a silent wrong
+verdict stronger than what was actually checked. -/
+def divisorIsZero (facts : DivFacts) (divisor : Term) : Bool :=
+  match intLitOf divisor with
+  | some n => n == 0
+  | none =>
+    match divisor with
+    | .var n _ _ =>
+        match facts.find? (fun (m, _) => m == n) with
+        | some (_, v) => v == 0
+        | none => false
+    | _ => false
+
+/-- Division-safety scan for `cap no_panic` (`refinecheck/division_safety.ml`,
+A3 slice (c) Task 2b) — the LITERAL-ZERO-WITH-SHADOWING fragment only, no
+SMT. Walks a `dfn` body threading `DivFacts` (the `let`-to-literal map),
+answering `true` the moment a division/modulo site's divisor (`divOps`,
+SECOND argument) is statically zero: a bare `0`, or a `var` whose tracked
+value is `0`.
+
+**Shadowing is the entire point of this checker** — `reject/t123`'s corpus
+comment documents a real runtime panic (past `--check` with exit 0) from
+exactly this omission. Every binder here — `let_` (a rebinding of `name`),
+`lam`/`letfn` params, and match-arm binders — RETIRES (`retireDivFacts`) the
+names it shadows from the incoming facts BEFORE contributing anything of its
+own, so an outer `let d = <lit>` can never be misread as still describing an
+inner, rebound `d`. This is exactly `reject/t123`'s shape: `if d == 0 do 0
+else let d = 0; 10 / d end` — the fact `not (d == 0)` is about the OUTER
+parameter, not the inner `let d = 0`, so the `else` branch's `let` must retire
+whatever the outer scope believed about `d` before recording the fresh
+literal fact.
+
+**No path-condition tracking.** march also proves a divisor non-zero from
+guard conditions (`if d != 0 do 10 / d`, `dctx.path`) — this checker does not
+model that channel at all, and does not need to: `divisorIsZero` never FLAGS
+an unresolved divisor (see its own docstring), so a guarded-but-unresolved
+division simply falls through as "not proven unsafe" without needing a guard
+to excuse it. Path conditions only ever matter for AVOIDING a false reject on
+an unresolved divisor, and this checker never rejects one in the first place.
+
+**Out of scope, permanently, without a solver:** refined-parameter divisors
+(march's Int-refinement syntactic fast-path and Z3 discharge) and non-linear
+divisor expressions. Both fall through `divisorIsZero`'s catch-all — silently
+ACCEPTED here, exactly like every other unresolved divisor. A solver-only
+div-by-zero in an otherwise in-fragment module would surface as an ordinary
+MISMATCH against `march --check`'s exit 1 (see
+`.superpowers/sdd/2026-07-24-a3-slice-c-behavioral-caps/task-2b-div-safety.md`'s
+corpus table — `t120`/`t119`/`t121`/`t122` all stay downstream SKIPS for
+unrelated out-of-fragment reasons, so this particular gap has not yet been
+observed to surface on its own; if it ever does on a fully in-fragment file,
+that is a finding to TRIAGE, not a bug in this function). -/
+partial def divisionUnsafe (facts : DivFacts) : Term → Bool
+  | .lit _ _ => false
+  | .var _ _ _ => false
+  | .app fn args _ =>
+      let hereBad :=
+        match fn with
+        | .var op _ _ =>
+            divOps.contains op &&
+              (match args[1]? with
+               | some divisor => divisorIsZero facts divisor
+               | none => false)
+        | _ => false
+      hereBad || divisionUnsafe facts fn || args.any (divisionUnsafe facts)
+  | .lam params body _ =>
+      divisionUnsafe (retireDivFacts (params.map (·.1)) facts) body
+  | .let_ name _ _ rhs body _ =>
+      divisionUnsafe facts rhs || divisionUnsafe (bindLetFacts name rhs facts) body
+  | .letfn name param _ _ fnBody body _ =>
+      divisionUnsafe (retireDivFacts [name, param] facts) fnBody ||
+        divisionUnsafe (retireDivFacts [name] facts) body
+  | .ite c t e _ =>
+      divisionUnsafe facts c || divisionUnsafe facts t || divisionUnsafe facts e
+  | .con _ args _ => args.any (divisionUnsafe facts)
+  | .tuple elems _ => elems.any (divisionUnsafe facts)
+  | .record fields _ => fields.any (fun (_, e) => divisionUnsafe facts e)
+  | .field record _ _ _ => divisionUnsafe facts record
+  | .match_ scrut arms _ =>
+      divisionUnsafe facts scrut ||
+        arms.any (fun (p, e) => divisionUnsafe (retireDivFacts (patBinderNames p) facts) e)
+  | .unsupported _ => false
+
 /-- Is `used` covered by any declared need? Reflexive and directional. -/
 def covered (declared : List String) (used : String) : Bool :=
   declared.any (fun need => capSubsumes need used)
@@ -581,12 +730,19 @@ def checkOneModule (modName : String) (decls : List Decl)
   | some (name, _) =>
       .violation s!"cap no_alloc: fn `{name}` in module `{modName}` allocates"
   | none =>
-  -- `no_panic`, explicit-panic half only (`:8108`) — a `dfn` body directly
-  -- calls `panic`. Exhaustiveness (the OTHER half of `no_panic`) is Task 3,
-  -- not modelled here.
+  -- `no_panic`, explicit-panic half (`:8108`) — a `dfn` body directly calls
+  -- `panic`. Exhaustiveness (a further half of `no_panic`) is Task 3, not
+  -- modelled here.
   match if opts.contains "no_panic" then dfns.find? (fun (_, body) => bodyCalls ["panic"] body) else none with
   | some (name, _) =>
       .violation s!"cap no_panic: fn `{name}` in module `{modName}` may panic (explicit panic)"
+  | none =>
+  -- `no_panic`, division-safety half (`refinecheck/division_safety.ml`, A3
+  -- slice (c) Task 2b) — the literal-zero-with-shadowing fragment; see
+  -- `divisionUnsafe`'s docstring for the solver-free scope boundary.
+  match if opts.contains "no_panic" then dfns.find? (fun (_, body) => divisionUnsafe [] body) else none with
+  | some (name, _) =>
+      .violation s!"cap no_panic: fn `{name}` in module `{modName}` may panic (division by zero literal)"
   | none => .ok
 
 /-- Walk the whole module tree, checking each module against its own needs. -/
@@ -1280,5 +1436,125 @@ def noPanicSafe : Module := {
   schemes := [], insts := [], moduleCaps := [] }
 #eval checkCaps noPanicSafe   -- expect: ok
 example : (checkCaps noPanicSafe).isViolation = false := by native_decide
+
+-- `no_panic`, division-safety half (A3 slice (c) Task 2b) — see
+-- `divisionUnsafe`'s docstring for the literal-zero-with-shadowing scope.
+def divIntTy : Ty := Ty.con "Int" []
+def divSp : Span := ⟨"f", 0, 0, 0, 0⟩
+
+/-- `lhs / rhs` at the exact shape march emits (`EApp{fn=EVar"/",
+args=[lhs, rhs]}` — verified against `reject/t123`'s `--emit-core-ast`
+output), so `rhs` is the divisor. -/
+def divTerm (lhs rhs : Term) : Term :=
+  Term.app (Term.var "/" divSp divIntTy) [lhs, rhs] divIntTy
+
+/-- A bare `10 / 0` literal divisor → violation. -/
+def noPanicDivLiteralZero : Module := {
+  decls := [Decl.dmod "NP" [
+    Decl.dopts ["no_panic"],
+    Decl.dfn "f" [] none
+      (divTerm (Term.lit (Lit.int 10) divIntTy) (Term.lit (Lit.int 0) divIntTy))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps noPanicDivLiteralZero   -- expect: violation
+example : (checkCaps noPanicDivLiteralZero).isViolation = true := by native_decide
+
+/-- `let d = 0; 10 / d` → violation (a name tracked to literal `0`). -/
+def noPanicDivLetZero : Module := {
+  decls := [Decl.dmod "NP" [
+    Decl.dopts ["no_panic"],
+    Decl.dfn "f" [] none
+      (Term.let_ "d" Lin.unrestricted none (Term.lit (Lit.int 0) divIntTy)
+        (divTerm (Term.lit (Lit.int 10) divIntTy) (Term.var "d" divSp divIntTy))
+        divIntTy)]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps noPanicDivLetZero   -- expect: violation
+example : (checkCaps noPanicDivLetZero).isViolation = true := by native_decide
+
+/-- `reject/t123`'s exact shape: outer param `d`, `if d == 0 do 0 else let d =
+0; 10 / d end` — the INNER shadowing `let` is what makes this unsafe; the
+`not (d == 0)` fact from the `if` guard is about the OUTER parameter, and this
+checker never models path conditions in the first place (see
+`divisionUnsafe`'s docstring), so it plays no role here either way. -/
+def noPanicShadowedGuard : Module := {
+  decls := [Decl.dmod "ShadowedGuard" [
+    Decl.dopts ["no_panic"],
+    Decl.dfn "f" [("d", Lin.unrestricted, some divIntTy)] none
+      (Term.ite
+        (Term.app (Term.var "==" divSp divIntTy)
+          [Term.var "d" divSp divIntTy, Term.lit (Lit.int 0) divIntTy] divIntTy)
+        (Term.lit (Lit.int 0) divIntTy)
+        (Term.let_ "d" Lin.unrestricted none (Term.lit (Lit.int 0) divIntTy)
+          (divTerm (Term.lit (Lit.int 10) divIntTy) (Term.var "d" divSp divIntTy))
+          divIntTy)
+        divIntTy)]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps noPanicShadowedGuard   -- expect: violation
+example : (checkCaps noPanicShadowedGuard).isViolation = true := by native_decide
+
+/-- `let d = 5; 10 / d` → ok (a non-zero literal is trivially safe). -/
+def noPanicDivLetNonZero : Module := {
+  decls := [Decl.dmod "NP" [
+    Decl.dopts ["no_panic"],
+    Decl.dfn "f" [] none
+      (Term.let_ "d" Lin.unrestricted none (Term.lit (Lit.int 5) divIntTy)
+        (divTerm (Term.lit (Lit.int 10) divIntTy) (Term.var "d" divSp divIntTy))
+        divIntTy)]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps noPanicDivLetNonZero   -- expect: ok
+example : (checkCaps noPanicDivLetNonZero).isViolation = false := by native_decide
+
+/-- `10 / d` where `d` is an unresolved parameter → ok (proving this needs a
+solver, which this checker deliberately does not have — see
+`divisorIsZero`'s docstring). -/
+def noPanicDivUnresolvedParam : Module := {
+  decls := [Decl.dmod "NP" [
+    Decl.dopts ["no_panic"],
+    Decl.dfn "f" [("d", Lin.unrestricted, some divIntTy)] none
+      (divTerm (Term.lit (Lit.int 10) divIntTy) (Term.var "d" divSp divIntTy))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps noPanicDivUnresolvedParam   -- expect: ok
+example : (checkCaps noPanicDivUnresolvedParam).isViolation = false := by native_decide
+
+/-- A division by a literal `0` in a module WITHOUT `cap no_panic` → ok (the
+check is gated on the cap, same as every other behavioral cap above). -/
+def divUngatedWithoutCap : Module := {
+  decls := [Decl.dmod "Plain" [
+    Decl.dfn "f" [] none
+      (divTerm (Term.lit (Lit.int 10) divIntTy) (Term.lit (Lit.int 0) divIntTy))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps divUngatedWithoutCap   -- expect: ok (no `no_panic` opt)
+example : (checkCaps divUngatedWithoutCap).isViolation = false := by native_decide
+
+/-- Shadowing teeth, direction 1: `let d = 0; let d = 5; 10 / d` → ok — the
+stale `d ↦ 0` fact from the first `let` must be RETIRED by the second, not
+merged or left to leak through. -/
+def noPanicShadowRetiresZero : Module := {
+  decls := [Decl.dmod "NP" [
+    Decl.dopts ["no_panic"],
+    Decl.dfn "f" [] none
+      (Term.let_ "d" Lin.unrestricted none (Term.lit (Lit.int 0) divIntTy)
+        (Term.let_ "d" Lin.unrestricted none (Term.lit (Lit.int 5) divIntTy)
+          (divTerm (Term.lit (Lit.int 10) divIntTy) (Term.var "d" divSp divIntTy))
+          divIntTy)
+        divIntTy)]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps noPanicShadowRetiresZero   -- expect: ok
+example : (checkCaps noPanicShadowRetiresZero).isViolation = false := by native_decide
+
+/-- Shadowing teeth, direction 2 (the reverse of the above): `let d = 5; let d
+= 0; 10 / d` → violation — the LATER binding's literal `0` must win, not the
+earlier non-zero one. -/
+def noPanicShadowInstallsZero : Module := {
+  decls := [Decl.dmod "NP" [
+    Decl.dopts ["no_panic"],
+    Decl.dfn "f" [] none
+      (Term.let_ "d" Lin.unrestricted none (Term.lit (Lit.int 5) divIntTy)
+        (Term.let_ "d" Lin.unrestricted none (Term.lit (Lit.int 0) divIntTy)
+          (divTerm (Term.lit (Lit.int 10) divIntTy) (Term.var "d" divSp divIntTy))
+          divIntTy)
+        divIntTy)]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps noPanicShadowInstallsZero   -- expect: violation
+example : (checkCaps noPanicShadowInstallsZero).isViolation = true := by native_decide
 
 end MarchLean.CapCheck
