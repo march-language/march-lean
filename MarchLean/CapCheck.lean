@@ -626,9 +626,15 @@ def pathProvesNonzero (var : String) (path : DivPath) : Bool :=
 `unknown` = march's answer depends on machinery this checker does not model
             (a refinement type, or a Z3 discharge). Neither an accept nor a
             reject may be manufactured from it: it becomes `CapResult.skip`.
-`divZero` = provably a division by zero (march rejects, and so do we). Named
-            `divZero` rather than the obvious `unsafe` only because `unsafe`
-            is a Lean declaration modifier and cannot name a constructor. -/
+`divZero` = march DEFINITELY rejects this divisor, with no solver involved and
+            no fact in scope able to change the answer. Two disjoint shapes
+            reach it: a divisor that provably IS zero (a literal `0`, or a name
+            tracked to literal `0`), and a divisor march classifies as a
+            complex expression — neither an `ELit` nor an `EVar` — which
+            `check_clause`'s catch-all (`division_safety.ml:497-500`) errors on
+            unconditionally. Named `divZero` rather than the obvious `unsafe`
+            only because `unsafe` is a Lean declaration modifier and cannot
+            name a constructor; read it as "march rejects this division". -/
 inductive DivVerdict where
   | safe
   | unknown
@@ -667,24 +673,68 @@ can reach machinery this checker has no analogue of:
 * a divisor variable bound by a `let` to a NON-literal right-hand side —
   reflected by `smt_of` and sent to Z3.
 
-So the three-way boundary is:
+march's own dispatch on the divisor's SYNTACTIC SHAPE (`check_clause`,
+`division_safety.ml:485-500`) is a clean four-way, and only the third arm
+needs machinery we lack:
 
-* **`divZero`** — a literal `0` (`check_clause`'s first arm), or a `var` whose
-  tracked `let` value is literal `0` and whose path does not prove it
-  non-zero (`check_var_divisor`'s `Some (ELit (LitInt 0))` arm). Both are
-  unconditional `Err.error`s in march.
-* **`safe`** — a non-zero literal (`check_clause`'s second arm), a `var`
-  proven non-zero by the enclosing path (`path_proves_nonzero`, which march
-  consults on BOTH the refined and unrefined branch and which needs no
-  solver), or a `var` whose tracked `let` value is a non-zero literal
-  (`Some (ELit (LitInt _))` → `()`).
-* **`unknown`** — everything else: a bare parameter, a match/lambda binder, a
-  `let` bound to a non-literal, and any complex expression. march rejects
-  MOST of these outright, but this checker cannot tell them apart from the
-  refined-parameter and Z3 arms above without modelling refinement types and
-  an SMT solver, so it declines to judge. See `divisionVerdict`'s docstring
-  for why answering `safe` (the previous behaviour) or `divZero` are both
-  wrong.
+1. `A.ELit (A.LitInt 0, _)`     → unconditional `Err.error`.
+2. `A.ELit (A.LitInt _, _)`     → unconditional `()`.
+3. `A.EVar {txt = var_name; _}` → `check_var_divisor`: path proof, tracked
+   `let` value, refinement + Z3 — the only arm with a solver in it.
+4. `_` (anything else)          → unconditional `Err.error` (`:497-500`,
+   "division by a complex expression"). NO solver, NO refinement escape, NO
+   path escape: the divisor's shape alone decides it.
+
+So the four-way boundary here is:
+
+* **`divZero`** — a literal `0` (arm 1), a `var` whose tracked `let` value is
+  literal `0` and whose path does not prove it non-zero
+  (`check_var_divisor`'s `Some (ELit (LitInt 0))` arm), **or a complex
+  divisor: any decoded node that is neither a `lit` nor a `var`** (arm 4).
+  All three are unconditional `Err.error`s in march.
+* **`safe`** — a non-zero literal (arm 2), a `var` proven non-zero by the
+  enclosing path (`path_proves_nonzero`, which march consults on BOTH the
+  refined and unrefined branch and which needs no solver), or a `var` whose
+  tracked `let` value is a non-zero literal (`Some (ELit (LitInt _))` → `()`).
+* **`unknown`** — what is left of arm 3 only: a `var` that is a bare
+  parameter, a match/lambda binder, or a `let` bound to a non-literal. march
+  rejects MOST of these outright, but this checker cannot tell them apart
+  from the refined-parameter and Z3 sub-arms without modelling refinement
+  types and an SMT solver, so it declines to judge. Plus `Term.unsupported`
+  — see below.
+
+**Why arm 4 is safe to mirror as a reject** (this was left at `unknown` when
+the three-way boundary landed, on the grounds that "is this node an `EVar`?"
+is a reconstruction). It is not a reconstruction: `Term.var` is produced by
+`Elab.decodeTerm` from `"kind":"EVar"` and from nothing else, and
+`dump/ast_json.ml:315` emits `"kind":"EVar"` from `Ast.EVar` and from nothing
+else — the correspondence `Term.var ⟺ A.EVar` is a decoded fact, not an
+inference. The same holds for `Term.lit ⟺ A.ELit`. Crucially, the AST march's
+`Division_safety.check_module` inspects is the SAME `desugared` module
+`--emit-core-ast` serialises (`bin/main.ml:1755/1764/1834`), so the shape we
+decode is literally the shape `check_clause` matched on — post-desugar, not
+surface syntax.
+
+That last point is what makes the module-qualified case safe. `Consts.k`
+PARSES as `EField (ECon "Consts", "k")`, but `Desugar.desugar_expr`'s `EField`
+arm (`lib/desugar/desugar.ml:677-697`, `flatten_module_path`) rewrites a
+module path into a single `EVar {txt = "Consts.k"}` before any of this runs.
+march therefore reaches `check_var_divisor "Consts.k"`, where a guard
+`if Consts.k != 0 do 10 / Consts.k` DISCHARGES (verified: exit 0) — and we
+decode the same node to `Term.var "Consts.k"`, where `pathProvesNonzero`
+discharges it identically. A genuine record field access (`r.d`, base not a
+module path) stays `EField` on both sides and march rejects it even under the
+same guard (verified: exit 1). There is no march-variable form that decodes
+to a non-`var` node.
+
+`Term.unsupported` is the ONE shape held back at `unknown`. Every march
+`kind` that currently decodes to it (`ECond`/`EPipe`/`EAnnot`/`EHole`/
+`EAtom`/`ESend`/`ESpawn`/`EResultRef`/`EDbg`/`ELetFn`/`ELetQ`/`EAssert`/
+`ESigil`) does land in arm 4, so rejecting would be right today — but it is
+also `decodeTerm`'s open catch-all for kinds that do not exist yet, and a
+future march AST node need not stay in arm 4. Nothing is lost by holding it:
+an `unsupported` node anywhere in a body already makes its `Decl` report
+`hasUnsupported`, which sends the file to exit 2 on its own.
 
 **Ordering matters and mirrors march exactly** (Finding C1): the path is
 consulted BEFORE the `DivFacts` (`let`-to-literal) lookup, so a guard proving
@@ -705,12 +755,26 @@ def divisorVerdict (facts : DivFacts) (path : DivPath) (divisor : Term) : DivVer
           -- rejects all but the refined/Z3-discharged cases; we cannot tell
           -- which this is.
           | none => .unknown
-    -- A complex divisor expression. march's `check_clause` catch-all
-    -- (`division_safety.ml:498-503`) rejects it unconditionally, but this
-    -- checker sees a DECODED core AST, not march's own surface `A.expr`, so
-    -- "is this node an `EVar`?" is a shape judgement it reconstructs rather
-    -- than reads. Reconstructed ⇒ fail conservative ⇒ decline to judge.
-    | _ => .unknown
+    -- A COMPLEX divisor: neither an `ELit` nor an `EVar`, so march's
+    -- `check_clause` catch-all (`division_safety.ml:497-500`) errors on it
+    -- unconditionally — no solver, no refinement escape, no path escape.
+    -- Enumerated one constructor at a time rather than left as `| _ =>`, so
+    -- that a NEW `Term` constructor is a compile error here (a deliberate
+    -- decision point) instead of silently inheriting a reject.
+    --
+    -- `.lit` reaches this arm only for a non-`Int` literal (`intLitOf`
+    -- already consumed the `Int` case above); march's arms 1 and 2 match
+    -- `A.ELit (A.LitInt _, _)` specifically, so a float/string/bool literal
+    -- divisor falls into its catch-all too.
+    | .lit _ _ | .app _ _ _ | .lam _ _ _ | .let_ _ _ _ _ _ _
+    | .letfn _ _ _ _ _ _ _ | .ite _ _ _ _ | .con _ _ _ | .tuple _ _
+    | .record _ _ | .field _ _ _ _ | .match_ _ _ _ => .divZero
+    -- `.unsupported` is `decodeTerm`'s open catch-all for march `kind`s this
+    -- fragment does not decode — including ones that do not exist yet. Every
+    -- kind it currently covers IS in march's arm 4, but a future one need not
+    -- be, so this stays at "cannot judge"; the enclosing decl's
+    -- `hasUnsupported` already drives such a file to skip anyway.
+    | .unsupported _ => .unknown
 
 /-- Division-safety scan for `cap no_panic` (`refinecheck/division_safety.ml`,
 A3 slice (c) Task 2b, path-conditions fix Finding C1, three-way boundary
@@ -780,26 +844,40 @@ which `checkOneModule` turns into `CapResult.skip` and `MarchLeanCheck` into
 exit 2. Provable zero still rejects, provable non-zero still accepts; only the
 middle changed, and it changed from a confident wrong answer to no answer.
 
-Consequence for the ledger: `scripts/expected-skips.txt` now gains every
+Consequence for the ledger: `scripts/expected-skips.txt` gains every
 `cap no_panic` file whose divisor is a bare parameter, a pattern/lambda
-binder, a `let` to a non-literal, or any complex expression. That is the
-intended cost. Closing it properly needs refinement-type decoding plus an SMT
-solver; until then, tightening ONLY the complex-expression arm to `divZero`
-(march rejects it unconditionally) is defensible but was deliberately not
-taken here, because "is this decoded node what march's parser called an
-`EVar`?" is itself a reconstruction. -/
+binder, or a `let` to a non-literal. That is the intended cost, and closing
+it properly needs refinement-type decoding plus an SMT solver.
+
+**The COMPLEX-divisor half of that bucket has since been tightened back to a
+reject.** `10 / (a + b)` is not an unresolved `EVar` at all — it is march's
+arm 4, `check_clause`'s catch-all (`division_safety.ml:497-500`), which errors
+with no solver, no refinement escape and no path escape. The reason it was
+originally left at `unknown` — that "is this decoded node an `EVar`?" is a
+reconstruction — does not hold: `Term.var` decodes from `"kind":"EVar"` and
+only from there, out of the very same post-desugar AST `check_clause` reads,
+and module-qualified names (the one form that LOOKS complex but is a variable
+to march) are already flattened to `EVar "M.k"` by desugar before either side
+sees them. `divisorVerdict`'s docstring works the correspondence through in
+full. So the boundary is now four-way: provable zero and complex both reject,
+provable non-zero accepts, and only an undischarged `var` — where a
+refinement type or a Z3 query really could go either way — declines. -/
 partial def divisionVerdict (facts : DivFacts) (path : DivPath) : Term → DivVerdict
   | .lit _ _ => .safe
   | .var _ _ _ => .safe
   | .app fn args _ =>
       let here :=
         match fn with
+        -- Exactly TWO arguments, mirroring march's own guard
+        -- (`EApp (EVar op, [lhs; rhs], sp) when List.mem op div_ops`,
+        -- `division_safety.ml:214`). An `args[1]?` lookup would also fire on a
+        -- 3+-ary application of one of these names and hand march's `args[1]`
+        -- a divisor march never looked at — harmless while the arm answered
+        -- `unknown`, a false REJECT now that a complex divisor rejects.
         | .var op _ _ =>
-            if divOps.contains op then
-              match args[1]? with
-              | some divisor => divisorVerdict facts path divisor
-              | none => .safe
-            else .safe
+            match args with
+            | [_, divisor] => if divOps.contains op then divisorVerdict facts path divisor else .safe
+            | _ => .safe
         | _ => .safe
       DivVerdict.joinAll
         (here :: divisionVerdict facts path fn :: args.map (divisionVerdict facts path))
@@ -1527,18 +1605,20 @@ def checkOneModule (modName : String) (decls : List Decl)
   -- (Finding 1). NOT inherited (Finding I3's exception, same reasoning as
   -- `no_alloc` above) — `opts` alone, never `effective`.
   --
-  -- THREE-WAY, and the tiers are ordered: a fn with a PROVABLE div-by-zero
-  -- makes the whole module a violation even if another fn carries an
-  -- unresolvable divisor (march errors on the provable one regardless of what
-  -- it later decides about the other); only when no fn is provably unsafe does
-  -- an unresolvable divisor downgrade the module to `skip`.
+  -- THREE-WAY over `DivVerdict`, and the tiers are ordered: a fn whose
+  -- division march DEFINITELY rejects (a provable div-by-zero, or a complex
+  -- divisor — see `divisorVerdict`'s four-way boundary) makes the whole module
+  -- a violation even if another fn carries an unresolvable divisor (march
+  -- errors on the definite one regardless of what it later decides about the
+  -- other); only when no fn is definitely unsafe does an unresolvable divisor
+  -- downgrade the module to `skip`.
   let divVerdicts :=
     if opts.contains "no_panic" then
       dfns.map (fun (name, body) => (name, divisionVerdict [] [] body))
     else []
   match divVerdicts.find? (fun (_, v) => v == DivVerdict.divZero) with
   | some (name, _) =>
-      .violation s!"cap no_panic: fn `{name}` in module `{modName}` may panic (division by zero literal)"
+      .violation s!"cap no_panic: fn `{name}` in module `{modName}` may panic (divides by zero, or by a complex expression march rejects unconditionally)"
   | none =>
   match divVerdicts.find? (fun (_, v) => v == DivVerdict.unknown) with
   | some (name, _) =>
@@ -2736,12 +2816,17 @@ def noPanicDivUnresolvedParam : Module := {
 #eval checkCaps noPanicDivUnresolvedParam   -- expect: skip
 example : (checkCaps noPanicDivUnresolvedParam).isSkip = true := by native_decide
 
+-- ---------------------------------------------------------------------
+-- Complex-divisor tightening: march's arm 4 (`check_clause`'s catch-all,
+-- `division_safety.ml:497-500`) errors on ANY divisor that is neither an
+-- `ELit` nor an `EVar` — no solver, no refinement escape, no path escape. The
+-- shapes below were all SKIPS until the four-way boundary landed; each is
+-- exit 1 from the march binary. See `divisorVerdict`'s docstring for why the
+-- `Term.var ⟺ A.EVar` correspondence this relies on is a decoded fact rather
+-- than a reconstruction.
+
 /-- `fn f(a : Int, b : Int) : Int do 10 / (a + b) end` under `cap no_panic` →
-SKIP. march rejects a complex divisor unconditionally (`check_clause`'s
-catch-all, `division_safety.ml:498-503`), so this one COULD in principle be
-tightened to a violation; it is not, because "is this decoded node what
-march's parser called an `EVar`?" is a reconstruction, and the governing rule
-(`matchExhaustive`'s docstring) says a reconstruction fails conservative. -/
+VIOLATION. An `app` divisor is march's arm 4. (march binary: exit 1.) -/
 def noPanicDivComplexExpr : Module := {
   decls := [Decl.dmod "NP" [
     Decl.dopts ["no_panic"],
@@ -2751,8 +2836,117 @@ def noPanicDivComplexExpr : Module := {
         (Term.app (Term.var "+" divSp divIntTy)
           [Term.var "a" divSp divIntTy, Term.var "b" divSp divIntTy] divIntTy))]],
   schemes := [], insts := [], moduleCaps := [] }
-#eval checkCaps noPanicDivComplexExpr   -- expect: skip
-example : (checkCaps noPanicDivComplexExpr).isSkip = true := by native_decide
+#eval checkCaps noPanicDivComplexExpr   -- expect: violation
+example : (checkCaps noPanicDivComplexExpr).isViolation = true := by native_decide
+
+/-- A CALL result as divisor — `10 / g(x)` — is the same arm 4 shape reached
+through a non-operator callee. (march binary: exit 1.) -/
+def noPanicDivCallResult : Module := {
+  decls := [Decl.dmod "NP" [
+    Decl.dopts ["no_panic"],
+    Decl.dfn "f" [("x", Lin.unrestricted, some divIntTy)] none
+      (divTerm (Term.lit (Lit.int 10) divIntTy)
+        (Term.app (Term.var "g" divSp divIntTy)
+          [Term.var "x" divSp divIntTy] divIntTy))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps noPanicDivCallResult   -- expect: violation
+example : (checkCaps noPanicDivCallResult).isViolation = true := by native_decide
+
+/-- A NESTED arithmetic divisor — `100 / (a * (b + 1))`. (march: exit 1.) -/
+def noPanicDivNestedArith : Module := {
+  decls := [Decl.dmod "NP" [
+    Decl.dopts ["no_panic"],
+    Decl.dfn "f" [("a", Lin.unrestricted, some divIntTy),
+                  ("b", Lin.unrestricted, some divIntTy)] none
+      (divTerm (Term.lit (Lit.int 100) divIntTy)
+        (Term.app (Term.var "*" divSp divIntTy)
+          [Term.var "a" divSp divIntTy,
+           Term.app (Term.var "+" divSp divIntTy)
+             [Term.var "b" divSp divIntTy, Term.lit (Lit.int 1) divIntTy] divIntTy]
+          divIntTy))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps noPanicDivNestedArith   -- expect: violation
+example : (checkCaps noPanicDivNestedArith).isViolation = true := by native_decide
+
+/-- A genuine RECORD FIELD divisor — `if r.d != 0 do 10 / r.d else 0 end` — is
+a VIOLATION even though a guard of exactly this shape discharges a plain
+variable. `r.d`'s base is not a module path, so `Desugar`'s
+`flatten_module_path` leaves it an `EField`, which is march's arm 4 and never
+reaches `path_proves_nonzero` at all. Verified against the binary: exit 1,
+where the module-qualified twin below is exit 0. This pair is the whole
+correspondence argument in two fixtures. -/
+def noPanicDivGuardedRecordField : Module := {
+  decls := [Decl.dmod "NP" [
+    Decl.dopts ["no_panic"],
+    Decl.dfn "f" [("r", Lin.unrestricted, none)] none
+      (Term.ite
+        (Term.app (Term.var "!=" divSp divIntTy)
+          [Term.field (Term.var "r" divSp divIntTy) "d" divSp divIntTy,
+           Term.lit (Lit.int 0) divIntTy] divIntTy)
+        (divTerm (Term.lit (Lit.int 10) divIntTy)
+          (Term.field (Term.var "r" divSp divIntTy) "d" divSp divIntTy))
+        (Term.lit (Lit.int 0) divIntTy)
+        divIntTy)]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps noPanicDivGuardedRecordField   -- expect: violation
+example : (checkCaps noPanicDivGuardedRecordField).isViolation = true := by native_decide
+
+/-- The FALSE-REJECT guard for the tightening: a MODULE-QUALIFIED divisor
+`Consts.k` under `if Consts.k != 0`. march ACCEPTS this (verified: exit 0) —
+`Desugar`'s `EField` arm (`desugar.ml:677-697`) flattens the module path to a
+single `EVar {txt = "Consts.k"}` BEFORE `check_clause` runs, so march's arm 3
+sees a variable and `path_proves_nonzero` discharges it. We decode the very
+same node (`"kind":"EVar"`, `name.txt = "Consts.k"` — confirmed in the
+`--emit-core-ast` output for this program) to `Term.var "Consts.k"`, so
+`pathProvesNonzero` discharges it identically. If a future change ever
+classified a dotted name as "complex", this pin fails instead of the harness
+finding a false reject. -/
+def noPanicDivGuardedQualifiedVar : Module := {
+  decls := [Decl.dmod "NP" [
+    Decl.dopts ["no_panic"],
+    Decl.dfn "f" [] none
+      (Term.ite
+        (Term.app (Term.var "!=" divSp divIntTy)
+          [Term.var "Consts.k" divSp divIntTy, Term.lit (Lit.int 0) divIntTy] divIntTy)
+        (divTerm (Term.lit (Lit.int 10) divIntTy) (Term.var "Consts.k" divSp divIntTy))
+        (Term.lit (Lit.int 0) divIntTy)
+        divIntTy)]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps noPanicDivGuardedQualifiedVar   -- expect: ok
+example : (checkCaps noPanicDivGuardedQualifiedVar).isViolation = false := by native_decide
+example : (checkCaps noPanicDivGuardedQualifiedVar).isSkip = false := by native_decide
+
+/-- `Term.unsupported` as a divisor stays a SKIP, not a reject — the one shape
+held back from the tightening (`divisorVerdict`'s docstring: it is
+`decodeTerm`'s open catch-all for march `kind`s that may not exist yet). Such
+a body already reports `hasUnsupported`, so the file skips downstream anyway;
+what this pins is that `checkCaps` does not pre-empt that with a violation. -/
+def noPanicDivUnsupportedDivisorSkips : Module := {
+  decls := [Decl.dmod "NP" [
+    Decl.dopts ["no_panic"],
+    Decl.dfn "f" [] none
+      (divTerm (Term.lit (Lit.int 10) divIntTy) (Term.unsupported divIntTy))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps noPanicDivUnsupportedDivisorSkips   -- expect: skip
+example : (checkCaps noPanicDivUnsupportedDivisorSkips).isSkip = true := by native_decide
+
+/-- A division-operator NAME applied at an arity march's own guard
+(`[lhs; rhs]`) does not match is NOT a division site. Pins the arity-exact
+`args` match in `divisionVerdict`'s `.app` arm: with an `args[1]?` lookup the
+complex second argument here would now false-reject. -/
+def noPanicDivOpWrongArityIsNotADivSite : Module := {
+  decls := [Decl.dmod "NP" [
+    Decl.dopts ["no_panic"],
+    Decl.dfn "f" [("a", Lin.unrestricted, some divIntTy),
+                  ("b", Lin.unrestricted, some divIntTy)] none
+      (Term.app (Term.var "int_div" divSp divIntTy)
+        [Term.lit (Lit.int 10) divIntTy,
+         Term.app (Term.var "+" divSp divIntTy)
+           [Term.var "a" divSp divIntTy, Term.var "b" divSp divIntTy] divIntTy,
+         Term.lit (Lit.int 1) divIntTy] divIntTy)]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps noPanicDivOpWrongArityIsNotADivSite   -- expect: ok
+example : (checkCaps noPanicDivOpWrongArityIsNotADivSite).isViolation = false := by native_decide
 
 /-- `let d = a + b; 10 / d` → SKIP. march DOES track this `let` (its own
 `bind_let` records every rhs, not just literals) and hands the rhs to
