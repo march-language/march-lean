@@ -79,10 +79,13 @@ partial def uses (name : String) : Term → Nat
   -- linear enforcement must take the MAX over arms, not the sum (a linear var
   -- used once in each of N arms is valid, not N uses). An arm whose pattern
   -- SHADOWS `name` (binds it itself) contributes 0 — inner uses there belong
-  -- to the pattern's own binder, not this outer one.
+  -- to the pattern's own binder, not this outer one. A guard runs (and may use
+  -- `name`) whenever this arm is the one taken, exactly like the body, so it
+  -- is counted the same way (summed with the body's count, within this arm).
   | .match_ s arms _ =>
-      uses name s + (arms.map (fun (p, e) =>
-        if (Pattern.boundNames p).contains name then 0 else uses name e)).foldl Nat.max 0
+      uses name s + (arms.map (fun (p, g, e) =>
+        if (Pattern.boundNames p).contains name then 0
+        else uses name e + (g.map (uses name)).getD 0)).foldl Nat.max 0
   | .lit _ _ | .unsupported _ => 0
 
 /-- The outermost linearity qualifier a type carries (`Ty.lin l _`), else
@@ -135,8 +138,9 @@ partial def capturedInLam (name : String) : Term → Bool
   | .record fs _ => fs.any (fun (_, e) => capturedInLam name e)
   | .field r _ _ _ => capturedInLam name r
   | .match_ s arms _ =>
-      capturedInLam name s || arms.any (fun (p, e) =>
-        if (Pattern.boundNames p).contains name then false else capturedInLam name e)
+      capturedInLam name s || arms.any (fun (p, g, e) =>
+        if (Pattern.boundNames p).contains name then false
+        else capturedInLam name e || (g.map (capturedInLam name)).getD false)
   | .lit _ _ | .var _ _ _ | .unsupported _ => false
 
 /-- Enforce a binder's linearity given its use count. -/
@@ -188,7 +192,11 @@ partial def checkTerm : Term → CheckResult
   | .record fs _ => fs.foldl (fun acc (_, t) => match acc with | .ok => checkTerm t | o => o) .ok
   | .field r _ _ _ => checkTerm r
   | .match_ s arms _ => match checkTerm s with
-      | .ok => arms.foldl (fun acc (_, e) => match acc with | .ok => checkTerm e | o => o) .ok
+      | .ok => arms.foldl (fun acc (_, g, e) => match acc with
+          | .ok => (match g with
+              | some gt => (match checkTerm gt with | .ok => checkTerm e | o => o)
+              | none => checkTerm e)
+          | o => o) .ok
       | o => o
   | .lit _ _ | .var _ _ _ | .unsupported _ => .ok
 
@@ -245,8 +253,8 @@ def linNever : Module :=
 def linMatchBalanced : Module :=
   { decls := [Decl.dfn "f" [("x", Lin.linear, none)] none
       (Term.match_ (Term.lit (Lit.bool true) (Ty.con "Bool" []))
-        [(Pattern.wild, Term.var "x" ⟨"f",1,1,1,2⟩ (Ty.con "Int" [])),
-         (Pattern.wild, Term.var "x" ⟨"f",1,3,1,4⟩ (Ty.con "Int" []))]
+        [(Pattern.wild, none, Term.var "x" ⟨"f",1,1,1,2⟩ (Ty.con "Int" [])),
+         (Pattern.wild, none, Term.var "x" ⟨"f",1,3,1,4⟩ (Ty.con "Int" []))]
         (Ty.con "Int" []))],
     schemes := [], insts := [] }
 #eval (repr (checkLinearity linMatchBalanced)) -- expected: CheckResult.ok
@@ -260,7 +268,7 @@ def linMatchBalanced : Module :=
 def linMatchShadowed : Module :=
   { decls := [Decl.dfn "f" [("x", Lin.linear, none)] none
       (Term.match_ (Term.lit (Lit.int 0) (Ty.con "Int" []))
-        [(Pattern.var "x" Lin.unrestricted, Term.var "x" ⟨"f",1,1,1,2⟩ (Ty.con "Int" []))]
+        [(Pattern.var "x" Lin.unrestricted, none, Term.var "x" ⟨"f",1,1,1,2⟩ (Ty.con "Int" []))]
         (Ty.con "Int" []))],
     schemes := [], insts := [] }
 #eval (repr (checkLinearity linMatchShadowed)) -- expected: CheckResult.reject "linear 'x' used 0 times ..."

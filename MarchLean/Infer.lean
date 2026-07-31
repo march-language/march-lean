@@ -836,9 +836,24 @@ partial def infer (s : Supply) (ctx : Ctx) : Term → InferM MTy
   | .match_ scrut arms _ => do
       let scrutTy ← infer s ctx scrut
       let resTy ← freshMVar s ctx.level
-      for (pat, body) in arms do
+      -- The guard (`Option Term`, A3 slice (c) Task 3) is evaluated in the
+      -- pattern's own binder scope (`ctx'`, after `inferPattern`), and march
+      -- REJECTS a non-`Bool` guard (verified directly:
+      -- `reject/t10_guard_not_bool`'s `n when n + 1 -> ..` — "Match guards
+      -- must be Bool. March does not coerce Int to Bool."). Unifying it
+      -- against `Bool` here closes exactly that gap: without it, `t10` would
+      -- newly ACCEPT once guards decode instead of forcing a whole-file skip
+      -- (a live false accept this task's guard-decoding change would
+      -- otherwise introduce), since nothing else in this checker inspects
+      -- the guard's type.
+      for (pat, guard, body) in arms do
         let binds ← inferPattern s ctx pat scrutTy
         let ctx' := binds.foldl (fun c (n, m) => c.addMono n m) ctx
+        match guard with
+        | some g => do
+            let gt ← infer s ctx' g
+            unify s gt (.con "Bool" [])
+        | none => pure ()
         let bt ← infer s ctx' body
         unify s resTy bt
       pure resTy
@@ -893,6 +908,25 @@ def builtins (s : Supply) : InferM (List (String × EnvEntry)) := do
     mono "int_to_string" (arr i str), mono "float_to_string" (arr f str),
     mono "bool_to_string" (arr b str)
   ]
+
+-- A `builtinCtorSigs` registration for `Option`/`Result`/`List` (so a bare
+-- `Some`/`None`/`Ok`/`Err`/`Nil`/`Cons` resolves in `ctx.ctors` instead of
+-- throwing the `"SKIP: unknown constructor"` coverage-gap marker) was tried
+-- here and REVERTED (A3 slice (c) Task 3): it fixes `accept/t59`'s match, but
+-- it also makes `println(None)`/`println(to_string(None))`
+-- (`accept/t86_bare_none_unpinned`) reach unification against this checker's
+-- monomorphic `println : String → ()` signature (this checker does not model
+-- march's `Show` typeclass) — the None-as-Option now resolves, then fails to
+-- unify with `String`, turning `t86`'s pre-existing SKIP (unresolved `None`)
+-- into a live FALSE REJECT (march accepts `t86`; a `builtinCtorSigs`-carrying
+-- checker rejects it, verified directly). Since Task 3's own non-negotiable
+-- constraint is "no new false rejects", this checker keeps treating a match
+-- over `Option`/`Result`/`List` as an inference-level SKIP rather than
+-- resolving it — `accept/t59` (this task's own corpus target) stays exit 2
+-- (skip), not exit 0, as a result; see the task report for the full account.
+-- A real fix needs `println`/`print`/etc. modeled as polymorphic-over-`Show`
+-- (or some other coverage-gap-safe treatment of builtin-ADT term/pattern
+-- resolution), which is out of this task's scope.
 
 /-- Infer every declaration of a module, returning the `(span, MTy)` record
 for each `var`/`field` node (Task 6 diffs these against march's computed
@@ -1208,8 +1242,8 @@ infers to `Int`. -/
   let greenSig : CtorSig := { name := "Green", argTys := [], resultTy := .con "Color" [] }
   let ctx ← freshCtx s [("Red", redSig), ("Green", greenSig)]
   let m := Term.match_ (Term.con "Red" [] dTy)
-    [(Pattern.con "Red" [], Term.lit (.int 1) dTy),
-     (Pattern.con "Green" [], Term.lit (.int 2) dTy)] dTy
+    [(Pattern.con "Red" [], none, Term.lit (.int 1) dTy),
+     (Pattern.con "Green" [], none, Term.lit (.int 2) dTy)] dTy
   match ← (do let t ← infer s ctx m; zonk s t).run with
   | .ok (.con "Int" []) => IO.println "adt-match: true"
   | .ok _ => IO.println "adt-match-FAIL: wrong shape"
@@ -1224,7 +1258,7 @@ constructor's instantiated argument type). -/
   let boxSig : CtorSig := { name := "Box", argTys := [.var 0], resultTy := .con "Box" [.var 0] }
   let ctx ← freshCtx s [("Box", boxSig)]
   let m := Term.match_ (Term.con "Box" [Term.lit (.int 1) dTy] dTy)
-    [(Pattern.con "Box" [Pattern.var "n" .unrestricted], Term.var "n" dSpan dTy)] dTy
+    [(Pattern.con "Box" [Pattern.var "n" .unrestricted], none, Term.var "n" dSpan dTy)] dTy
   match ← (do let t ← infer s ctx m; zonk s t).run with
   | .ok (.con "Int" []) => IO.println "adt-bind: true"
   | .ok _ => IO.println "adt-bind-FAIL: wrong shape"

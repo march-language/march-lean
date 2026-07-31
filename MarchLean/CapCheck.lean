@@ -334,7 +334,13 @@ partial def bodyCalls (banned : List String) : Term → Bool
   | .tuple elems _ => elems.any (bodyCalls banned)
   | .record fields _ => fields.any (fun (_, e) => bodyCalls banned e)
   | .field record _ _ _ => bodyCalls banned record
-  | .match_ scrut arms _ => bodyCalls banned scrut || arms.any (fun (_, e) => bodyCalls banned e)
+  -- A guard (A3 slice (c) Task 3) is scanned too — march's `calls_in_expr`
+  -- (`typecheck.ml:6737-6768`) walks `branch_guard` alongside `branch_body`,
+  -- so a banned call hiding in `Some(v) when println("leak") | ... -> body`
+  -- must be found even though the guard, not the body, is where it lives.
+  | .match_ scrut arms _ =>
+      bodyCalls banned scrut ||
+        arms.any (fun (_, g, e) => (g.map (bodyCalls banned)).getD false || bodyCalls banned e)
   -- LOAD-BEARING: this arm is safe returning `false` (rather than `true`,
   -- which would be the conservative choice) ONLY because
   -- `MarchLeanCheck.lean`'s `run` invokes `CapCheck.checkCaps` BEFORE the
@@ -384,7 +390,9 @@ partial def bodyAllocates : Term → Bool
   | .tuple (_ :: _) _ => true      -- non-empty tuple always allocates
   | .record _ _ => true
   | .field record _ _ _ => bodyAllocates record
-  | .match_ scrut arms _ => bodyAllocates scrut || arms.any (fun (_, e) => bodyAllocates e)
+  | .match_ scrut arms _ =>
+      bodyAllocates scrut ||
+        arms.any (fun (_, g, e) => (g.map bodyAllocates).getD false || bodyAllocates e)
   | .unsupported _ => false
 
 /-- Division operators march's own division-safety pass flags
@@ -474,7 +482,9 @@ partial def termMentionsAny (names : List String) : Term → Bool
   | .tuple elems _ => elems.any (termMentionsAny names)
   | .record fields _ => fields.any (fun (_, e) => termMentionsAny names e)
   | .field record _ _ _ => termMentionsAny names record
-  | .match_ scrut arms _ => termMentionsAny names scrut || arms.any (fun (_, e) => termMentionsAny names e)
+  | .match_ scrut arms _ =>
+      termMentionsAny names scrut ||
+        arms.any (fun (_, g, e) => (g.map (termMentionsAny names)).getD false || termMentionsAny names e)
   | .unsupported _ => false
 
 /-- Drop every path entry whose condition mentions a name in `names` — march's
@@ -664,12 +674,134 @@ partial def divisionUnsafe (facts : DivFacts) (path : DivPath) : Term → Bool
   | .tuple elems _ => elems.any (divisionUnsafe facts path)
   | .record fields _ => fields.any (fun (_, e) => divisionUnsafe facts path e)
   | .field record _ _ _ => divisionUnsafe facts path record
+  -- A guard runs in the pattern's own binder scope (its names are already
+  -- bound by the time the guard is evaluated), so it is scanned with the SAME
+  -- retired facts/path as the body, not the outer ones.
   | .match_ scrut arms _ =>
       divisionUnsafe facts path scrut ||
-        arms.any (fun (p, e) =>
+        arms.any (fun (p, g, e) =>
           let names := patBinderNames p
-          divisionUnsafe (retireDivFacts names facts) (retireDivPath names path) e)
+          let facts' := retireDivFacts names facts
+          let path' := retireDivPath names path
+          (g.map (divisionUnsafe facts' path')).getD false || divisionUnsafe facts' path' e)
   | .unsupported _ => false
+
+/-- `no_panic`'s SECOND half (A3 slice (c) Task 3): a non-exhaustive `match`
+lowers to a runtime "no matching clause" panic (`tir/lower_state.ml:48`), so
+march's `check_no_panic_module` (`typecheck.ml:8879`) rejects any `match_`
+whose GUARDLESS arms alone are non-exhaustive — attributed by span-containment
+to the enclosing fn, recorded once by `check_exhaustiveness`
+(`typecheck.ml:4546`) and promoted to an error here. This checker instead
+walks each `dfn` body directly (`matchExhaustive` below, called from
+`checkOneModule`).
+
+Built-in ADT constructor sets, verbatim from march's `builtin_ctors`
+(`typecheck.ml:2551-2566`; `Bool` is not registered there — `Bool` matches
+lower to `if`, never a `match`). Each is registered under BOTH its bare name
+("Some") and its type-qualified alias ("Option.Some") — `bareCtorName` below
+normalises either spelling in a `Pattern.con` to the bare form before
+comparing against these lists, mirroring that dual registration. -/
+def builtinCtors : List (String × List String) :=
+  [ ("Option", ["Some", "None"]), ("Result", ["Ok", "Err"]), ("List", ["Nil", "Cons"]) ]
+
+/-- Strip a leading `Type.` qualifier from a constructor name (`"Option.Some"`
+→ `"Some"`), mirroring `builtin_ctors`' dual bare/qualified registration — a
+`Pattern.con` may spell either form and both must match the same ctor. Only
+the LAST dot-segment is kept; a name with no dot passes through unchanged. -/
+def bareCtorName (n : String) : String :=
+  match (n.splitOn ".").reverse with
+  | last :: _ => last
+  | [] => n
+
+/-- The head type-constructor name of a resolved `Ty`, peeling a `Ty.lin`
+wrapper first (a linear/affine-qualified scrutinee, e.g. `linear Option(Int)`,
+still names `Option`). `none` for anything that isn't headed by a `Ty.con` at
+all (a type variable, tuple, etc.) — such a scrutinee is never one of
+`builtinCtors`/a decoded `DType` anyway, so `matchExhaustive` treats it as
+unknown. -/
+def headTypeName : Ty → Option String
+  | .con name _ => some name
+  | .lin _ t => headTypeName t
+  | _ => none
+
+/-- Every `(type name, ctor names)` pair from every `Decl.dtype` reachable in
+`decls`, gathered across the WHOLE module tree (`flattenDecls`, not just this
+one module's own siblings) — a `match` inside a nested module may scrutinize a
+user ADT declared at an outer level or a sibling, and `matchExhaustive` needs
+that type's full ctor set regardless of which module declared it. -/
+def dtypeCtorSets (decls : List Decl) : List (String × List String) :=
+  (flattenDecls decls).filterMap (fun d => match d with
+    | .dtype name _ ctors => some (name, ctors.map (·.name))
+    | _ => none)
+
+/-- Is a `match_`'s arm list exhaustive over `scrutTy`, per march's
+`check_exhaustiveness` restricted to the guardless-coverage fragment it falls
+back to whenever any arm carries a `when` guard (`typecheck.ml:4546-4581`:
+"compute exhaustiveness over the guardless branches only")? A GUARDED arm's
+pattern contributes NOTHING to coverage — if every guard fails at runtime, a
+guarded-only match still falls through and panics — so only `guard = none`
+arms are ever consulted below, for both the wildcard/var catch-all shortcut
+and the constructor-set coverage test.
+
+- A guardless `Pattern.wild`/`Pattern.var` arm is a catch-all: exhaustive
+  regardless of the scrutinee type or any other arm.
+- Otherwise, collect the (bare-normalised) constructor names of every
+  guardless `Pattern.con` arm and test them against the scrutinee's full ctor
+  set — from `builtinCtors` by `scrutTy`'s head type name, or from
+  `userCtors` (a module tree's decoded `DType`s, see `dtypeCtorSets`) for a
+  user ADT. If the scrutinee's type resolves to NEITHER (unknown to this
+  checker entirely — no built-in, no decoded `DType`), the match is
+  conservatively treated as exhaustive: an unknown-type match is out of this
+  checker's fragment, and inventing a reject over it would be a false reject
+  this differential oracle must never manufacture (see the module docstring's
+  false-reject discipline). -/
+def matchExhaustive (scrutTy : Ty) (userCtors : List (String × List String))
+    (arms : List (Pattern × Option Term × Term)) : Bool :=
+  let isCatchAll : Pattern × Option Term × Term → Bool
+    | (.wild, none, _) | (.var _ _, none, _) => true
+    | _ => false
+  if arms.any isCatchAll then true
+  else
+    let covered : List String :=
+      arms.filterMap (fun (p, g, _) =>
+        if g.isSome then none
+        else match p with
+          | .con name _ => some (bareCtorName name)
+          | _ => none)
+    match headTypeName scrutTy with
+    | none => true
+    | some tyName =>
+        match (builtinCtors ++ userCtors).find? (fun (n, _) => n == tyName) with
+        | none => true
+        | some (_, ctors) => ctors.all covered.contains
+
+/-- Every `match_` node reachable anywhere inside `t` (not just at the top
+level of a body — a non-exhaustive match nested inside a `let`/tuple/another
+match's arm is exactly as much a runtime panic surface as a top-level one),
+paired with its scrutinee type and arm list, ready for `matchExhaustive`.
+Total over every `Term` constructor, matching `bodyCalls`/`bodyAllocates`'s
+exhaustiveness-of-the-walk-itself discipline. -/
+partial def matchesIn : Term → List (Ty × List (Pattern × Option Term × Term))
+  | .lit _ _ => []
+  | .var _ _ _ => []
+  | .app fn args _ => matchesIn fn ++ args.flatMap matchesIn
+  | .lam _ body _ => matchesIn body
+  | .let_ _ _ _ rhs body _ => matchesIn rhs ++ matchesIn body
+  | .letfn _ _ _ _ fnBody body _ => matchesIn fnBody ++ matchesIn body
+  | .ite c t e _ => matchesIn c ++ matchesIn t ++ matchesIn e
+  | .con _ args _ => args.flatMap matchesIn
+  | .tuple elems _ => elems.flatMap matchesIn
+  | .record fields _ => fields.flatMap (fun (_, e) => matchesIn e)
+  | .field record _ _ _ => matchesIn record
+  | .match_ scrut arms _ =>
+      (scrut.ty, arms) :: (matchesIn scrut ++ arms.flatMap (fun (_, g, e) =>
+        (g.map matchesIn).getD [] ++ matchesIn e))
+  | .unsupported _ => []
+
+/-- Does `t` (a function body) contain any non-exhaustive `match_` at all,
+anywhere within it? -/
+def bodyHasNonExhaustiveMatch (userCtors : List (String × List String)) (t : Term) : Bool :=
+  (matchesIn t).any (fun (scrutTy, arms) => !matchExhaustive scrutTy userCtors arms)
 
 /-- Is `used` covered by any declared need? Reflexive and directional. -/
 def covered (declared : List String) (used : String) : Bool :=
@@ -684,11 +816,16 @@ why this is passed in ONLY at the top-level call and always `[]` for a
 nested `dmod`. `inheritedCaps` is the subset of `inheritableBehavioralCaps`
 (below) an ENCLOSING module has declared or itself inherited — Finding I3;
 see this function's `pure`/`deterministic`/`no_extern`/`no_panic`-explicit-panic
-gates below for how it is combined with this module's own `opts`. -/
+gates below for how it is combined with this module's own `opts`. `userCtors`
+is every `DType` ctor set reachable in the WHOLE module tree (`dtypeCtorSets
+m.decls`, computed once in `checkCaps` and threaded unchanged through every
+recursive call — see that function and `checkDecls`), consulted by the
+`no_panic` exhaustiveness gate below for a user-ADT scrutinee. -/
 def checkOneModule (modName : String) (decls : List Decl)
     (moduleCaps : List (String × List String))
     (selfDeclaredCaps : List String := [])
-    (inheritedCaps : List String := []) : CapResult :=
+    (inheritedCaps : List String := [])
+    (userCtors : List (String × List String) := []) : CapResult :=
   let declared := declaredNeeds decls
   -- Check 1 — signature Cap(X) coverage over `param_tys @ ret_tys`
   -- (march's `check_module_needs`). Parameter caps are ALWAYS scanned.
@@ -977,6 +1114,19 @@ def checkOneModule (modName : String) (decls : List Decl)
   | some (name, _) =>
       .violation s!"cap no_panic: fn `{name}` in module `{modName}` may panic (explicit panic)"
   | none =>
+  -- `no_panic`, non-exhaustive-match half (A3 slice (c) Task 3;
+  -- `matchExhaustive`'s docstring has the full march citation). Lives in the
+  -- SAME march function (`check_no_panic_module`, called with the SAME
+  -- `inner_env`) as the explicit-panic scan just above, so it is INHERITED
+  -- exactly like that half — `effective`, not `opts` alone (contrast the
+  -- division-safety half right below, which is a genuinely separate march
+  -- pass, `refinecheck/division_safety.ml`, and does NOT inherit).
+  match if effective.contains "no_panic" then
+      dfns.find? (fun (_, body) => bodyHasNonExhaustiveMatch userCtors body)
+    else none with
+  | some (name, _) =>
+      .violation s!"cap no_panic: fn `{name}` in module `{modName}` has a non-exhaustive match"
+  | none =>
   -- `no_panic`, division-safety half (`refinecheck/division_safety.ml`, A3
   -- slice (c) Task 2b) — the literal-zero-with-shadowing-and-path-conditions
   -- fragment; see `divisionUnsafe`'s docstring for the solver-free scope
@@ -1033,21 +1183,28 @@ module's own `check_pure_module`/etc., so a module's own `cap pure` declared
 AFTER one of its own fns still governs that fn (verified: `mod P do fn f() :
 Int do println("x"); 1 end; cap pure end` REJECTS). `checkOneModule`'s own
 `opts` binding (order-insensitive flatMap over `decls`) already implements
-that half unchanged; only this positional fold changes here. -/
+that half unchanged; only this positional fold changes here.
+
+`userCtors` (every `DType` ctor set in the WHOLE module tree, computed once by
+`checkCaps`) is threaded through UNCHANGED at every level — unlike
+`inherited`, it is not positional or scoped: a `match` anywhere may scrutinize
+a user ADT declared anywhere else in the file, so every recursive
+`checkOneModule` call gets the same complete table. -/
 partial def checkDecls (moduleCaps : List (String × List String))
-    (inherited : List String) : List Decl → CapResult
+    (inherited : List String) (userCtors : List (String × List String)) :
+    List Decl → CapResult
   | [] => .ok
   | .dopts o :: rest =>
       let inherited' := (inherited ++ o).filter inheritableBehavioralCaps.contains
-      checkDecls moduleCaps inherited' rest
+      checkDecls moduleCaps inherited' userCtors rest
   | .dmod name inner :: rest =>
-      match checkOneModule name inner moduleCaps (inheritedCaps := inherited) with
+      match checkOneModule name inner moduleCaps (inheritedCaps := inherited) (userCtors := userCtors) with
       | .violation m => .violation m
       | .ok =>
-        match checkDecls moduleCaps inherited inner with   -- nested modules, same positional fold
+        match checkDecls moduleCaps inherited userCtors inner with   -- nested modules, same positional fold
         | .violation m => .violation m
-        | .ok => checkDecls moduleCaps inherited rest      -- siblings never see what `inner` declared
-  | _ :: rest => checkDecls moduleCaps inherited rest
+        | .ok => checkDecls moduleCaps inherited userCtors rest      -- siblings never see what `inner` declared
+  | _ :: rest => checkDecls moduleCaps inherited userCtors rest
 
 /-- Entry point. Also checks the top level as an implicit module, so a file
 with `needs`/`Cap(X)` outside any `mod` block is still checked.
@@ -1078,7 +1235,12 @@ module) and threaded only into the top-level `checkOneModule` call;
 def checkCaps (m : Module) : CapResult :=
   let selfDeclaredCaps :=
     (declaredProofCapNames m.decls).map (fun n => s!"{m.entryName}.{n}")
-  match checkOneModule "<top-level>" m.decls m.moduleCaps selfDeclaredCaps with
+  -- Every `DType` ctor set in the WHOLE file (A3 slice (c) Task 3), computed
+  -- once here and threaded UNCHANGED into both the top-level call and every
+  -- recursive `checkDecls`/`checkOneModule` call below — see `checkDecls`'s
+  -- docstring for why this table, unlike `inherited`, is not positional.
+  let userCtors := dtypeCtorSets m.decls
+  match checkOneModule "<top-level>" m.decls m.moduleCaps selfDeclaredCaps (userCtors := userCtors) with
   | .violation msg => .violation msg
   | .ok =>
     -- Finding I3: the top-level (entry) module is threaded through the SAME
@@ -1092,7 +1254,7 @@ def checkCaps (m : Module) : CapResult :=
     -- reaches it. Starting the fold at `[]` and letting `checkDecls` itself
     -- accumulate `Decl.dopts` as it walks `m.decls` in order gets this right
     -- without any whole-list pre-collection here.
-    checkDecls m.moduleCaps [] m.decls
+    checkDecls m.moduleCaps [] userCtors m.decls
 
 end MarchLean.CapCheck
 
@@ -1400,7 +1562,7 @@ def migrateDoesIONested : Module := {
     Decl.dfn "counter_migrate_state" [("old", Lin.unrestricted, some (Ty.con "Int" []))] none
       (Term.let_ "x" Lin.unrestricted none
         (Term.match_ (Term.var "old" ⟨"f",0,0,0,0⟩ (Ty.con "Int" []))
-          [(Pattern.wild,
+          [(Pattern.wild, none,
             Term.app (Term.var "println" ⟨"f",0,0,0,0⟩ (Ty.con "Unit" []))
                       [Term.lit (Lit.str "hi") (Ty.con "String" [])] (Ty.con "Unit" []))]
           (Ty.con "Unit" []))
@@ -2109,5 +2271,229 @@ def noPanicShadowInstallsZero : Module := {
   schemes := [], insts := [], moduleCaps := [] }
 #eval checkCaps noPanicShadowInstallsZero   -- expect: violation
 example : (checkCaps noPanicShadowInstallsZero).isViolation = true := by native_decide
+
+-- ---------------------------------------------------------------------
+-- A3 slice (c), Task 3: `no_panic`'s SECOND half — non-exhaustive matches.
+-- See `matchExhaustive`'s docstring for the full march citation
+-- (`typecheck.ml:4546-4581`, `check_exhaustiveness`'s guardless-only-coverage
+-- fallback for a guarded match; `typecheck.ml:8955-8971`,
+-- `check_no_panic_module`'s promotion of a recorded non-exhaustive span to an
+-- error). Every fixture below is a direct false-reject probe: this task has
+-- produced five false rejects already (see the module's `bodyCalls`
+-- docstring for the general discipline), so each shape march ACCEPTS is
+-- pinned here as `ok`, not just each shape it rejects.
+
+private def optionIntTy : Ty := Ty.con "Option" [Ty.con "Int" []]
+private def npSpan : Span := ⟨"f", 0, 0, 0, 0⟩
+
+/-- `reject/t48`-equivalent: `Some(x) -> x` alone — no `None`, no guard, no
+wildcard — is non-exhaustive → violation. -/
+def npNonExhaustive : Module := {
+  decls := [Decl.dmod "G" [
+  Decl.dopts ["no_panic"],
+  Decl.dfn "get" [("o", Lin.unrestricted, none)] none
+    (Term.match_ (Term.var "o" npSpan optionIntTy)
+      [(Pattern.con "Some" [Pattern.var "x" Lin.unrestricted], none,
+        Term.var "x" npSpan (Ty.con "Int" []))]
+      (Ty.con "Int" []))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps npNonExhaustive   -- expect: violation naming no_panic (non-exhaustive)
+example : (checkCaps npNonExhaustive).isViolation = true := by native_decide
+
+/-- `reject/t50`-equivalent: `Some(v) when v > 0 -> v | None -> 0` — the
+GUARDED `Some` does not count toward coverage, so only `None` is guardlessly
+covered → still non-exhaustive → violation. This is the shape that proves the
+guard field is load-bearing (see the report's teeth-check). -/
+def npGuardedNonExh : Module := {
+  decls := [Decl.dmod "G" [
+  Decl.dopts ["no_panic"],
+  Decl.dfn "classify" [("o", Lin.unrestricted, none)] none
+    (Term.match_ (Term.var "o" npSpan optionIntTy)
+      [(Pattern.con "Some" [Pattern.var "v" Lin.unrestricted],
+        some (Term.lit (Lit.bool true) (Ty.con "Bool" [])),
+        Term.var "v" npSpan (Ty.con "Int" [])),
+       (Pattern.con "None" [], none, Term.lit (Lit.int 0) (Ty.con "Int" []))]
+      (Ty.con "Int" []))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps npGuardedNonExh   -- expect: violation (guarded Some doesn't cover, None alone is non-exhaustive)
+example : (checkCaps npGuardedNonExh).isViolation = true := by native_decide
+
+/-- `accept/t59`-equivalent: same as `npGuardedNonExh`, plus a GUARDLESS
+`Some(v)` arm — now the guardless arms (`Some`, `None`) cover `Option`'s full
+ctor set → exhaustive → ok. -/
+def npGuardless : Module := {
+  decls := [Decl.dmod "G" [
+  Decl.dopts ["no_panic"],
+  Decl.dfn "classify" [("o", Lin.unrestricted, none)] none
+    (Term.match_ (Term.var "o" npSpan optionIntTy)
+      [(Pattern.con "Some" [Pattern.var "v" Lin.unrestricted],
+        some (Term.lit (Lit.bool true) (Ty.con "Bool" [])),
+        Term.var "v" npSpan (Ty.con "Int" [])),
+       (Pattern.con "Some" [Pattern.var "v" Lin.unrestricted], none,
+        Term.lit (Lit.int 0) (Ty.con "Int" [])),
+       (Pattern.con "None" [], none, Term.lit (Lit.int 0) (Ty.con "Int" []))]
+      (Ty.con "Int" []))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps npGuardless   -- expect: ok
+example : (checkCaps npGuardless).isViolation = false := by native_decide
+
+/-- False-reject probe 1: a guardless wildcard arm is a catch-all regardless
+of any other arm or the scrutinee type → ok. -/
+def npWildcard : Module := {
+  decls := [Decl.dmod "G" [
+  Decl.dopts ["no_panic"],
+  Decl.dfn "get" [("o", Lin.unrestricted, none)] none
+    (Term.match_ (Term.var "o" npSpan optionIntTy)
+      [(Pattern.con "Some" [Pattern.var "x" Lin.unrestricted], none,
+        Term.var "x" npSpan (Ty.con "Int" [])),
+       (Pattern.wild, none, Term.lit (Lit.int 0) (Ty.con "Int" []))]
+      (Ty.con "Int" []))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps npWildcard   -- expect: ok
+example : (checkCaps npWildcard).isViolation = false := by native_decide
+
+/-- False-reject probe 2: a fully-covered `Option` (`Some` AND `None`, no
+wildcard needed) → ok — ctor-set coverage alone is sufficient. -/
+def npFullyCoveredOption : Module := {
+  decls := [Decl.dmod "G" [
+  Decl.dopts ["no_panic"],
+  Decl.dfn "get" [("o", Lin.unrestricted, none)] none
+    (Term.match_ (Term.var "o" npSpan optionIntTy)
+      [(Pattern.con "Some" [Pattern.var "x" Lin.unrestricted], none,
+        Term.var "x" npSpan (Ty.con "Int" [])),
+       (Pattern.con "None" [], none, Term.lit (Lit.int 0) (Ty.con "Int" []))]
+      (Ty.con "Int" []))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps npFullyCoveredOption   -- expect: ok
+example : (checkCaps npFullyCoveredOption).isViolation = false := by native_decide
+
+/-- A user ADT `Color = Red | Green | Blue` (`Decl.dtype`), reused by the next
+two fixtures: one non-exhaustive (only `Red`/`Green` covered), one fully
+covered. -/
+def colorCtors : List CtorSig :=
+  [ { name := "Red", argTys := [], resultTy := Ty.con "Color" [] },
+    { name := "Green", argTys := [], resultTy := Ty.con "Color" [] },
+    { name := "Blue", argTys := [], resultTy := Ty.con "Color" [] } ]
+def colorDType : Decl := Decl.dtype "Color" [] colorCtors
+def colorTy : Ty := Ty.con "Color" []
+
+/-- False-reject probe 3 (negative half, must still REJECT): a user ADT match
+covering only 2 of 3 ctors, no wildcard → non-exhaustive → violation. Proves
+`userCtors` (from the decoded `DType`) actually drives coverage, not just the
+built-in table. -/
+def npUserAdtNonExhaustive : Module := {
+  decls := [
+  colorDType,
+  Decl.dmod "G" [
+    Decl.dopts ["no_panic"],
+    Decl.dfn "describe" [("c", Lin.unrestricted, none)] none
+      (Term.match_ (Term.var "c" npSpan colorTy)
+        [(Pattern.con "Red" [], none, Term.lit (Lit.int 0) (Ty.con "Int" [])),
+         (Pattern.con "Green" [], none, Term.lit (Lit.int 1) (Ty.con "Int" []))]
+        (Ty.con "Int" []))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps npUserAdtNonExhaustive   -- expect: violation naming no_panic (non-exhaustive)
+example : (checkCaps npUserAdtNonExhaustive).isViolation = true := by native_decide
+
+/-- False-reject probe 3 (positive half): the same user ADT, all 3 ctors
+guardlessly covered → ok. -/
+def npUserAdtFullyCovered : Module := {
+  decls := [
+  colorDType,
+  Decl.dmod "G" [
+    Decl.dopts ["no_panic"],
+    Decl.dfn "describe" [("c", Lin.unrestricted, none)] none
+      (Term.match_ (Term.var "c" npSpan colorTy)
+        [(Pattern.con "Red" [], none, Term.lit (Lit.int 0) (Ty.con "Int" [])),
+         (Pattern.con "Green" [], none, Term.lit (Lit.int 1) (Ty.con "Int" [])),
+         (Pattern.con "Blue" [], none, Term.lit (Lit.int 2) (Ty.con "Int" []))]
+        (Ty.con "Int" []))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps npUserAdtFullyCovered   -- expect: ok
+example : (checkCaps npUserAdtFullyCovered).isViolation = false := by native_decide
+
+/-- False-reject probe 4: a match on a scrutinee type this checker cannot
+resolve AT ALL — not `builtinCtors`, no decoded `DType` for it (no `Widget`
+`Decl.dtype` anywhere in this module) — with only a partial, non-wildcard arm
+list. Per `matchExhaustive`'s docstring, an unknown type is conservatively
+exhaustive: inventing a reject here would be a false reject on a program this
+checker cannot actually judge. -/
+def npUnknownScrutineeOk : Module := {
+  decls := [Decl.dmod "G" [
+  Decl.dopts ["no_panic"],
+  Decl.dfn "get" [("w", Lin.unrestricted, none)] none
+    (Term.match_ (Term.var "w" npSpan (Ty.con "Widget" []))
+      [(Pattern.con "Sprocket" [], none, Term.lit (Lit.int 0) (Ty.con "Int" []))]
+      (Ty.con "Int" []))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps npUnknownScrutineeOk   -- expect: ok
+example : (checkCaps npUnknownScrutineeOk).isViolation = false := by native_decide
+
+/-- False-reject probe 5: a guarded arm PLUS a guardless WILDCARD catch-all
+(distinct from `npGuardless`, whose guardless catch-all is a `Some(v)` ctor
+arm, not a wildcard) → ok regardless of the guarded arm's coverage. -/
+def npGuardedPlusGuardlessCatchAll : Module := {
+  decls := [Decl.dmod "G" [
+  Decl.dopts ["no_panic"],
+  Decl.dfn "classify" [("o", Lin.unrestricted, none)] none
+    (Term.match_ (Term.var "o" npSpan optionIntTy)
+      [(Pattern.con "Some" [Pattern.var "v" Lin.unrestricted],
+        some (Term.lit (Lit.bool true) (Ty.con "Bool" [])),
+        Term.var "v" npSpan (Ty.con "Int" [])),
+       (Pattern.wild, none, Term.lit (Lit.int 0) (Ty.con "Int" []))]
+      (Ty.con "Int" []))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps npGuardedPlusGuardlessCatchAll   -- expect: ok
+example : (checkCaps npGuardedPlusGuardlessCatchAll).isViolation = false := by native_decide
+
+/-- A non-exhaustive match NESTED inside a `let` (not the `dfn` body's own
+top-level node) is still found — `bodyHasNonExhaustiveMatch`'s `matchesIn`
+walk is total over every `Term` constructor, matching `bodyCalls`/
+`bodyAllocates`'s discipline, not just a top-level scan. -/
+def npNestedMatchNonExhaustive : Module := {
+  decls := [Decl.dmod "G" [
+  Decl.dopts ["no_panic"],
+  Decl.dfn "get" [("o", Lin.unrestricted, none)] none
+    (Term.let_ "_" Lin.unrestricted none
+      (Term.match_ (Term.var "o" npSpan optionIntTy)
+        [(Pattern.con "Some" [Pattern.var "x" Lin.unrestricted], none,
+          Term.var "x" npSpan (Ty.con "Int" []))]
+        (Ty.con "Int" []))
+      (Term.lit (Lit.int 0) (Ty.con "Int" []))
+      (Ty.con "Int" []))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps npNestedMatchNonExhaustive   -- expect: violation naming no_panic (non-exhaustive)
+example : (checkCaps npNestedMatchNonExhaustive).isViolation = true := by native_decide
+
+/-- Gating: the SAME non-exhaustive match, in a module WITHOUT `cap no_panic`
+at all, must NOT be flagged — mirrors `divUngatedWithoutCap`. -/
+def npNonExhaustiveUngated : Module := {
+  decls := [Decl.dmod "Plain" [
+  Decl.dfn "get" [("o", Lin.unrestricted, none)] none
+    (Term.match_ (Term.var "o" npSpan optionIntTy)
+      [(Pattern.con "Some" [Pattern.var "x" Lin.unrestricted], none,
+        Term.var "x" npSpan (Ty.con "Int" []))]
+      (Ty.con "Int" []))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps npNonExhaustiveUngated   -- expect: ok (no `cap no_panic`)
+example : (checkCaps npNonExhaustiveUngated).isViolation = false := by native_decide
+
+/-- Finding I3, exhaustiveness half: like `pureInheritedIntoNestedModule`,
+this half of `no_panic` lives in the SAME march function
+(`check_no_panic_module`) and the SAME `inner_env` as the explicit-panic
+scan, so it INHERITS into a nested `dmod` too. `Outer` declares `cap
+no_panic`; nested `Inner` (no cap of its own) has a non-exhaustive match. -/
+def npNonExhaustiveInheritedIntoNestedModule : Module := {
+  decls := [Decl.dmod "Outer" [
+  Decl.dopts ["no_panic"],
+  Decl.dmod "Inner" [
+    Decl.dfn "get" [("o", Lin.unrestricted, none)] none
+      (Term.match_ (Term.var "o" npSpan optionIntTy)
+        [(Pattern.con "Some" [Pattern.var "x" Lin.unrestricted], none,
+          Term.var "x" npSpan (Ty.con "Int" []))]
+        (Ty.con "Int" []))]]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps npNonExhaustiveInheritedIntoNestedModule   -- expect: violation naming no_panic
+example : (checkCaps npNonExhaustiveInheritedIntoNestedModule).isViolation = true := by native_decide
 
 end MarchLean.CapCheck

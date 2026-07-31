@@ -217,7 +217,7 @@ partial def termSpanTys (env : TyEnv) (isCallee : Bool) : Term → List (Span ×
       (if isCallee && !isArrowShaped env ty then [] else [(span, ty)]) ++ termSpanTys env false r
   | .match_ scrut arms _ =>
       termSpanTys env false scrut ++
-        (arms.map (fun (_, body) => termSpanTys env false body)).foldl (· ++ ·) []
+        (arms.map (fun (_, _, body) => termSpanTys env false body)).foldl (· ++ ·) []
   | .unsupported _ => []
 
 /-- `termSpanTys`, dispatched over one declaration (`dtype` carries no

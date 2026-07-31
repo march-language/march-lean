@@ -128,7 +128,13 @@ inductive Term where
   | tuple (elems : List Term) (ty : Ty)
   | record (fields : List (String × Term)) (ty : Ty)
   | field (record : Term) (name : String) (span : Span) (ty : Ty)
-  | match_ (scrut : Term) (arms : List (Pattern × Term)) (ty : Ty)
+  -- Each arm's middle field is its optional `when` guard (A3 slice (c) Task
+  -- 3) — `none` for a guardless arm, `some g` for `pat when g -> body`. A
+  -- guardless arm's pattern counts toward `no_panic`'s exhaustiveness
+  -- coverage (`CapCheck.matchExhaustive`); a guarded arm's does not, mirroring
+  -- march's `check_exhaustiveness` (`typecheck.ml:4546`), which computes
+  -- coverage over the GUARDLESS branches only.
+  | match_ (scrut : Term) (arms : List (Pattern × Option Term × Term)) (ty : Ty)
   | unsupported (ty : Ty)
   deriving Repr, Inhabited
 
@@ -161,7 +167,8 @@ partial def Term.hasUnsupported : Term → Bool
      | .tuple es _ => es.any Term.hasUnsupported
      | .record fs _ => fs.any (fun (_, e) => e.hasUnsupported)
      | .field r _ _ _ => r.hasUnsupported
-     | .match_ s arms _ => s.hasUnsupported || arms.any (fun (p, e) => p.hasUnsupported || e.hasUnsupported)
+     | .match_ s arms _ => s.hasUnsupported ||
+         arms.any (fun (p, g, e) => p.hasUnsupported || (g.map Term.hasUnsupported).getD false || e.hasUnsupported)
      | _ => false)
 
 /-- Datatype constructor signature (from a `DType` decl). -/
@@ -335,11 +342,11 @@ example : Ty.hasUnsupported (Ty.tuple [Ty.con "Int" [], Ty.err]) = true := by na
 private def intTy : Ty := Ty.con "Int" []
 private def dummySpan : Span := ⟨"f", 0, 0, 0, 0⟩
 private def okScrut : Term := Term.lit (Lit.int 0) intTy
-private def okArm : Pattern × Term := (Pattern.wild, Term.lit (Lit.int 1) intTy)
-private def badArm : Pattern × Term := (Pattern.unsupported, Term.lit (Lit.int 1) intTy)
+private def okArm : Pattern × Option Term × Term := (Pattern.wild, none, Term.lit (Lit.int 1) intTy)
+private def badArm : Pattern × Option Term × Term := (Pattern.unsupported, none, Term.lit (Lit.int 1) intTy)
 -- Nested inside a `con` pattern too, not just at the top level of the arm.
-private def badNestedArm : Pattern × Term :=
-  (Pattern.con "Some" [Pattern.unsupported], Term.lit (Lit.int 1) intTy)
+private def badNestedArm : Pattern × Option Term × Term :=
+  (Pattern.con "Some" [Pattern.unsupported], none, Term.lit (Lit.int 1) intTy)
 
 -- A match with only clean patterns/arms is in-fragment.
 example : Term.hasUnsupported (Term.match_ okScrut [okArm] intTy) = false := by native_decide

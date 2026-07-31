@@ -322,16 +322,11 @@ partial def decodeTerm (j : Json) : Except String Term := do
       let scrut ← decodeTerm (← field j "scrutinee")
       let branchesJ ← (← field j "branches").getArr?.mapError (fun _ => "branches")
       let arms ← branchesJ.toList.mapM (fun b => do
-        let guard ← field b "guard"
-        if !guard.isNull then
-          -- guarded arms aren't representable (`Term.match_`'s arms carry no
-          -- guard) — surface as an unsupported arm rather than silently
-          -- dropping the guard and risking a false accept.
-          pure (Pattern.unsupported, Term.unsupported Ty.unsupported)
-        else do
-          let p ← decodePattern (← field b "pattern")
-          let bodyTerm ← decodeTerm (← field b "body")
-          pure (p, bodyTerm))
+        let guardJ ← field b "guard"
+        let g ← if guardJ.isNull then pure none else (some <$> decodeTerm guardJ)
+        let p ← decodePattern (← field b "pattern")
+        let bodyTerm ← decodeTerm (← field b "body")
+        pure (p, g, bodyTerm))
       .ok (Term.match_ scrut arms ty)
   | "ETuple" =>
       let elemsJ ← (← field j "elements").getArr?.mapError (fun _ => "elements")
