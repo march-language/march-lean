@@ -738,33 +738,72 @@ def dtypeCtorSets (decls : List Decl) : List (String × List String) :=
     | .dtype name _ ctors => some (name, ctors.map (·.name))
     | _ => none)
 
-/-- Peel `Pattern.as` wrappers (recursively) to the pattern actually being
-matched — march's `norm_pat`: `| Ast.PatAs (p', _, _) -> norm_pat p'`
-(review finding C2). `Red as r` must be judged as `Red`; `x as y` (a bare
-variable rebound under another name) must be judged as the catch-all `x`
-would be. Total by construction (recurses only through `.as`; every other
-constructor is a base case). -/
-partial def peelAs : Pattern → Pattern
-  | .as _ p => peelAs p
-  | p => p
+/-- march's or-pattern enumeration cap, verbatim from `or_expansion_cap`
+(`typecheck.ml:3958`) — see `orExpansionSize`'s docstring for how it's used.
+Read from march's source, not guessed: hardcoding a *different* number here
+would silently misplace the accept/reject boundary relative to march's own. -/
+def orExpansionCap : Nat := 256
+
+/-- How many `spat` rows `p` would expand to under march's `norm_pat_all`,
+mirroring `or_expansion_size` (`typecheck.ml:3963-3974`) field-for-field:
+`or_` sums its alternatives' sizes, `con`/`tuple`/`record` multiply their
+sub-patterns' sizes (a nested or-pattern in a constructor argument or tuple
+element/record field is a cross-product, e.g. `C(a|b, a|b)` is 4 shapes, not
+2), and every other case (`wild`/`var`/`lit`/`unsupported`) is a single row.
+Saturates at `orExpansionCap + 1` at every fold step, exactly like march's
+`sat`, so a pathological pattern is capped instead of the `Nat` (or, in
+OCaml, the row list) growing without bound. -/
+partial def orExpansionSize : Pattern → Nat
+  | .or_ alts =>
+      let sat (n : Nat) := min n (orExpansionCap + 1)
+      sat (alts.foldl (fun acc a => sat (acc + orExpansionSize a)) 0)
+  | .as _ p => orExpansionSize p
+  | .con _ args =>
+      let sat (n : Nat) := min n (orExpansionCap + 1)
+      sat (args.foldl (fun acc a => sat (acc * orExpansionSize a)) 1)
+  | .tuple elems =>
+      let sat (n : Nat) := min n (orExpansionCap + 1)
+      sat (elems.foldl (fun acc a => sat (acc * orExpansionSize a)) 1)
+  | .record fields =>
+      let sat (n : Nat) := min n (orExpansionCap + 1)
+      sat (fields.foldl (fun acc (_, a) => sat (acc * orExpansionSize a)) 1)
+  | .wild | .var _ _ | .lit _ | .unsupported => 1
+
+/-- True when `p`'s or-expansion exceeds march's cap, mirroring
+`pat_or_expansion_capped` (`typecheck.ml:4007-4008`). Past this point march
+abandons per-row enumeration (`norm_pat_rows`, `typecheck.ml:4021-4022`) and
+falls back to the widening `norm_pat`, whose `PatOr` case is
+`| Ast.PatOr _ -> SPWild` (`typecheck.ml:3948`) — i.e. an over-cap or-pattern
+becomes a full catch-all row, unconditionally, not "enumerate what we can."
+`isCatchAllPattern` below applies this at every `or_` node it actually
+inspects (see FINDING B in the general-conservatism-rule paragraphs of
+`matchExhaustive`'s docstring for why this is the right place, not a
+recursive re-derivation of march's whole-arm cap check). -/
+def patOrExpansionCapped (p : Pattern) : Bool := orExpansionSize p > orExpansionCap
 
 /-- Is `p` a catch-all pattern for exhaustiveness purposes — `wild`/`var`
-directly, through any depth of `Pattern.as` (C2), OR an `or_` with ANY
-alternative that itself is a catch-all (review finding, regression fix)?
-march's `norm_pat_all` expands `PatOr` by concatenating every alternative's
-own normal-form rows (`| Ast.PatOr (alts, _) -> List.concat_map norm_pat_all
-alts`), and `PatWild` normalises to a single `SPWild` row
-(`| Ast.PatWild _ -> [SPWild]`); so an or-pattern with a wildcard/var
-alternative anywhere yields an `SPWild` row that alone covers the whole
-column, making the arm exhaustive regardless of its other alternatives. The
-widening fallback (`norm_pat`'s `| Ast.PatOr _ -> SPWild`) agrees. `Red | _`,
-`_ | Red`, and `Green | _` are therefore catch-alls; `Red | Green` (only
-constructor alternatives) is NOT — it falls through to `patCoveredCtors`
-below, contributing exactly its named constructors, not blanket coverage. -/
+directly, through any depth of `Pattern.as` (C2), an `or_` with ANY
+alternative that itself is a catch-all (review finding, regression fix), OR
+an `or_` whose or-expansion exceeds march's cap (Finding B, this commit —
+see `patOrExpansionCapped`)? march's `norm_pat_all` expands `PatOr` by
+concatenating every alternative's own normal-form rows (`| Ast.PatOr (alts,
+_) -> List.concat_map norm_pat_all alts`), and `PatWild` normalises to a
+single `SPWild` row (`| Ast.PatWild _ -> [SPWild]`); so an or-pattern with a
+wildcard/var alternative anywhere yields an `SPWild` row that alone covers
+the whole column, making the arm exhaustive regardless of its other
+alternatives. The widening fallback (`norm_pat`'s `| Ast.PatOr _ -> SPWild`)
+agrees, AND fires unconditionally once the cap is exceeded, independent of
+whether any alternative happens to be a wildcard — a 300-alternative
+`Red | Red | … | Red` or-pattern (no wildcard anywhere) is still a catch-all
+past the cap, because march stops enumerating its named constructors at all.
+`Red | _`, `_ | Red`, and `Green | _` are therefore catch-alls (regardless of
+size); `Red | Green` (only constructor alternatives, under the cap) is NOT —
+it falls through to `patCoveredCtors` below, contributing exactly its named
+constructors, not blanket coverage. -/
 partial def isCatchAllPattern : Pattern → Bool
   | .wild | .var _ _ => true
   | .as _ p => isCatchAllPattern p
-  | .or_ alts => alts.any isCatchAllPattern
+  | .or_ alts => alts.any isCatchAllPattern || patOrExpansionCapped (.or_ alts)
   | .con _ _ | .tuple _ | .lit _ | .record _ | .unsupported => false
 
 /-- Is `p` one of the pattern forms `matchExhaustive` actually models for
@@ -831,13 +870,17 @@ and the constructor-set coverage test.
   `type Result = Success(Int) | Failure(Int)` — must be judged against ITS
   OWN ctors, not `Result`'s built-in `{Ok, Err}`; see
   `accept/t82_local_type_exhaustive_shadows_stdlib_ctor`, which pins exactly
-  this restriction-to-the-declaring-module's-own-ctors behavior). If the
-  scrutinee's type resolves to NEITHER (unknown to this checker entirely — no
-  built-in, no decoded `DType`), the match is conservatively treated as
-  exhaustive: an unknown-type match is out of this checker's fragment, and
-  inventing a reject over it would be a false reject this differential oracle
-  must never manufacture (see the module docstring's false-reject
-  discipline).
+  this restriction-to-the-declaring-module's-own-ctors behavior) — BUT first,
+  if `userCtors` contains MORE THAN ONE entry for `scrutTy`'s head name
+  (FINDING A, this commit: two different modules each declaring their own
+  `type Color = …`), the type is treated as unresolvable and the match is
+  conservatively exhaustive — see the general-conservatism-rule paragraphs
+  below for why picking either one would be unsound. If the scrutinee's type
+  resolves to NEITHER (unknown to this checker entirely — no built-in, no
+  decoded `DType`), the match is conservatively treated as exhaustive: an
+  unknown-type match is out of this checker's fragment, and inventing a
+  reject over it would be a false reject this differential oracle must never
+  manufacture (see the module docstring's false-reject discipline).
 
 **Known shallowness (Finding I1, documented not fixed):** coverage above
 compares only TOP-LEVEL constructor names; a `Pattern.con`'s own argument
@@ -872,7 +915,76 @@ so the unknown-type carve-out's conservatism here produces a genuine
 divergence from march, not an out-of-fragment skip. Left unfixed
 deliberately: narrowing the unknown-type rule to close this gap risks
 reintroducing a false reject elsewhere (the exact failure mode C1/C2 already
-demonstrated), which this differential oracle must never manufacture. -/
+demonstrated), which this differential oracle must never manufacture.
+
+---
+
+**THE GENERAL CONSERVATISM RULE (review finding, this commit — read this
+before touching any input to the coverage test below):**
+
+march's actual exhaustiveness decision, `find_missing_mc`, takes THREE
+inputs: the arm patterns, the constructor universe to test them against, and
+the or-expansion policy that governs how a `PatOr` is normalized. This
+checker only ever sees the FIRST of those directly (the decoded `Pattern`
+tree); the other two it must *reconstruct* from a flattened, already-decoded
+tree with no access to march's `env` (module-scoped ctor resolution) or its
+row-budget accounting. The pattern-shape SAFETY NET a few paragraphs up
+protects only the first input — an arm pattern shape this checker doesn't
+model. It has NO purchase over the other two, because they are not shapes
+*within* the coverage test, they are INPUTS *to* it; an unmodelled pattern
+shape and a mis-reconstructed universe or policy are different failure
+classes that happen to demand the same remedy.
+
+The rule: **any input this checker reconstructs rather than genuinely
+models — now or later — MUST fail conservative.** On any doubt about what
+march would actually use, treat the match as exhaustive; never manufacture a
+reject from a guess. Concretely, as of this commit:
+
+- **Constructor universe** (FINDING A). `dtypeCtorSets` keys every
+  `Decl.dtype` reachable in the WHOLE flattened tree by BARE name, with no
+  notion of march's module-scoped resolution — `ctors_for_type`'s
+  `local_shadow` (`typecheck.ml:4027-4059`), which restricts the ctor
+  universe to the CURRENT module's own type when a same-named type is ALSO
+  declared elsewhere, using `ci_module` bookkeeping this checker has no
+  analogue of. Before this commit, `(userCtors ++ builtinCtors).find?`
+  silently took whichever `DType` came first in decl order — i.e. an
+  arbitrary pick with no relationship to march's actual, module-scoped
+  answer, and therefore a live false-reject site (order-dependent: swapping
+  two sibling modules' declaration order flipped the verdict). Fix: when
+  `scrutTy`'s head name matches MORE THAN ONE decoded `DType`, this checker
+  cannot tell which one march would pick, so it picks none — the type is
+  treated as unresolvable, i.e. exhaustive. This is deliberately NOT a full
+  `ci_module` model (that would be the faithful fix); it is the safe
+  under-approximation until one exists. The single-match case is unaffected
+  — `userCtors` is still consulted before `builtinCtors` there (C3).
+- **Or-expansion policy** (FINDING B). march abandons per-row or-pattern
+  enumeration past `or_expansion_cap = 256` rows (`typecheck.ml:3958`,
+  `orExpansionCap` above) and falls back to the widening `norm_pat`, whose
+  `PatOr` case is unconditionally `SPWild` (`typecheck.ml:3948`) — i.e. march
+  itself gives up and treats an over-cap or-pattern as a catch-all, full
+  stop, regardless of which constructors it names. Before this commit, this
+  checker enumerated every or-pattern unconditionally via `patCoveredCtors`
+  and contributed only its named constructors — correct under the cap, but a
+  false reject past it: a 300-alternative `Red | Red | … | Red` arm was
+  judged to cover only `Red` (march judges it a catch-all past the cap) and
+  the match was rejected as non-exhaustive on a type with `Green`/`Blue`
+  also present, though march accepts it. Fix: `orExpansionSize` mirrors
+  `or_expansion_size` field-for-field (including the cross-product over
+  `con`/`tuple`/`record` sub-patterns, not just top-level alternative
+  counting), and `isCatchAllPattern` treats an over-cap guardless `or_` as a
+  catch-all — NOT as "enumerate what we can, ignore the rest," which would
+  silently under-count coverage relative to what march actually decided and
+  manufacture the exact false reject above.
+
+A future contributor adding a THIRD reconstructed input to this function —
+or anyone touching the two above — must give it the same treatment: when
+this checker cannot be sure it has reconstructed march's answer correctly,
+default to exhaustive. A reconstructed input we are not certain of is
+exactly where this checker is most CONFIDENT and most likely WRONG; the
+safety net's "unmodelled pattern shape ⇒ exhaustive" rule cannot save you
+here, because there is no pattern shape to fail to recognize — the mistake
+would be baked into a `Bool`/`List` this function computed with complete
+confidence from an incomplete reconstruction. -/
 def matchExhaustive (scrutTy : Ty) (userCtors : List (String × List String))
     (arms : List (Pattern × Option Term × Term)) : Bool :=
   let isCatchAll : Pattern × Option Term × Term → Bool := fun (p, g, _) =>
@@ -885,9 +997,15 @@ def matchExhaustive (scrutTy : Ty) (userCtors : List (String × List String))
     match headTypeName scrutTy with
     | none => true
     | some tyName =>
-        match (userCtors ++ builtinCtors).find? (fun (n, _) => n == tyName) with
-        | none => true
-        | some (_, ctors) => ctors.all covered.contains
+        -- FINDING A: more than one decoded `DType` sharing this bare name
+        -- means we cannot reconstruct march's module-scoped pick — fail
+        -- conservative (exhaustive) rather than guess via decl order. See
+        -- the general-conservatism-rule paragraphs above.
+        if 1 < (userCtors.filter (fun (n, _) => n == tyName)).length then true
+        else
+          match (userCtors ++ builtinCtors).find? (fun (n, _) => n == tyName) with
+          | none => true
+          | some (_, ctors) => ctors.all covered.contains
 
 /-- Every `match_` node reachable anywhere inside `t` (not just at the top
 level of a body — a non-exhaustive match nested inside a `let`/tuple/another
@@ -2654,12 +2772,13 @@ def npOrPatternStillNonExhaustive : Module := {
 #eval checkCaps npOrPatternStillNonExhaustive   -- expect: violation naming no_panic (non-exhaustive)
 example : (checkCaps npOrPatternStillNonExhaustive).isViolation = true := by native_decide
 
-/-- C2: `Red as r -> 0; Green -> 1; Blue -> 2` — `peelAs` strips the `as`
-wrapper before the coverage test, so `Red as r` counts as covering `Red`
-exactly like a bare `Red` arm would → all 3 ctors covered → ok. Before the
-fix, `matchExhaustive` never peeled `Pattern.as`, so `Red as r`'s `.as`
-shape matched neither the catch-all test nor `Pattern.con`, contributing
-nothing to coverage — a false reject. -/
+/-- C2: `Red as r -> 0; Green -> 1; Blue -> 2` — `isCatchAllPattern`/
+`isModeledArmPattern`/`patCoveredCtors` each strip the `as` wrapper (via
+their own `.as` recursion) before the coverage test, so `Red as r` counts as
+covering `Red` exactly like a bare `Red` arm would → all 3 ctors covered →
+ok. Before the fix, `matchExhaustive` never peeled `Pattern.as`, so
+`Red as r`'s `.as` shape matched neither the catch-all test nor
+`Pattern.con`, contributing nothing to coverage — a false reject. -/
 def npAsPatternPeels : Module := {
   decls := [
   colorDType,
@@ -2834,5 +2953,155 @@ def npUnmodelledPatternSafetyNet : Module := {
   schemes := [], insts := [], moduleCaps := [] }
 #eval checkCaps npUnmodelledPatternSafetyNet   -- expect: ok
 example : (checkCaps npUnmodelledPatternSafetyNet).isViolation = false := by native_decide
+
+-- ---------------------------------------------------------------------
+-- FINDING A (this commit, general-conservatism-rule review): a same-named
+-- user type declared in TWO different modules is an ambiguous constructor
+-- universe this checker cannot resolve the way march's `ci_module`-scoped
+-- `local_shadow` does — see `matchExhaustive`'s docstring. Must be judged
+-- exhaustive, not arbitrarily against whichever `DType` decl-order put
+-- first.
+
+/-- A second, differently-shaped `Color` declared in a SIBLING module from
+`colorDType`'s (`Cyan`/`Magenta` instead of `Red`/`Green`/`Blue`). Together
+they make `dtypeCtorSets` report TWO entries keyed `"Color"`. -/
+def colorCtorsAmbiguous : List CtorSig :=
+  [ { name := "Cyan", argTys := [], resultTy := Ty.con "Color" [] },
+    { name := "Magenta", argTys := [], resultTy := Ty.con "Color" [] } ]
+def colorDTypeAmbiguous : Decl := Decl.dtype "Color" [] colorCtorsAmbiguous
+
+/-- Finding A: `mod A do type Color = Red|Green|Blue end; mod G do cap
+no_panic; type Color = Cyan|Magenta; fn describe(c : Color) : Int do match c
+do Cyan -> 0; Magenta -> 1 end end end` — `G`'s `Color` is fully covered by
+its OWN two ctors, but `dtypeCtorSets` sees `A`'s three-ctor `Color` too
+(same bare name, different module), so the universe is ambiguous → this
+checker cannot tell which one march would pick → conservatively exhaustive →
+ok. Before the fix, `(userCtors ++ builtinCtors).find?` took whichever
+`Color` decl came first (decl order, not module scoping) — order-dependent
+and a live false reject whenever `A`'s entry happened to land first. -/
+def npAmbiguousTypeNameAcrossSiblingModules : Module := {
+  decls := [
+  Decl.dmod "A" [colorDType],
+  Decl.dmod "G" [
+    Decl.dopts ["no_panic"],
+    colorDTypeAmbiguous,
+    Decl.dfn "describe" [("c", Lin.unrestricted, none)] none
+      (Term.match_ (Term.var "c" npSpan colorTy)
+        [(Pattern.con "Cyan" [], none, Term.lit (Lit.int 0) (Ty.con "Int" [])),
+         (Pattern.con "Magenta" [], none, Term.lit (Lit.int 1) (Ty.con "Int" []))]
+        (Ty.con "Int" []))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps npAmbiguousTypeNameAcrossSiblingModules   -- expect: ok
+example : (checkCaps npAmbiguousTypeNameAcrossSiblingModules).isViolation = false := by native_decide
+
+/-- Same ambiguity, module ORDER SWAPPED (`G` before `A`) — must give the
+SAME verdict (ok) as the fixture above, pinning that the fix isn't itself
+order-dependent (it treats "more than one match" as ambiguous regardless of
+which one `List.filter` would have found first). -/
+def npAmbiguousTypeNameAcrossSiblingModulesSwapped : Module := {
+  decls := [
+  Decl.dmod "G" [
+    Decl.dopts ["no_panic"],
+    colorDTypeAmbiguous,
+    Decl.dfn "describe" [("c", Lin.unrestricted, none)] none
+      (Term.match_ (Term.var "c" npSpan colorTy)
+        [(Pattern.con "Cyan" [], none, Term.lit (Lit.int 0) (Ty.con "Int" [])),
+         (Pattern.con "Magenta" [], none, Term.lit (Lit.int 1) (Ty.con "Int" []))]
+        (Ty.con "Int" []))],
+  Decl.dmod "A" [colorDType]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps npAmbiguousTypeNameAcrossSiblingModulesSwapped   -- expect: ok
+example : (checkCaps npAmbiguousTypeNameAcrossSiblingModulesSwapped).isViolation = false := by native_decide
+
+/-- Same ambiguity with the duplicate `Color` declared at the ENCLOSING
+level instead of a sibling module — `dtypeCtorSets` gathers `Decl.dtype`
+across the WHOLE flattened tree regardless of nesting depth, so an outer
+`Color` and `G`'s own `Color` collide exactly like two siblings' would. -/
+def npAmbiguousTypeNameEnclosingLevel : Module := {
+  decls := [
+  colorDType,
+  Decl.dmod "G" [
+    Decl.dopts ["no_panic"],
+    colorDTypeAmbiguous,
+    Decl.dfn "describe" [("c", Lin.unrestricted, none)] none
+      (Term.match_ (Term.var "c" npSpan colorTy)
+        [(Pattern.con "Cyan" [], none, Term.lit (Lit.int 0) (Ty.con "Int" [])),
+         (Pattern.con "Magenta" [], none, Term.lit (Lit.int 1) (Ty.con "Int" []))]
+        (Ty.con "Int" []))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps npAmbiguousTypeNameEnclosingLevel   -- expect: ok
+example : (checkCaps npAmbiguousTypeNameEnclosingLevel).isViolation = false := by native_decide
+
+/-- Negative half (must NOT over-apply the fix): a SINGLE `Color` declaration
+(`colorDType` alone, as `npUserAdtFullyCovered` already exercises) must not
+be treated as ambiguous just because the fix now filters `userCtors` by
+name — restated here for direct traceability next to Finding A's other
+fixtures. -/
+example : (checkCaps npUserAdtFullyCovered).isViolation = false := by native_decide
+
+/-- Negative half, C3 survival: `npUserResultShadowsBuiltin`'s user `Result`
+(single `Decl.dtype`, shadowing the BUILT-IN `Result`, not another user
+decl) must still resolve to the user's own ctors, not be treated as
+ambiguous — `userCtors` alone has exactly one `"Result"` entry; `builtinCtors`
+is a separate list never counted by the Finding A ambiguity filter. Restated
+here for direct traceability; the underlying fixture/proof already exists
+above. -/
+example : (checkCaps npUserResultShadowsBuiltin).isViolation = false := by native_decide
+
+-- ---------------------------------------------------------------------
+-- FINDING B (this commit, general-conservatism-rule review): march's
+-- `or_expansion_cap` (256 rows, `typecheck.ml:3958`) — past it, march
+-- abandons per-row enumeration and widens the whole or-pattern to a
+-- catch-all (`norm_pat`'s `PatOr -> SPWild`). This checker previously
+-- enumerated unconditionally, so an over-cap or-pattern naming only SOME
+-- of a type's constructors was judged non-exhaustive when march judges it
+-- a full catch-all — a false reject. See `orExpansionSize`/
+-- `patOrExpansionCapped`'s docstrings for the mirrored algorithm.
+
+/-- `n` copies of a guardless `Red` alternative, for building or-patterns at
+a specific or-expansion size (each `Pattern.con _ []` alternative has size 1,
+so `n` alternatives sums to exactly `n`). -/
+def manyRedAlts (n : Nat) : List Pattern := List.replicate n (Pattern.con "Red" [])
+
+/-- Finding B, boundary exceeded: a single arm `Red | Red | … | Red -> 0`
+with 300 alternatives (`orExpansionSize` sums to 300 > `orExpansionCap`
+256) over the 3-ctor `Color` type, no `Green`/`Blue` arm at all. Past the
+cap march treats the WHOLE or-pattern as a catch-all regardless of which
+(or how few distinct) constructors it names → exhaustive → ok. Before the
+fix, `patCoveredCtors` unconditionally contributed just `{Red}` and the
+match was rejected as missing `Green`/`Blue` — a false reject of code march
+accepts. -/
+def npOrPatternOverCapCatchAll : Module := {
+  decls := [
+  colorDType,
+  Decl.dmod "G" [
+    Decl.dopts ["no_panic"],
+    Decl.dfn "describe" [("c", Lin.unrestricted, none)] none
+      (Term.match_ (Term.var "c" npSpan colorTy)
+        [(Pattern.or_ (manyRedAlts 300), none, Term.lit (Lit.int 0) (Ty.con "Int" []))]
+        (Ty.con "Int" []))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps npOrPatternOverCapCatchAll   -- expect: ok
+example : (checkCaps npOrPatternOverCapCatchAll).isViolation = false := by native_decide
+
+/-- Finding B, boundary NOT exceeded (must NOT over-apply the fix): the
+identical shape with only 200 alternatives (`orExpansionSize` = 200 ≤ 256)
+— still strictly UNDER march's cap, so no widening happens on either side;
+`patCoveredCtors` still contributes only `{Red}`, `Green`/`Blue` remain
+uncovered → still non-exhaustive → violation. Pins the exact boundary: this
+fixture and the 300-alternative one above differ ONLY in count, and must
+give OPPOSITE verdicts. -/
+def npOrPatternUnderCapStillNonExhaustive : Module := {
+  decls := [
+  colorDType,
+  Decl.dmod "G" [
+    Decl.dopts ["no_panic"],
+    Decl.dfn "describe" [("c", Lin.unrestricted, none)] none
+      (Term.match_ (Term.var "c" npSpan colorTy)
+        [(Pattern.or_ (manyRedAlts 200), none, Term.lit (Lit.int 0) (Ty.con "Int" []))]
+        (Ty.con "Int" []))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps npOrPatternUnderCapStillNonExhaustive   -- expect: violation naming no_panic (non-exhaustive)
+example : (checkCaps npOrPatternUnderCapStillNonExhaustive).isViolation = true := by native_decide
 
 end MarchLean.CapCheck
