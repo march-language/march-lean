@@ -995,25 +995,58 @@ see `checkOneModule`'s docstring for the empirically-verified exception. -/
 def inheritableBehavioralCaps : List String := ["pure", "deterministic", "no_extern", "no_panic"]
 
 /-- Walk the whole module tree, checking each module against its own needs.
-`inherited` is the subset of `inheritableBehavioralCaps` accumulated from
-every ENCLOSING module (Finding I3) — `[]` at the top level (`checkCaps`
-below), and for a nested `dmod`, its own `opts` unioned into `inherited`
-before recursing into ITS children, so the inheritance is transitive: a
-grandchild sees a `cap pure` declared on its grandparent just as march's
-monotone env flag would. -/
+`inherited` is the subset of `inheritableBehavioralCaps` accumulated so far —
+`[]` at the top level (`checkCaps` below).
+
+**Inheritance into a nested `dmod` is POSITIONAL, not whole-list** (Finding
+I3, refined). march sets `pure_mod`/`deterministic_mod`/`no_extern_mod`/
+`no_panic_mod` on its `env` inside the SEQUENTIAL `check_decl` fold over a
+module's decl list (`typecheck.ml`, the `Ast.DOpts` arm, `:10182-10185`); a
+nested `Ast.DMod` is typechecked with whatever `env` that fold has reached AT
+THAT POINT (`:9336-9339` derives the child env from the CURRENT outer env,
+not from a pre-scan of the whole list). So a `cap` directive written AFTER a
+nested `mod` in the source does NOT reach that nested module — only caps
+declared BEFORE it do. Verified directly against `march`:
+`mod Outer do needs IO.Console; mod Inner do needs IO.Console; fn g(c :
+Cap(IO.Console)) : () do println("io") end end; cap pure; fn f() : Int do 1
+end end` — ACCEPTS (`cap pure` comes after `mod Inner`, so `Inner.g`'s
+`println` is never checked against it), even though the textually-identical
+shape with `cap pure` moved BEFORE `mod Inner` REJECTS. Same for `no_extern`
+and a nested `extern` block.
+
+This function therefore folds `decls` in order, threading `inherited`
+through EVERY decl (not just `dmod`s): a `Decl.dopts` adds its inheritable
+caps to the running accumulator for the REST of this same list; a
+`Decl.dmod` is checked, and its children recursed into, using only the
+accumulator value reached so far (ancestors' caps, plus this list's own
+`dopts` that appeared earlier) — never caps declared later in this list, and
+never anything discovered inside a sibling's subtree. This makes inheritance
+correctly transitive to a grandchild when positionally reachable, and keeps
+it from leaking into siblings, exactly mirroring march's single sequential
+fold.
+
+This positional threading applies ONLY to what a nested `dmod` inherits.
+Each module's OWN `dfn`s are still checked in `checkOneModule` against ALL of
+that module's own `Decl.dopts` regardless of where they sit in its decl list
+— march folds an ENTIRE module's decls (env included) before running that
+module's own `check_pure_module`/etc., so a module's own `cap pure` declared
+AFTER one of its own fns still governs that fn (verified: `mod P do fn f() :
+Int do println("x"); 1 end; cap pure end` REJECTS). `checkOneModule`'s own
+`opts` binding (order-insensitive flatMap over `decls`) already implements
+that half unchanged; only this positional fold changes here. -/
 partial def checkDecls (moduleCaps : List (String × List String))
     (inherited : List String) : List Decl → CapResult
   | [] => .ok
+  | .dopts o :: rest =>
+      let inherited' := (inherited ++ o).filter inheritableBehavioralCaps.contains
+      checkDecls moduleCaps inherited' rest
   | .dmod name inner :: rest =>
       match checkOneModule name inner moduleCaps (inheritedCaps := inherited) with
       | .violation m => .violation m
       | .ok =>
-        let ownOpts := inner.flatMap (fun d => match d with | .dopts o => o | _ => [])
-        let childInherited :=
-          (inherited ++ ownOpts).filter inheritableBehavioralCaps.contains
-        match checkDecls moduleCaps childInherited inner with   -- nested modules
+        match checkDecls moduleCaps inherited inner with   -- nested modules, same positional fold
         | .violation m => .violation m
-        | .ok => checkDecls moduleCaps inherited rest
+        | .ok => checkDecls moduleCaps inherited rest      -- siblings never see what `inner` declared
   | _ :: rest => checkDecls moduleCaps inherited rest
 
 /-- Entry point. Also checks the top level as an implicit module, so a file
@@ -1049,14 +1082,17 @@ def checkCaps (m : Module) : CapResult :=
   | .violation msg => .violation msg
   | .ok =>
     -- Finding I3: the top-level (entry) module is threaded through the SAME
-    -- env-based `check_decl` fold march uses for a nested `dmod`, so a
-    -- behavioral cap declared OUTSIDE any `mod` block (a top-level `Decl.dopts`
-    -- sibling in `m.decls`) inherits into a nested `mod` exactly like a
-    -- `cap pure` declared on any other enclosing module would — there is no
-    -- asymmetry here the way Finding I1's self-declaration exemption has one.
-    let topOpts := m.decls.flatMap (fun d => match d with | .dopts o => o | _ => [])
-    let topInherited := topOpts.filter inheritableBehavioralCaps.contains
-    checkDecls m.moduleCaps topInherited m.decls
+    -- env-based, SEQUENTIAL `check_decl` fold march uses for a nested `dmod`,
+    -- so a behavioral cap declared OUTSIDE any `mod` block (a top-level
+    -- `Decl.dopts` sibling in `m.decls`) inherits into a nested `mod` exactly
+    -- like a `cap pure` declared on any other enclosing module would — there
+    -- is no asymmetry here the way Finding I1's self-declaration exemption
+    -- has one. But per `checkDecls`'s docstring, that inheritance is
+    -- POSITIONAL: only a top-level `cap` written BEFORE a nested `mod`
+    -- reaches it. Starting the fold at `[]` and letting `checkDecls` itself
+    -- accumulate `Decl.dopts` as it walks `m.decls` in order gets this right
+    -- without any whole-list pre-collection here.
+    checkDecls m.moduleCaps [] m.decls
 
 end MarchLean.CapCheck
 
@@ -1730,6 +1766,69 @@ def noExternInheritedIntoNestedModule : Module := {
   schemes := [], insts := [], moduleCaps := [] }
 #eval checkCaps noExternInheritedIntoNestedModule   -- expect: violation naming `no_extern`
 example : (checkCaps noExternInheritedIntoNestedModule).isViolation = true := by native_decide
+
+-- ---------------------------------------------------------------------
+-- Positional refinement of Finding I3: march sets its inheritable-cap flags
+-- inside the SEQUENTIAL `check_decl` fold over a module's own decl list, so
+-- a `cap` written AFTER a nested `mod` does NOT reach it — only one written
+-- BEFORE it does. `checkDecls`'s docstring has the full march-side citation.
+
+/-- The false-REJECT reproducer this fix closes: `cap pure` sits AFTER the
+nested `Inner` module in `Outer`'s own decl list, so march's sequential fold
+has not set `pure_mod` yet when it typechecks `Inner` — march ACCEPTS
+(`Inner.g`'s `println` is never checked against `pure`), even though `Outer`
+itself does declare `cap pure` (which still governs `Outer`'s OWN fn `f`,
+checked separately below). A pre-collect-the-whole-list checker would
+wrongly reject this. -/
+def pureAfterNestedModuleNotInherited : Module := {
+  decls := [Decl.dmod "Outer" [
+    Decl.dneeds ["IO.Console"],
+    Decl.dmod "Inner" [
+      Decl.dneeds ["IO.Console"],
+      Decl.dfn "g" [("c", Lin.unrestricted, some (Ty.con "Cap" [Ty.con "IO.Console" []]))]
+        none
+        (Term.app (Term.var "println" ⟨"f",0,0,0,0⟩ (Ty.con "Unit" []))
+                  [Term.lit (Lit.str "io") (Ty.con "String" [])] (Ty.con "Unit" []))],
+    Decl.dopts ["pure"],
+    Decl.dfn "f" [] none (Term.lit (Lit.int 1) (Ty.con "Int" []))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps pureAfterNestedModuleNotInherited   -- expect: ok
+example : (checkCaps pureAfterNestedModuleNotInherited).isViolation = false := by native_decide
+
+/-- Same shape with `cap pure` moved BEFORE `mod Inner` (otherwise identical
+decl list) — now positionally reachable, so march REJECTS. Paired with
+`pureAfterNestedModuleNotInherited` above, this pins that inheritance is a
+function of SOURCE ORDER, not merely "declared somewhere in the parent". -/
+def pureBeforeNestedModuleInherited : Module := {
+  decls := [Decl.dmod "Outer" [
+    Decl.dneeds ["IO.Console"],
+    Decl.dopts ["pure"],
+    Decl.dmod "Inner" [
+      Decl.dneeds ["IO.Console"],
+      Decl.dfn "g" [("c", Lin.unrestricted, some (Ty.con "Cap" [Ty.con "IO.Console" []]))]
+        none
+        (Term.app (Term.var "println" ⟨"f",0,0,0,0⟩ (Ty.con "Unit" []))
+                  [Term.lit (Lit.str "io") (Ty.con "String" [])] (Ty.con "Unit" []))],
+    Decl.dfn "f" [] none (Term.lit (Lit.int 1) (Ty.con "Int" []))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps pureBeforeNestedModuleInherited   -- expect: violation naming `pure`
+example : (checkCaps pureBeforeNestedModuleInherited).isViolation = true := by native_decide
+
+/-- A module's OWN fns are still checked against ALL of its OWN `dopts`
+regardless of position — only the CHILD-inheritance path became positional
+above. `P`'s own fn `f` performs IO, and `cap pure` is declared AFTER `f` in
+`P`'s decl list; march still rejects, because march folds an entire module's
+own decls (env included) before running that module's own
+`check_pure_module`. -/
+def pureOwnFnOrderInsensitive : Module := {
+  decls := [Decl.dmod "P" [
+    Decl.dfn "f" [] none
+      (Term.app (Term.var "println" ⟨"f",0,0,0,0⟩ (Ty.con "Unit" []))
+                [Term.lit (Lit.str "x") (Ty.con "String" [])] (Ty.con "Unit" [])),
+    Decl.dopts ["pure"]]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps pureOwnFnOrderInsensitive   -- expect: violation naming `pure`
+example : (checkCaps pureOwnFnOrderInsensitive).isViolation = true := by native_decide
 
 /-- The exception, half 1: `no_alloc` does NOT inherit. `Outer` declares `cap
 no_alloc`; nested `Inner` (no cap of its own) allocates (a non-empty tuple).
