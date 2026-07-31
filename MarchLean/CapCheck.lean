@@ -295,17 +295,37 @@ hardcoded `ioBuiltins` as the banned set — `bodyCallsIO` below is now a thin
 specialisation (`bodyCalls ioBuiltins`) kept so Check 8's existing call site
 is unchanged.
 
-**This walk is DELIBERATELY MORE TOTAL than march's own `calls_in_expr`
-(`typecheck.ml:6737-6768`), and that is not a bug to fix here.** march's
-version ends in a catch-all `| _ -> acc` and has no `ETuple`/record/list arm,
-so a call nested inside a tuple/record/list literal is invisible to it. E.g.
-`(println("hi"), old)` as a migrate body: march's Check 8 ACCEPTS (the
-`println` inside the `ETuple` is never visited by `calls_in_expr`), while this
-checker's exhaustive walk correctly finds it and REJECTS. Do not narrow
-`bodyCalls` to match march's gap — that gap looks like a genuine march bug,
-and surfacing exactly this kind of divergence is what this oracle is for. A
-mismatch of this shape should be triaged as a **march finding**, not a
-checker regression.
+**This walk is DELIBERATELY MORE TOTAL than march's own `calls_in_expr`, and
+that is not a bug to fix here.** march has TWO copies of `calls_in_expr`
+(`typecheck.ml:6737-6768` and `typecheck.ml:~8834`); BOTH end in a catch-all
+`| _ -> acc` with no `ETuple`/record/list/lambda arm, so a call nested inside
+any of those is invisible to march. Filed upstream as **march#82** (see
+`specs/march-findings.md`).
+
+**SCOPE — this divergence affects FOUR checks, not just Check 8.** `bodyCalls`
+is the shared scan behind:
+  - Check 8 (migrate-state IO-freedom) — `bodyCallsIO`, via the first copy;
+  - `cap pure`, `cap deterministic`, and `cap no_panic`'s explicit-panic scan
+    — all via the second copy, which has the identical blind spot.
+An earlier revision of this docstring discussed the divergence as though it
+were Check-8-only. It is not, and that framing is exactly why the other three
+went unexamined until the slice (c) whole-branch review. Confirmed divergent
+shapes (march ACCEPTS, this checker REJECTS):
+  `(println("hi"), 1)` under `cap pure`,
+  `(unix_time(), 1)` under `cap deterministic`,
+  `(panic("boom"), 1)` under `cap no_panic`,
+  `(println("hi"), old)` as a migrate body under Check 8.
+
+**Deliberate policy (decided 2026-07-30):** keep this walk total and let the
+divergence stand. No corpus file currently exercises these shapes, so the
+harness is green today; if march ever adds one, CI goes RED and that red is
+the trigger to triage — NOT a signal that this checker regressed.
+
+**Therefore: do NOT "fix" a red of this shape by narrowing `bodyCalls`.**
+march is the side that is wrong here; the gap is a genuine march bug that
+this oracle already surfaced and reported. Triage it as a **march finding**.
+If march#82 is fixed upstream, this divergence disappears on its own and no
+change is needed here.
 
 **Remaining Check-8 fidelity gaps (tracked here, not fixed):**
 1. Direct-call only, as noted above — this scan does not follow
