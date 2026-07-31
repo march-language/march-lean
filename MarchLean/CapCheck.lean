@@ -748,6 +748,25 @@ partial def peelAs : Pattern → Pattern
   | .as _ p => peelAs p
   | p => p
 
+/-- Is `p` a catch-all pattern for exhaustiveness purposes — `wild`/`var`
+directly, through any depth of `Pattern.as` (C2), OR an `or_` with ANY
+alternative that itself is a catch-all (review finding, regression fix)?
+march's `norm_pat_all` expands `PatOr` by concatenating every alternative's
+own normal-form rows (`| Ast.PatOr (alts, _) -> List.concat_map norm_pat_all
+alts`), and `PatWild` normalises to a single `SPWild` row
+(`| Ast.PatWild _ -> [SPWild]`); so an or-pattern with a wildcard/var
+alternative anywhere yields an `SPWild` row that alone covers the whole
+column, making the arm exhaustive regardless of its other alternatives. The
+widening fallback (`norm_pat`'s `| Ast.PatOr _ -> SPWild`) agrees. `Red | _`,
+`_ | Red`, and `Green | _` are therefore catch-alls; `Red | Green` (only
+constructor alternatives) is NOT — it falls through to `patCoveredCtors`
+below, contributing exactly its named constructors, not blanket coverage. -/
+partial def isCatchAllPattern : Pattern → Bool
+  | .wild | .var _ _ => true
+  | .as _ p => isCatchAllPattern p
+  | .or_ alts => alts.any isCatchAllPattern
+  | .con _ _ | .tuple _ | .lit _ | .record _ | .unsupported => false
+
 /-- Is `p` one of the pattern forms `matchExhaustive` actually models for
 coverage purposes — `wild`/`var`/`con`/`as`/`or_`, recursively through `as`
 and `or_`'s own alternatives? `tuple`/`lit`/`record`/`unsupported` are NOT
@@ -783,10 +802,14 @@ guarded-only match still falls through and panics — so only `guard = none`
 arms are ever consulted below, for both the wildcard/var catch-all shortcut
 and the constructor-set coverage test.
 
-- A guardless arm whose pattern peels (through `Pattern.as`, `peelAs`) to
-  `Pattern.wild`/`Pattern.var` is a catch-all: exhaustive regardless of the
-  scrutinee type or any other arm (C2: `Red as r` binds, doesn't catch-all;
-  `x as y` does, because `x` alone would).
+- A guardless arm whose pattern is a catch-all per `isCatchAllPattern` —
+  `Pattern.wild`/`Pattern.var` directly, through any depth of `Pattern.as`
+  (C2: `Red as r` binds, doesn't catch-all; `x as y` does, because `x` alone
+  would), or an `or_` with ANY wild/var alternative (`Red | _`, `_ | Red`;
+  regression fix, mirrors `norm_pat_all`'s `PatOr`/`PatWild` handling) — is
+  exhaustive regardless of the scrutinee type or any other arm. An `or_` of
+  constructors only (`Red | Green`) is NOT a catch-all this way; it is judged
+  by `patCoveredCtors` below instead.
 - SAFETY NET (C1+C2, review finding): if any guardless arm's pattern is not
   one of the modeled forms `isModeledArmPattern` recognizes — i.e. it's (or
   recursively contains, through `as`/`or_`) an `unsupported`/`tuple`/`lit`/
@@ -833,11 +856,13 @@ out upstream.
 
 **Known false-accept class (Finding I2, documented not fixed):** a
 `Pattern.lit` arm list over a non-ADT scrutinee (`Int`/`String`/`Float`) has
-no built-in/user ctor set to test against at all — `headTypeName` resolves
-to e.g. `some "Int"`, which is in neither `builtinCtors` nor `userCtors` — so
-it falls into the unknown-type "conservatively exhaustive" branch above and
-this checker EXITS 0 on it. march, by contrast, DOES exhaustiveness-check
-literal patterns against a scrutinee's structure (`check_exhaustiveness`
+no built-in/user ctor set to test against at all — but that mismatch is never
+even reached: `Pattern.lit` is not one of `isModeledArmPattern`'s recognized
+forms, so the SAFETY NET above fires FIRST on the unmodelled `.lit` pattern
+and short-circuits to "exhaustive" before `headTypeName`/`scrutTy` are
+consulted at all — this checker EXITS 0 on it either way. march, by
+contrast, DOES exhaustiveness-check literal patterns against a scrutinee's
+structure (`check_exhaustiveness`
 handles `PatLit` rows) and rejects `match n do 0 -> 1; 1 -> 2 end` (no
 catch-all) as non-exhaustive. This is therefore a live false-accept class,
 not merely a "skip" as an earlier draft of this docstring implied — `Int`/
@@ -851,9 +876,7 @@ demonstrated), which this differential oracle must never manufacture. -/
 def matchExhaustive (scrutTy : Ty) (userCtors : List (String × List String))
     (arms : List (Pattern × Option Term × Term)) : Bool :=
   let isCatchAll : Pattern × Option Term × Term → Bool := fun (p, g, _) =>
-    g.isNone && match peelAs p with
-      | .wild | .var _ _ => true
-      | _ => false
+    g.isNone && isCatchAllPattern p
   if arms.any isCatchAll then true
   else if arms.any (fun (p, g, _) => g.isNone && !isModeledArmPattern p) then true
   else
@@ -2695,6 +2718,105 @@ def npUserResultShadowsBuiltin : Module := {
   schemes := [], insts := [], moduleCaps := [] }
 #eval checkCaps npUserResultShadowsBuiltin   -- expect: ok
 example : (checkCaps npUserResultShadowsBuiltin).isViolation = false := by native_decide
+
+-- ---------------------------------------------------------------------
+-- Regression fix: an or-pattern with a WILDCARD/VAR alternative
+-- (`Red | _`, `_ | Red`) is a catch-all — `isCatchAllPattern`. Before this
+-- fix, `isCatchAll` peeled only `Pattern.as` and never looked inside
+-- `Pattern.or_`, and `isModeledArmPattern` reported `.or_ [.con _, .wild]`
+-- as fully modeled (so the unmodelled-pattern safety net didn't fire
+-- either); the arm was then scored only by `patCoveredCtors`, where the
+-- `.wild` alternative contributes nothing to coverage — a false reject of
+-- code march accepts (worse than the C1/C2 false rejects this task's
+-- earlier fixes replaced, because these programs previously exited 2
+-- (skip) and now produced a live MISMATCH). See `isCatchAllPattern`'s
+-- docstring for the `norm_pat_all`/`norm_pat` citations.
+
+/-- `Red | _ -> 0` alone, no other arm: the `.wild` alternative makes the
+whole or-pattern a catch-all → exhaustive → ok, regardless of `Color` having
+3 ctors and only 1 named here. -/
+def npOrPatternWildAltCatchAll : Module := {
+  decls := [
+  colorDType,
+  Decl.dmod "G" [
+    Decl.dopts ["no_panic"],
+    Decl.dfn "describe" [("c", Lin.unrestricted, none)] none
+      (Term.match_ (Term.var "c" npSpan colorTy)
+        [(Pattern.or_ [Pattern.con "Red" [], Pattern.wild], none,
+          Term.lit (Lit.int 0) (Ty.con "Int" []))]
+        (Ty.con "Int" []))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps npOrPatternWildAltCatchAll   -- expect: ok
+example : (checkCaps npOrPatternWildAltCatchAll).isViolation = false := by native_decide
+
+/-- `_ | Red -> 0` — same as above with the wildcard alternative FIRST
+instead of last, pinning that `isCatchAllPattern`'s `alts.any` doesn't care
+about alternative order. -/
+def npOrPatternWildAltCatchAllLeading : Module := {
+  decls := [
+  colorDType,
+  Decl.dmod "G" [
+    Decl.dopts ["no_panic"],
+    Decl.dfn "describe" [("c", Lin.unrestricted, none)] none
+      (Term.match_ (Term.var "c" npSpan colorTy)
+        [(Pattern.or_ [Pattern.wild, Pattern.con "Red" []], none,
+          Term.lit (Lit.int 0) (Ty.con "Int" []))]
+        (Ty.con "Int" []))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps npOrPatternWildAltCatchAllLeading   -- expect: ok
+example : (checkCaps npOrPatternWildAltCatchAllLeading).isViolation = false := by native_decide
+
+/-- `Red -> 1; Green | _ -> 0` — the exact 3-arm shape from the regression
+report: a plain `Red` arm followed by an or-arm whose second alternative is
+`.wild`. The or-arm alone is a catch-all, so the whole match is exhaustive →
+ok, independent of the preceding `Red` arm. -/
+def npOrPatternWildAltAfterConstructorArm : Module := {
+  decls := [
+  colorDType,
+  Decl.dmod "G" [
+    Decl.dopts ["no_panic"],
+    Decl.dfn "describe" [("c", Lin.unrestricted, none)] none
+      (Term.match_ (Term.var "c" npSpan colorTy)
+        [(Pattern.con "Red" [], none, Term.lit (Lit.int 1) (Ty.con "Int" [])),
+         (Pattern.or_ [Pattern.con "Green" [], Pattern.wild], none,
+          Term.lit (Lit.int 0) (Ty.con "Int" []))]
+        (Ty.con "Int" []))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps npOrPatternWildAltAfterConstructorArm   -- expect: ok
+example : (checkCaps npOrPatternWildAltAfterConstructorArm).isViolation = false := by native_decide
+
+/-- Negative half (must NOT over-apply the fix): `Red | Green -> 0` alone,
+no `Blue` arm — an or-pattern of CONSTRUCTORS ONLY (no `.wild`/`.var`
+alternative) must still contribute exactly its named constructors via
+`patCoveredCtors`, not become a blanket catch-all. `Blue` is uncovered →
+non-exhaustive → violation. (This is the same fixture as
+`npOrPatternStillNonExhaustive` above, C1's negative half — restated here
+under the regression-fix section for direct traceability: `isCatchAllPattern
+(.or_ [.con "Red" [], .con "Green" []])` must be `false`.) -/
+example : (checkCaps npOrPatternStillNonExhaustive).isViolation = true := by native_decide
+
+/-- Negative half (guards still don't cover, even under an or-pattern):
+`Red | Green when b -> 0` (guarded) plus `Blue -> 1` (guardless) — the
+guarded or-arm contributes NOTHING to coverage (guard `g.isSome`, checked
+before `isCatchAllPattern`/`patCoveredCtors` are even consulted for that
+arm), so only `Blue` is guardlessly covered → `Red`/`Green` uncovered →
+non-exhaustive → violation. Proves the regression fix didn't accidentally
+let a guarded or-arm's wildcard alternative leak through the guard gate. -/
+def npOrPatternGuardedDoesNotCover : Module := {
+  decls := [
+  colorDType,
+  Decl.dmod "G" [
+    Decl.dopts ["no_panic"],
+    Decl.dfn "describe" [("c", Lin.unrestricted, none), ("b", Lin.unrestricted, none)] none
+      (Term.match_ (Term.var "c" npSpan colorTy)
+        [(Pattern.or_ [Pattern.con "Red" [], Pattern.con "Green" []],
+          some (Term.var "b" npSpan (Ty.con "Bool" [])),
+          Term.lit (Lit.int 0) (Ty.con "Int" [])),
+         (Pattern.con "Blue" [], none, Term.lit (Lit.int 1) (Ty.con "Int" []))]
+        (Ty.con "Int" []))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps npOrPatternGuardedDoesNotCover   -- expect: violation naming no_panic (non-exhaustive)
+example : (checkCaps npOrPatternGuardedDoesNotCover).isViolation = true := by native_decide
 
 /-- C1+C2 safety net: a guardless `Pattern.tuple` arm (unmodelled by
 `isModeledArmPattern`) is the ENTIRE arm list — no `Pattern.con`/wildcard at
