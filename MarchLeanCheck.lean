@@ -54,13 +54,25 @@ def run (input : String) : IO UInt32 := do
           -- still judgeable. Placing them after inference would forfeit
           -- exactly those files to the skip gate.
           --
-          -- Note this can only ever produce a REJECT. A clean cap check
-          -- never licenses an accept on its own: control falls through to
-          -- the unchanged skip-gate → inference → linearity → cross-check
+          -- Note this can only ever produce a REJECT or a SKIP. A clean cap
+          -- check never licenses an accept on its own: control falls through
+          -- to the unchanged skip-gate → inference → linearity → cross-check
           -- path below.
-          match MarchLean.CapCheck.checkCaps m with
+          --
+          -- `CapResult.skip` (today: a `cap no_panic` divisor whose
+          -- non-zeroness needs a refinement type or Z3 — see
+          -- `CapCheck.divisionVerdict`) is DEFERRED rather than returned
+          -- here. A file the cap layer cannot judge may still be rejected by
+          -- inference or linearity for an unrelated, fully-modelled reason,
+          -- and march would reject it too; returning exit 2 immediately would
+          -- forfeit those confirmations. So the skip is carried past both
+          -- passes and only becomes exit 2 once nothing else has rendered a
+          -- verdict — at which point it must beat the accept, since the
+          -- unjudged division is exactly what an accept would be claiming.
+          let capRes := MarchLean.CapCheck.checkCaps m
+          match capRes with
           | .violation msg => IO.eprintln s!"reject (capability): {msg}"; pure 1
-          | .ok =>
+          | _ =>
           let iv ← MarchLean.Compare.inferModule m
           match iv with
           | .skip r => IO.eprintln s!"skip: {r}"; pure 2
@@ -70,6 +82,9 @@ def run (input : String) : IO UInt32 := do
             | .skip r => IO.eprintln s!"skip: {r}"; pure 2
             | .reject r => IO.eprintln s!"reject (linearity): {r}"; pure 1
             | .ok =>
+              match capRes with
+              | .skip r => IO.eprintln s!"skip (capability): {r}"; pure 2
+              | _ =>
               match iv with
               | .typesDiffer r => IO.eprintln s!"accept, but types differ: {r}"; pure 4
               | _ => pure 0

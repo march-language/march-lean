@@ -24,10 +24,41 @@ namespace MarchLean.CapCheck
 open MarchLean.Syntax
 open MarchLean.CapLattice
 
+/-- The cap layer's verdict on a whole file.
+
+`skip` is NOT "ok" — it is the explicit "this checker cannot judge" answer,
+and it exists because march reaches some of its own capability decisions
+through machinery this solver-free oracle deliberately does not model (today:
+`refinecheck/division_safety.ml`'s refined-parameter and Z3 channels — see
+`divisionVerdict`'s docstring). A decision we RECONSTRUCT rather than model
+must fail toward "cannot judge", never toward a confident accept or reject;
+`ok` would be a false accept on a program march rejects, and `violation`
+would be a false reject on one march accepts. `MarchLeanCheck.run` maps it to
+exit 2, the same honest-skip channel the inference and linearity passes
+already use. -/
 inductive CapResult where
   | ok
   | violation (msg : String)
+  | skip (reason : String)
   deriving Repr, Inhabited
+
+/-- Combine two capability verdicts over disjoint parts of a file (two
+modules, or one module's own check and its children's).
+
+**A definite `violation` anywhere beats a `skip` anywhere**, and a `skip`
+beats `ok`. march reports every error it finds and rejects the file if ANY
+one of them fires, so a violation this checker is sure of stays a reject even
+when some other module carried an unjudgeable divisor; conversely a `skip`
+must not be swallowed by a sibling's clean `ok`, or the file would be
+reported as accepted on the strength of a part we never judged. Leftmost wins
+within a tier, so the reported message is the earliest one in decl order,
+matching the previous short-circuiting behaviour. -/
+def CapResult.andThen : CapResult → CapResult → CapResult
+  | .violation m, _ => .violation m
+  | _, .violation m => .violation m
+  | .skip r, _      => .skip r
+  | _, .skip r      => .skip r
+  | .ok, .ok        => .ok
 
 /-- Every capability named by a `Cap(X)` type anywhere inside a type.
 
@@ -407,18 +438,19 @@ def divOps : List String :=
 
 /-- Names currently known to be bound to a literal `Int` value, from an
 in-scope `let`. march's equivalent channel is `dctx.lets`
-(`division_safety.ml:167`); this checker models ONLY that channel — not the
-`path`/refined-parameter channels — as a plain association list keyed on the
-bare variable name (see `divisionUnsafe`'s docstring for why those other two
-channels are out of scope here). -/
+(`division_safety.ml:167`); this checker models this channel and the `path`
+channel (`DivPath` below), but NOT the refined-parameter channel, as a plain
+association list keyed on the bare variable name (see `divisionVerdict`'s
+docstring for why the refinement channel is out of scope, and why a divisor
+that would need it is a SKIP rather than an accept). -/
 abbrev DivFacts := List (String × Int)
 
 /-- Drop every fact about a name in `names`. march's `retire`
 (`division_safety.ml:173`) exists precisely so a rebinding of a name can never
 leave a STALE outer fact attributed to a fresh inner value — see
-`divisionUnsafe`'s docstring, and `reject/t123`'s own corpus comment, for the
+`divisionVerdict`'s docstring, and `reject/t123`'s own corpus comment, for the
 runtime panic this omission caused in practice. Every binding-introducing
-`Term` arm of `divisionUnsafe` calls this BEFORE extending the facts with
+`Term` arm of `divisionVerdict` calls this BEFORE extending the facts with
 anything the new binder itself provides. -/
 def retireDivFacts (names : List String) (facts : DivFacts) : DivFacts :=
   facts.filter (fun (n, _) => !names.contains n)
@@ -446,8 +478,12 @@ def intLitOf : Term → Option Int
 /-- The updated `DivFacts` after a `let name = rhs` binding: retire the old
 `name` entry, then record a fresh one when — and only when — `rhs` is itself a
 literal (march's `bind_let`, `division_safety.ml:183`). A non-literal `rhs`
-retires and offers nothing in exchange, the same "unresolved" fallback
-`divisorIsZero` treats as safe — never a false fact. -/
+retires and offers nothing in exchange, so a division by that name lands in
+`divisorVerdict`'s "no tracked literal" arm — `DivVerdict.unknown`, i.e. a
+SKIP, never a fabricated fact in either direction. (march's own `bind_let`
+records EVERY `rhs`, literal or not, because it can hand a non-literal to
+`smt_of` and Z3; this checker has no solver, so recording one would buy
+nothing.) -/
 def bindLetFacts (name : String) (rhs : Term) (facts : DivFacts) : DivFacts :=
   match intLitOf rhs with
   | some n => (name, n) :: retireDivFacts [name] facts
@@ -457,7 +493,7 @@ def bindLetFacts (name : String) (rhs : Term) (facts : DivFacts) : DivFacts :=
 (`division_safety.ml`'s `dctx.path : (A.expr * bool) list`). `negated = true`
 means we are on the ELSE side of the `if` that produced this entry, so the fact
 actually in scope is `not cond`, not `cond` itself. Populated by
-`divisionUnsafe`'s `.ite` arm (the then-branch pushes `(cond, false)`, the
+`divisionVerdict`'s `.ite` arm (the then-branch pushes `(cond, false)`, the
 else-branch pushes `(cond, true)`) and by its `.match_` arm (an arm's BODY is
 scanned with that arm's guard pushed as `(g, false)` — reaching the body means
 the guard evaluated true), mirroring march's `EIf` and `EMatch` arms in
@@ -491,7 +527,7 @@ partial def termMentionsAny (names : List String) : Term → Bool
   | .unsupported _ => false
 
 /-- Drop every path entry whose condition mentions a name in `names` — march's
-`path_shadow` (`refine_check.ml:1747`), called from `divisionUnsafe`'s binding
+`path_shadow` (`refine_check.ml:1747`), called from `divisionVerdict`'s binding
 arms alongside `retireDivFacts` so a rebinding retires BOTH channels: a guard
 about the outer `d` must not survive to describe an inner, rebound `d`. -/
 def retireDivPath (names : List String) (path : DivPath) : DivPath :=
@@ -563,43 +599,106 @@ def pathProvesNonzero (var : String) (path : DivPath) : Bool :=
             | some op' => proves op' n
     | _ => false)
 
-/-- Is `divisor` statically known to be zero? Resolves a bare `0` literal
-unconditionally, or a `var` — but for a `var`, march's `check_var_divisor`
-consults `path_proves_nonzero` FIRST (a guard proving the divisor non-zero
-wins outright, even over a stale-looking `let`-to-zero fact) and only falls
-back to the `DivFacts` (`let`-to-literal) lookup when the path is silent — see
-`divisionUnsafe`'s docstring for why this ordering matters (Finding C1). Any
-OTHER shape — an unresolved parameter with no proving guard, a non-linear or
-otherwise-complex expression, a variable with no tracked literal at all —
-answers `false`, DELIBERATELY: march's solver path (`division_safety.ml`'s
-`smt_of` / `Refine.discharge`, reflecting the divisor and any
-refined-parameter assumptions into a Z3 query) is OUT OF SCOPE here — this
-checker imports no SMT solver — and `false` here can only make this checker
-ACCEPT something march would reject via Z3, never the reverse. That is the
-safe direction for a differential oracle with no solver: an under-reject
-surfaces downstream as an ordinary MISMATCH to triage, never a silent wrong
-verdict stronger than what was actually checked. -/
-def divisorIsZero (facts : DivFacts) (path : DivPath) (divisor : Term) : Bool :=
+/-- What this checker can say about ONE division site, or about a whole body
+(the join of its sites). THREE-VALUED on purpose — see `divisorVerdict`.
+
+`safe`    = provably NOT a division by zero (march accepts, and so do we).
+`unknown` = march's answer depends on machinery this checker does not model
+            (a refinement type, or a Z3 discharge). Neither an accept nor a
+            reject may be manufactured from it: it becomes `CapResult.skip`.
+`divZero` = provably a division by zero (march rejects, and so do we). Named
+            `divZero` rather than the obvious `unsafe` only because `unsafe`
+            is a Lean declaration modifier and cannot name a constructor. -/
+inductive DivVerdict where
+  | safe
+  | unknown
+  | divZero
+  deriving DecidableEq, BEq, Repr, Inhabited
+
+/-- Join over sibling subterms / division sites: `divZero` (a definite reject
+march would report) dominates `unknown`, which dominates `safe`. A body with
+both a provable div-by-zero and an unresolvable divisor is a reject — march
+errors on the first one regardless of what it later decides about the
+second. -/
+def DivVerdict.join : DivVerdict → DivVerdict → DivVerdict
+  | .divZero, _   => .divZero
+  | _, .divZero   => .divZero
+  | .unknown, _  => .unknown
+  | _, .unknown  => .unknown
+  | .safe, .safe => .safe
+
+/-- Join a list of verdicts (`safe` for the empty list). -/
+def DivVerdict.joinAll (vs : List DivVerdict) : DivVerdict :=
+  vs.foldl DivVerdict.join .safe
+
+/-- This checker's verdict on ONE divisor expression — a faithful, SOLVER-FREE
+partition of `division_safety.ml`'s decision into the part we can settle and
+the part we cannot.
+
+march's policy is **reject-unless-proven-non-zero**, and the default fires
+with NO solver involved: `check_clause`'s callback (`:489-503`) errors on a
+literal `0` and on ANY non-`ELit`/non-`EVar` divisor, and `check_var_divisor`
+(`:345-478`) errors on a variable it cannot discharge. Only two of its arms
+can reach machinery this checker has no analogue of:
+
+* a divisor variable that IS an Int-**refined** parameter
+  (`clause_refined_params`) — `syntactic_nonzero` on the refinement, then a
+  `Refine.discharge` (Z3) query;
+* a divisor variable bound by a `let` to a NON-literal right-hand side —
+  reflected by `smt_of` and sent to Z3.
+
+So the three-way boundary is:
+
+* **`divZero`** — a literal `0` (`check_clause`'s first arm), or a `var` whose
+  tracked `let` value is literal `0` and whose path does not prove it
+  non-zero (`check_var_divisor`'s `Some (ELit (LitInt 0))` arm). Both are
+  unconditional `Err.error`s in march.
+* **`safe`** — a non-zero literal (`check_clause`'s second arm), a `var`
+  proven non-zero by the enclosing path (`path_proves_nonzero`, which march
+  consults on BOTH the refined and unrefined branch and which needs no
+  solver), or a `var` whose tracked `let` value is a non-zero literal
+  (`Some (ELit (LitInt _))` → `()`).
+* **`unknown`** — everything else: a bare parameter, a match/lambda binder, a
+  `let` bound to a non-literal, and any complex expression. march rejects
+  MOST of these outright, but this checker cannot tell them apart from the
+  refined-parameter and Z3 arms above without modelling refinement types and
+  an SMT solver, so it declines to judge. See `divisionVerdict`'s docstring
+  for why answering `safe` (the previous behaviour) or `divZero` are both
+  wrong.
+
+**Ordering matters and mirrors march exactly** (Finding C1): the path is
+consulted BEFORE the `DivFacts` (`let`-to-literal) lookup, so a guard proving
+the divisor non-zero wins outright even over a `let`-to-zero fact in the same
+scope. -/
+def divisorVerdict (facts : DivFacts) (path : DivPath) (divisor : Term) : DivVerdict :=
   match intLitOf divisor with
-  | some n => n == 0
+  | some n => if n == 0 then .divZero else .safe
   | none =>
     match divisor with
     | .var n _ _ =>
-        if pathProvesNonzero n path then false
+        if pathProvesNonzero n path then .safe
         else
           match facts.find? (fun (m, _) => m == n) with
-          | some (_, v) => v == 0
-          | none => false
-    | _ => false
+          | some (_, v) => if v == 0 then .divZero else .safe
+          -- A variable with no tracked literal: a parameter (refined or not),
+          -- a pattern/lambda binder, or a `let` to a non-literal. march
+          -- rejects all but the refined/Z3-discharged cases; we cannot tell
+          -- which this is.
+          | none => .unknown
+    -- A complex divisor expression. march's `check_clause` catch-all
+    -- (`division_safety.ml:498-503`) rejects it unconditionally, but this
+    -- checker sees a DECODED core AST, not march's own surface `A.expr`, so
+    -- "is this node an `EVar`?" is a shape judgement it reconstructs rather
+    -- than reads. Reconstructed ⇒ fail conservative ⇒ decline to judge.
+    | _ => .unknown
 
 /-- Division-safety scan for `cap no_panic` (`refinecheck/division_safety.ml`,
-A3 slice (c) Task 2b, path-conditions fix Finding C1) — the
-LITERAL-ZERO-WITH-SHADOWING-AND-PATH-CONDITIONS fragment, no SMT. Walks a
-`dfn` body threading a `DivFacts` (the `let`-to-literal map) AND a `DivPath`
-(the enclosing guard conditions, march's `dctx.path`), answering `true` the
-moment a division/modulo site's divisor (`divOps`, SECOND argument) is
-statically zero: a bare `0`, or a `var` whose tracked value is `0` and whose
-enclosing path does NOT prove it non-zero (`divisorIsZero`).
+A3 slice (c) Task 2b, path-conditions fix Finding C1, three-way boundary
+Finding 1) — the LITERAL-ZERO-WITH-SHADOWING-AND-PATH-CONDITIONS fragment, no
+SMT. Walks a `dfn` body threading a `DivFacts` (the `let`-to-literal map) AND
+a `DivPath` (the enclosing guard conditions, march's `dctx.path`), and JOINS
+(`DivVerdict.join`) `divisorVerdict`'s answer over every division/modulo site
+(`divOps`, divisor = SECOND argument) it reaches.
 
 **Shadowing is the entire point of this checker** — `reject/t123`'s corpus
 comment documents a real runtime panic (past `--check` with exit 0) from
@@ -621,8 +720,8 @@ fact before the inner zero fact is ever consulted.
 **Path-condition tracking (Finding C1).** march's `check_var_divisor`
 consults `path_proves_nonzero` BEFORE the `let`-value lookup — a guard proving
 the divisor non-zero wins outright, even when a `let` in the SAME scope (not
-retired by shadowing) would otherwise read as a zero fact. `divisorIsZero`
-mirrors that ordering exactly. `divisionUnsafe`'s `.ite` arm pushes `(cond,
+retired by shadowing) would otherwise read as a zero fact. `divisorVerdict`
+mirrors that ordering exactly. `divisionVerdict`'s `.ite` arm pushes `(cond,
 false)` onto the path for the then-branch and `(cond, true)` (negated) for the
 else-branch — march's `dctx.path` entries, with their `negated` flag, are
 built the exact same way. `pathProvesNonzero` (defined above) is march's own
@@ -636,47 +735,72 @@ that march itself accepts as proven non-zero (e.g. `let d = 0; if d != 0 do 10
 / d else 0 end`) — the worst class of divergence for a differential oracle,
 since it cries wolf on a program march accepts.
 
-**Out of scope, permanently, without a solver:** refined-parameter divisors
-(march's Int-refinement syntactic fast-path and Z3 discharge) and non-linear
-divisor expressions. Both fall through `divisorIsZero`'s catch-all — silently
-ACCEPTED here, exactly like every other unresolved divisor. A solver-only
-div-by-zero in an otherwise in-fragment module would surface as an ordinary
-MISMATCH against `march --check`'s exit 1 (see
-`.superpowers/sdd/2026-07-24-a3-slice-c-behavioral-caps/task-2b-div-safety.md`'s
-corpus table — `t120`/`t119`/`t121`/`t122` all stay downstream SKIPS for
-unrelated out-of-fragment reasons, so this particular gap has not yet been
-observed to surface on its own; if it ever does on a fully in-fragment file,
-that is a finding to TRIAGE, not a bug in this function). -/
-partial def divisionUnsafe (facts : DivFacts) (path : DivPath) : Term → Bool
-  | .lit _ _ => false
-  | .var _ _ _ => false
+**The unresolved-divisor case is a SKIP, not an accept (Finding 1).** This
+paragraph used to claim refined-parameter and complex divisors were "out of
+scope, permanently, without a solver" and that the gap "has not yet been
+observed to surface on its own". Both clauses were WRONG. march's division
+policy is REJECT-unless-proven-non-zero and its default fires with no solver
+at all — `check_clause`'s catch-all errors on every non-`ELit`/non-`EVar`
+divisor (`division_safety.ml:498-503`) and `check_var_divisor`'s `None` arm
+errors on a variable with neither a proving path nor a tracked `let` value
+(`:394-399`). Two plain, fully-in-fragment probes surface it directly:
+`fn f(d : Int) : Int do 10 / d end` and
+`fn f(a : Int, b : Int) : Int do 10 / (a + b) end`, both under `cap no_panic`
+— march rejects both, and this checker used to ACCEPT both.
+
+The fix is NOT to flip those to `violation`. march genuinely ACCEPTS a divisor
+whose non-zeroness comes from a refinement type
+(`fn f(d : {v : Int | v != 0}) : Int do 10 / d end`, verified against the
+binary) or from a Z3 discharge, and blanket-rejecting would trade a false
+accept for a FALSE REJECT — the worse error class for an oracle. Per the
+governing rule stated at length in `matchExhaustive`'s docstring — *any march
+decision this checker RECONSTRUCTS rather than models must fail conservative,
+toward "cannot judge"* — an unresolved divisor answers `DivVerdict.unknown`,
+which `checkOneModule` turns into `CapResult.skip` and `MarchLeanCheck` into
+exit 2. Provable zero still rejects, provable non-zero still accepts; only the
+middle changed, and it changed from a confident wrong answer to no answer.
+
+Consequence for the ledger: `scripts/expected-skips.txt` now gains every
+`cap no_panic` file whose divisor is a bare parameter, a pattern/lambda
+binder, a `let` to a non-literal, or any complex expression. That is the
+intended cost. Closing it properly needs refinement-type decoding plus an SMT
+solver; until then, tightening ONLY the complex-expression arm to `divZero`
+(march rejects it unconditionally) is defensible but was deliberately not
+taken here, because "is this decoded node what march's parser called an
+`EVar`?" is itself a reconstruction. -/
+partial def divisionVerdict (facts : DivFacts) (path : DivPath) : Term → DivVerdict
+  | .lit _ _ => .safe
+  | .var _ _ _ => .safe
   | .app fn args _ =>
-      let hereBad :=
+      let here :=
         match fn with
         | .var op _ _ =>
-            divOps.contains op &&
-              (match args[1]? with
-               | some divisor => divisorIsZero facts path divisor
-               | none => false)
-        | _ => false
-      hereBad || divisionUnsafe facts path fn || args.any (divisionUnsafe facts path)
+            if divOps.contains op then
+              match args[1]? with
+              | some divisor => divisorVerdict facts path divisor
+              | none => .safe
+            else .safe
+        | _ => .safe
+      DivVerdict.joinAll
+        (here :: divisionVerdict facts path fn :: args.map (divisionVerdict facts path))
   | .lam params body _ =>
       let names := params.map (·.1)
-      divisionUnsafe (retireDivFacts names facts) (retireDivPath names path) body
+      divisionVerdict (retireDivFacts names facts) (retireDivPath names path) body
   | .let_ name _ _ rhs body _ =>
-      divisionUnsafe facts path rhs ||
-        divisionUnsafe (bindLetFacts name rhs facts) (retireDivPath [name] path) body
+      (divisionVerdict facts path rhs).join
+        (divisionVerdict (bindLetFacts name rhs facts) (retireDivPath [name] path) body)
   | .letfn name param _ _ fnBody body _ =>
-      divisionUnsafe (retireDivFacts [name, param] facts) (retireDivPath [name, param] path) fnBody ||
-        divisionUnsafe (retireDivFacts [name] facts) (retireDivPath [name] path) body
+      (divisionVerdict (retireDivFacts [name, param] facts) (retireDivPath [name, param] path) fnBody).join
+        (divisionVerdict (retireDivFacts [name] facts) (retireDivPath [name] path) body)
   | .ite c t e _ =>
-      divisionUnsafe facts path c ||
-        divisionUnsafe facts ((c, false) :: path) t ||
-        divisionUnsafe facts ((c, true) :: path) e
-  | .con _ args _ => args.any (divisionUnsafe facts path)
-  | .tuple elems _ => elems.any (divisionUnsafe facts path)
-  | .record fields _ => fields.any (fun (_, e) => divisionUnsafe facts path e)
-  | .field record _ _ _ => divisionUnsafe facts path record
+      DivVerdict.joinAll
+        [ divisionVerdict facts path c
+        , divisionVerdict facts ((c, false) :: path) t
+        , divisionVerdict facts ((c, true) :: path) e ]
+  | .con _ args _ => DivVerdict.joinAll (args.map (divisionVerdict facts path))
+  | .tuple elems _ => DivVerdict.joinAll (elems.map (divisionVerdict facts path))
+  | .record fields _ => DivVerdict.joinAll (fields.map (fun (_, e) => divisionVerdict facts path e))
+  | .field record _ _ _ => divisionVerdict facts path record
   -- A guard runs in the pattern's own binder scope (its names are already
   -- bound by the time the guard is evaluated), so it is scanned with the SAME
   -- retired facts/path as the body, not the outer ones.
@@ -693,16 +817,17 @@ partial def divisionUnsafe (facts : DivFacts) (path : DivPath) : Term → Bool
   -- below pins it). Note the guard itself is still scanned WITHOUT its own
   -- condition on the path — a guard cannot assume itself.
   | .match_ scrut arms _ =>
-      divisionUnsafe facts path scrut ||
-        arms.any (fun (p, g, e) =>
+      (divisionVerdict facts path scrut).join
+        (DivVerdict.joinAll (arms.map (fun (p, g, e) =>
           let names := patBinderNames p
           let facts' := retireDivFacts names facts
           let path' := retireDivPath names path
           let bodyPath := match g with
             | some cond => (cond, false) :: path'
             | none      => path'
-          (g.map (divisionUnsafe facts' path')).getD false || divisionUnsafe facts' bodyPath e)
-  | .unsupported _ => false
+          ((g.map (divisionVerdict facts' path')).getD .safe).join
+            (divisionVerdict facts' bodyPath e))))
+  | .unsupported _ => .safe
 
 /-- `no_panic`'s SECOND half (A3 slice (c) Task 3): a non-exhaustive `match`
 lowers to a runtime "no matching clause" panic (`tir/lower_state.ml:48`), so
@@ -1344,7 +1469,7 @@ def checkOneModule (modName : String) (decls : List Decl)
   -- qualified calls are decoded, or `unwrap`/`head`/etc. become recognised
   -- builtins) WITHOUT this ban set being widened to match, a `cap no_panic`
   -- module calling one becomes a FALSE ACCEPT here (march rejects, this
-  -- checker doesn't) — the same shape of gap `divisionUnsafe`'s docstring
+  -- checker doesn't) — the same shape of gap `divisionVerdict`'s docstring
   -- documents for its own solver-free scope boundary. Do NOT close this by
   -- guessing at the missing 25 names without re-deriving them from march's
   -- live source, the way `builtinCaps` above was extracted.
@@ -1378,12 +1503,26 @@ def checkOneModule (modName : String) (decls : List Decl)
   | none =>
   -- `no_panic`, division-safety half (`refinecheck/division_safety.ml`, A3
   -- slice (c) Task 2b) — the literal-zero-with-shadowing-and-path-conditions
-  -- fragment; see `divisionUnsafe`'s docstring for the solver-free scope
-  -- boundary. NOT inherited (Finding I3's exception, same reasoning as
+  -- fragment; see `divisionVerdict`'s docstring for the three-way boundary
+  -- (Finding 1). NOT inherited (Finding I3's exception, same reasoning as
   -- `no_alloc` above) — `opts` alone, never `effective`.
-  match if opts.contains "no_panic" then dfns.find? (fun (_, body) => divisionUnsafe [] [] body) else none with
+  --
+  -- THREE-WAY, and the tiers are ordered: a fn with a PROVABLE div-by-zero
+  -- makes the whole module a violation even if another fn carries an
+  -- unresolvable divisor (march errors on the provable one regardless of what
+  -- it later decides about the other); only when no fn is provably unsafe does
+  -- an unresolvable divisor downgrade the module to `skip`.
+  let divVerdicts :=
+    if opts.contains "no_panic" then
+      dfns.map (fun (name, body) => (name, divisionVerdict [] [] body))
+    else []
+  match divVerdicts.find? (fun (_, v) => v == DivVerdict.divZero) with
   | some (name, _) =>
       .violation s!"cap no_panic: fn `{name}` in module `{modName}` may panic (division by zero literal)"
+  | none =>
+  match divVerdicts.find? (fun (_, v) => v == DivVerdict.unknown) with
+  | some (name, _) =>
+      .skip s!"cap no_panic: fn `{name}` in module `{modName}` divides by an expression this checker cannot resolve — march's policy is reject-unless-proven-non-zero, but a refinement type or a Z3 discharge may still prove it non-zero, so no verdict is rendered"
   | none => .ok
 
 /-- The behavioral caps march inherits down into a nested `dmod` (Finding
@@ -1447,12 +1586,12 @@ partial def checkDecls (moduleCaps : List (String × List String))
       let inherited' := (inherited ++ o).filter inheritableBehavioralCaps.contains
       checkDecls moduleCaps inherited' userCtors rest
   | .dmod name inner :: rest =>
-      match checkOneModule name inner moduleCaps (inheritedCaps := inherited) (userCtors := userCtors) with
-      | .violation m => .violation m
-      | .ok =>
-        match checkDecls moduleCaps inherited userCtors inner with   -- nested modules, same positional fold
-        | .violation m => .violation m
-        | .ok => checkDecls moduleCaps inherited userCtors rest      -- siblings never see what `inner` declared
+      -- `CapResult.andThen` keeps the old leftmost-violation behaviour while
+      -- letting a `skip` from ANY module survive a clean sibling — see its
+      -- docstring for the tier order (violation > skip > ok).
+      (checkOneModule name inner moduleCaps (inheritedCaps := inherited) (userCtors := userCtors)).andThen
+        ((checkDecls moduleCaps inherited userCtors inner).andThen   -- nested modules, same positional fold
+          (checkDecls moduleCaps inherited userCtors rest))          -- siblings never see what `inner` declared
   | _ :: rest => checkDecls moduleCaps inherited userCtors rest
 
 /-- Entry point. Also checks the top level as an implicit module, so a file
@@ -1489,9 +1628,7 @@ def checkCaps (m : Module) : CapResult :=
   -- recursive `checkDecls`/`checkOneModule` call below — see `checkDecls`'s
   -- docstring for why this table, unlike `inherited`, is not positional.
   let userCtors := dtypeCtorSets m.decls
-  match checkOneModule "<top-level>" m.decls m.moduleCaps selfDeclaredCaps (userCtors := userCtors) with
-  | .violation msg => .violation msg
-  | .ok =>
+  (checkOneModule "<top-level>" m.decls m.moduleCaps selfDeclaredCaps (userCtors := userCtors)).andThen
     -- Finding I3: the top-level (entry) module is threaded through the SAME
     -- env-based, SEQUENTIAL `check_decl` fold march uses for a nested `dmod`,
     -- so a behavioral cap declared OUTSIDE any `mod` block (a top-level
@@ -1503,7 +1640,7 @@ def checkCaps (m : Module) : CapResult :=
     -- reaches it. Starting the fold at `[]` and letting `checkDecls` itself
     -- accumulate `Decl.dopts` as it walks `m.decls` in order gets this right
     -- without any whole-list pre-collection here.
-    checkDecls m.moduleCaps [] userCtors m.decls
+    (checkDecls m.moduleCaps [] userCtors m.decls)
 
 end MarchLean.CapCheck
 
@@ -1583,6 +1720,17 @@ in `MarchLeanCheck.lean`, which already imports the decoder — this file's core
 stays independent of `Elab`.) -/
 def CapResult.isViolation : CapResult → Bool
   | .violation _ => true
+  | .skip _      => false
+  | .ok          => false
+
+/-- True iff a `CapResult` is the explicit "cannot judge" answer (exit 2).
+Distinct from `!isViolation`: a `skip` is NOT an accept, and the fixtures
+below that pin an unresolvable divisor need to say so positively — asserting
+only `isViolation = false` would pass just as well if the checker regressed
+to the old silent accept. -/
+def CapResult.isSkip : CapResult → Bool
+  | .skip _      => true
+  | .violation _ => false
   | .ok          => false
 
 /-- Finding M1 regression, direct unit (no decode): a fully-in-fragment module
@@ -2317,7 +2465,7 @@ def noPanicSafe : Module := {
 example : (checkCaps noPanicSafe).isViolation = false := by native_decide
 
 -- `no_panic`, division-safety half (A3 slice (c) Task 2b) — see
--- `divisionUnsafe`'s docstring for the literal-zero-with-shadowing scope.
+-- `divisionVerdict`'s docstring for the literal-zero-with-shadowing scope.
 def divIntTy : Ty := Ty.con "Int" []
 def divSp : Span := ⟨"f", 0, 0, 0, 0⟩
 
@@ -2396,7 +2544,7 @@ example : (checkCaps noPanicShadowedGuard).isViolation = true := by native_decid
 -- ---------------------------------------------------------------------
 -- Finding C1 pins: a `let`-bound literal-zero divisor guarded (NOT shadowed
 -- — the SAME `d` the guard is about) by a condition `pathProvesNonzero`
--- recognises must be `ok`, not a violation. Prior to this fix, `divisorIsZero`
+-- recognises must be `ok`, not a violation. Prior to this fix, `divisorVerdict`
 -- consulted ONLY `DivFacts` and had no path channel at all, so all three of
 -- these false-rejected (checker exit 1, march exit 0) — the worst class of
 -- divergence for a differential oracle. Each mirrors one of march's
@@ -2544,17 +2692,146 @@ def noPanicDivLetNonZero : Module := {
 #eval checkCaps noPanicDivLetNonZero   -- expect: ok
 example : (checkCaps noPanicDivLetNonZero).isViolation = false := by native_decide
 
-/-- `10 / d` where `d` is an unresolved parameter → ok (proving this needs a
-solver, which this checker deliberately does not have — see
-`divisorIsZero`'s docstring). -/
+-- ---------------------------------------------------------------------
+-- Review Finding 1 pins: an UNRESOLVED divisor is a SKIP — not an accept
+-- (which it silently was, a live FALSE ACCEPT on two plain in-fragment
+-- programs) and not a reject (which would be a FALSE REJECT on the
+-- refinement-typed programs march genuinely accepts). See
+-- `divisorVerdict`/`divisionVerdict`'s docstrings. Verified against the
+-- march binary for every shape below.
+
+/-- `fn f(d : Int) : Int do 10 / d end` under `cap no_panic` → SKIP. march
+REJECTS this (`check_var_divisor`'s `None` arm, `division_safety.ml:394-399`,
+no solver involved) — but this checker cannot see whether `d` carries an Int
+refinement, and `fn f(d : {v : Int | v != 0}) : Int do 10 / d end` is
+textually the same division in a file march ACCEPTS (both verified against
+the binary). So it declines to judge. Asserted with `isSkip`, not merely
+`isViolation = false`, so a regression to the old silent accept fails here. -/
 def noPanicDivUnresolvedParam : Module := {
   decls := [Decl.dmod "NP" [
     Decl.dopts ["no_panic"],
     Decl.dfn "f" [("d", Lin.unrestricted, some divIntTy)] none
       (divTerm (Term.lit (Lit.int 10) divIntTy) (Term.var "d" divSp divIntTy))]],
   schemes := [], insts := [], moduleCaps := [] }
-#eval checkCaps noPanicDivUnresolvedParam   -- expect: ok
-example : (checkCaps noPanicDivUnresolvedParam).isViolation = false := by native_decide
+#eval checkCaps noPanicDivUnresolvedParam   -- expect: skip
+example : (checkCaps noPanicDivUnresolvedParam).isSkip = true := by native_decide
+
+/-- `fn f(a : Int, b : Int) : Int do 10 / (a + b) end` under `cap no_panic` →
+SKIP. march rejects a complex divisor unconditionally (`check_clause`'s
+catch-all, `division_safety.ml:498-503`), so this one COULD in principle be
+tightened to a violation; it is not, because "is this decoded node what
+march's parser called an `EVar`?" is a reconstruction, and the governing rule
+(`matchExhaustive`'s docstring) says a reconstruction fails conservative. -/
+def noPanicDivComplexExpr : Module := {
+  decls := [Decl.dmod "NP" [
+    Decl.dopts ["no_panic"],
+    Decl.dfn "f" [("a", Lin.unrestricted, some divIntTy),
+                  ("b", Lin.unrestricted, some divIntTy)] none
+      (divTerm (Term.lit (Lit.int 10) divIntTy)
+        (Term.app (Term.var "+" divSp divIntTy)
+          [Term.var "a" divSp divIntTy, Term.var "b" divSp divIntTy] divIntTy))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps noPanicDivComplexExpr   -- expect: skip
+example : (checkCaps noPanicDivComplexExpr).isSkip = true := by native_decide
+
+/-- `let d = a + b; 10 / d` → SKIP. march DOES track this `let` (its own
+`bind_let` records every rhs, not just literals) and hands the rhs to
+`smt_of`/Z3 — the one arm where a `let`-bound divisor can still be
+discharged. No solver here, so no verdict. -/
+def noPanicDivLetNonLiteral : Module := {
+  decls := [Decl.dmod "NP" [
+    Decl.dopts ["no_panic"],
+    Decl.dfn "f" [("a", Lin.unrestricted, some divIntTy),
+                  ("b", Lin.unrestricted, some divIntTy)] none
+      (Term.let_ "d" Lin.unrestricted none
+        (Term.app (Term.var "+" divSp divIntTy)
+          [Term.var "a" divSp divIntTy, Term.var "b" divSp divIntTy] divIntTy)
+        (divTerm (Term.lit (Lit.int 10) divIntTy) (Term.var "d" divSp divIntTy))
+        divIntTy)]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps noPanicDivLetNonLiteral   -- expect: skip
+example : (checkCaps noPanicDivLetNonLiteral).isSkip = true := by native_decide
+
+/-- Tier order inside one module: a fn with a PROVABLE `10 / 0` and another
+fn with an unresolvable divisor is a VIOLATION, not a skip. march errors on
+the provable site regardless of what it decides about the other, so the
+definite verdict must win (`checkOneModule`'s two-pass `divVerdicts` scan). -/
+def noPanicDivProvableBeatsUnknown : Module := {
+  decls := [Decl.dmod "NP" [
+    Decl.dopts ["no_panic"],
+    Decl.dfn "g" [("d", Lin.unrestricted, some divIntTy)] none
+      (divTerm (Term.lit (Lit.int 10) divIntTy) (Term.var "d" divSp divIntTy)),
+    Decl.dfn "f" [] none
+      (divTerm (Term.lit (Lit.int 10) divIntTy) (Term.lit (Lit.int 0) divIntTy))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps noPanicDivProvableBeatsUnknown   -- expect: violation
+example : (checkCaps noPanicDivProvableBeatsUnknown).isViolation = true := by native_decide
+
+/-- Tier order ACROSS modules (`CapResult.andThen`): a skip in the FIRST
+module must not swallow a definite violation in a later sibling — the file is
+still a reject. This is the direction a naive early-return on the first
+non-`ok` result would get wrong. -/
+def noPanicDivSkipDoesNotMaskSibling : Module := {
+  decls := [
+    Decl.dmod "A" [
+      Decl.dopts ["no_panic"],
+      Decl.dfn "f" [("d", Lin.unrestricted, some divIntTy)] none
+        (divTerm (Term.lit (Lit.int 10) divIntTy) (Term.var "d" divSp divIntTy))],
+    Decl.dmod "B" [
+      Decl.dopts ["no_panic"],
+      Decl.dfn "g" [] none
+        (divTerm (Term.lit (Lit.int 10) divIntTy) (Term.lit (Lit.int 0) divIntTy))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps noPanicDivSkipDoesNotMaskSibling   -- expect: violation
+example : (checkCaps noPanicDivSkipDoesNotMaskSibling).isViolation = true := by native_decide
+
+/-- The other direction of `CapResult.andThen`: a clean sibling must not
+swallow a skip. `A` is unjudgeable, `B` is fine — the FILE is a skip. -/
+def noPanicDivSkipSurvivesCleanSibling : Module := {
+  decls := [
+    Decl.dmod "A" [
+      Decl.dopts ["no_panic"],
+      Decl.dfn "f" [("d", Lin.unrestricted, some divIntTy)] none
+        (divTerm (Term.lit (Lit.int 10) divIntTy) (Term.var "d" divSp divIntTy))],
+    Decl.dmod "B" [
+      Decl.dopts ["no_panic"],
+      Decl.dfn "g" [] none
+        (divTerm (Term.lit (Lit.int 10) divIntTy) (Term.lit (Lit.int 2) divIntTy))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps noPanicDivSkipSurvivesCleanSibling   -- expect: skip
+example : (checkCaps noPanicDivSkipSurvivesCleanSibling).isSkip = true := by native_decide
+
+/-- A bare `10 / 2` — a non-zero LITERAL divisor — stays a plain `ok`. The
+three-way boundary must not drag the literal fast-path into `unknown`. -/
+def noPanicDivLiteralNonZero : Module := {
+  decls := [Decl.dmod "NP" [
+    Decl.dopts ["no_panic"],
+    Decl.dfn "f" [] none
+      (divTerm (Term.lit (Lit.int 10) divIntTy) (Term.lit (Lit.int 2) divIntTy))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps noPanicDivLiteralNonZero   -- expect: ok
+example : (checkCaps noPanicDivLiteralNonZero).isViolation = false := by native_decide
+example : (checkCaps noPanicDivLiteralNonZero).isSkip = false := by native_decide
+
+/-- A guarded PARAMETER divisor — `fn f(d : Int) do if d != 0 do 10 / d else 0
+end end` — stays a plain `ok`, not a skip: `path_proves_nonzero` is march's
+own solver-free fast path and it applies to an unrefined parameter exactly as
+it does to a `let`-bound one. march ACCEPTS this file. Without this pin the
+three-way boundary could regress into skipping every parameter divisor. -/
+def noPanicDivGuardedParam : Module := {
+  decls := [Decl.dmod "NP" [
+    Decl.dopts ["no_panic"],
+    Decl.dfn "f" [("d", Lin.unrestricted, some divIntTy)] none
+      (Term.ite
+        (Term.app (Term.var "!=" divSp divIntTy)
+          [Term.var "d" divSp divIntTy, Term.lit (Lit.int 0) divIntTy] divIntTy)
+        (divTerm (Term.lit (Lit.int 10) divIntTy) (Term.var "d" divSp divIntTy))
+        (Term.lit (Lit.int 0) divIntTy)
+        divIntTy)]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps noPanicDivGuardedParam   -- expect: ok
+example : (checkCaps noPanicDivGuardedParam).isViolation = false := by native_decide
+example : (checkCaps noPanicDivGuardedParam).isSkip = false := by native_decide
 
 /-- A division by a literal `0` in a module WITHOUT `cap no_panic` → ok (the
 check is gated on the cap, same as every other behavioral cap above). -/
