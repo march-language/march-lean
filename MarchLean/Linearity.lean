@@ -59,6 +59,7 @@ partial def _root_.MarchLean.Syntax.Pattern.boundNames : Pattern → List String
   | .con _ args => args.foldl (fun acc p => acc ++ p.boundNames) []
   | .tuple elems => elems.foldl (fun acc p => acc ++ p.boundNames) []
   | .record fs => fs.foldl (fun acc (_, p) => acc ++ p.boundNames) []
+  | .or_ alts => alts.foldl (fun acc p => acc ++ p.boundNames) []
   | .wild | .lit _ | .unsupported => []
 
 /-- Count uses of `name` in a term (occurrences of `Term.var name`). -/

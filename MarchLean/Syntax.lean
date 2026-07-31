@@ -96,6 +96,13 @@ inductive Pattern where
   | lit (l : Lit)
   | record (fields : List (String × Pattern))
   | as (name : String) (p : Pattern)
+  -- Or-pattern (`p1 | p2 | ...`), march's `Ast.PatOr` (`ast.ml:49`), emitted
+  -- as `{"kind":"PatOr","patterns":[...]}` (`dump/ast_json.ml`). march's
+  -- `norm_pat_rows` expands a `PatOr` at every depth during exhaustiveness
+  -- (`typecheck.ml:3966`) — `MarchLean.CapCheck.matchExhaustive` mirrors that
+  -- by unioning each alternative's covered constructors (A3 slice (c) review
+  -- finding C1).
+  | or_ (alts : List Pattern)
   | unsupported
   deriving Repr, Inhabited
 
@@ -106,6 +113,7 @@ partial def Pattern.hasUnsupported : Pattern → Bool
   | .tuple ps => ps.any Pattern.hasUnsupported
   | .record fs => fs.any (fun (_, p) => p.hasUnsupported)
   | .as _ p => p.hasUnsupported
+  | .or_ alts => alts.any Pattern.hasUnsupported
   | .wild | .var _ _ | .lit _ => false
 
 /-- Term. Each node carries its resolved type `ty`. `var` and `field` also
@@ -362,5 +370,11 @@ example : Pattern.hasUnsupported Pattern.unsupported = true := by native_decide
 example : Pattern.hasUnsupported (Pattern.tuple [Pattern.wild, Pattern.unsupported]) = true := by
   native_decide
 example : Pattern.hasUnsupported (Pattern.as "x" Pattern.unsupported) = true := by native_decide
+-- `Pattern.or_`: clean alternatives are in-fragment; an `unsupported`
+-- alternative anywhere in the list is not (A3 slice (c) review finding C1).
+example : Pattern.hasUnsupported (Pattern.or_ [Pattern.con "Red" [], Pattern.con "Green" []]) = false := by
+  native_decide
+example : Pattern.hasUnsupported (Pattern.or_ [Pattern.con "Red" [], Pattern.unsupported]) = true := by
+  native_decide
 
 end MarchLean.Syntax.Test

@@ -137,8 +137,9 @@ def decodeLit (j : Json) : Except String (Option Lit) := do
   | _ => .ok none
 
 /-- Decode a `pattern` node. `PatWild`/`PatVar`/`PatCon`/`PatTuple`/`PatLit`/
-`PatRecord`/`PatAs` map onto the `Pattern` constructors of the same shape;
-`PatAtom` (actor-protocol atom patterns, out of the A1 fragment) → `.unsupported`. -/
+`PatRecord`/`PatAs`/`PatOr` map onto the `Pattern` constructors of the same
+shape; `PatAtom` (actor-protocol atom patterns, out of the A1 fragment) →
+`.unsupported`. -/
 partial def decodePattern (j : Json) : Except String Pattern := do
   match ← kindOf j with
   | "PatWild" => .ok Pattern.wild
@@ -170,6 +171,9 @@ partial def decodePattern (j : Json) : Except String Pattern := do
       let p ← decodePattern (← field j "pattern")
       let (n, _) ← decodeName (← field j "name")
       .ok (Pattern.as n p)
+  | "PatOr" =>
+      let alts ← (← (← field j "patterns").getArr?.mapError (fun _ => "patterns")).toList.mapM decodePattern
+      .ok (Pattern.or_ alts)
   | _ => .ok Pattern.unsupported
 
 /-- Decode a *surface* `ty` node (`TyCon`/`TyArrow`/..; a different tag

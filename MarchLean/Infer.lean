@@ -697,6 +697,16 @@ partial def inferPattern (s : Supply) (ctx : Ctx) : Pattern → MTy → InferM (
       unify s expected (.record (fms.map (fun (n, _, m) => (n, m))))
       let bindss ← fms.mapM (fun (_, p, m) => inferPattern s ctx p m)
       pure (bindss.foldl (· ++ ·) [])
+  | .or_ alts, expected => do
+      -- march unifies every alternative's inferred type against a shared
+      -- `expected` and merges their bindings (`typecheck.ml:3773`, `PatOr`),
+      -- rejecting name/type disagreement between alternatives — a check this
+      -- differential inference pass does not replicate (out of scope: it
+      -- exists for `Compare`'s cross-check, not for diagnosing march's own
+      -- pattern-binding errors). Unifying each alt against the same
+      -- `expected` and concatenating bindings is enough for that purpose.
+      let bindss ← alts.mapM (fun p => inferPattern s ctx p expected)
+      pure (bindss.foldl (· ++ ·) [])
   | .unsupported, _ => throw "infer: unsupported pattern (should have been skip-gated)"
 
 /-- Demote every unbound metavariable reachable in `t` to level 0, march's

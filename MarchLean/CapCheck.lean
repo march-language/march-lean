@@ -435,6 +435,7 @@ partial def patBinderNames : Pattern → List String
   | .lit _ => []
   | .record fields => fields.flatMap (fun (_, p) => patBinderNames p)
   | .as n p => n :: patBinderNames p
+  | .or_ alts => alts.flatMap patBinderNames
   | .unsupported => []
 
 /-- The literal `Int` value of a term, if it directly is one. -/
@@ -707,11 +708,14 @@ def builtinCtors : List (String × List String) :=
 /-- Strip a leading `Type.` qualifier from a constructor name (`"Option.Some"`
 → `"Some"`), mirroring `builtin_ctors`' dual bare/qualified registration — a
 `Pattern.con` may spell either form and both must match the same ctor. Only
-the LAST dot-segment is kept; a name with no dot passes through unchanged. -/
+the LAST dot-segment is kept; a name with no dot passes through unchanged.
+`(n.splitOn ".").reverse.head?` is never `none` — `String.splitOn` always
+returns at least one segment (`[n]` itself when `"."` doesn't occur), so
+there is no genuine `[]` case to fall back on; `getD n` is just how that
+totality is expressed without an unreachable match arm (M2, review finding:
+an earlier `| [] => n` branch here was dead code). -/
 def bareCtorName (n : String) : String :=
-  match (n.splitOn ".").reverse with
-  | last :: _ => last
-  | [] => n
+  ((n.splitOn ".").reverse.head?).getD n
 
 /-- The head type-constructor name of a resolved `Ty`, peeling a `Ty.lin`
 wrapper first (a linear/affine-qualified scrutinee, e.g. `linear Option(Int)`,
@@ -734,6 +738,42 @@ def dtypeCtorSets (decls : List Decl) : List (String × List String) :=
     | .dtype name _ ctors => some (name, ctors.map (·.name))
     | _ => none)
 
+/-- Peel `Pattern.as` wrappers (recursively) to the pattern actually being
+matched — march's `norm_pat`: `| Ast.PatAs (p', _, _) -> norm_pat p'`
+(review finding C2). `Red as r` must be judged as `Red`; `x as y` (a bare
+variable rebound under another name) must be judged as the catch-all `x`
+would be. Total by construction (recurses only through `.as`; every other
+constructor is a base case). -/
+partial def peelAs : Pattern → Pattern
+  | .as _ p => peelAs p
+  | p => p
+
+/-- Is `p` one of the pattern forms `matchExhaustive` actually models for
+coverage purposes — `wild`/`var`/`con`/`as`/`or_`, recursively through `as`
+and `or_`'s own alternatives? `tuple`/`lit`/`record`/`unsupported` are NOT
+modeled (this checker has no notion of what they cover), and per the
+safety-net rule below their presence on a guardless arm must never be read
+as "does not cover" — see `matchExhaustive`'s docstring. -/
+partial def isModeledArmPattern : Pattern → Bool
+  | .wild | .var _ _ | .con _ _ => true
+  | .as _ p => isModeledArmPattern p
+  | .or_ alts => alts.all isModeledArmPattern
+  | .tuple _ | .lit _ | .record _ | .unsupported => false
+
+/-- The (bare-normalised) constructor names `p` covers, peeling `Pattern.as`
+first (C2) and, for `Pattern.or_`, unioning every alternative's own covered
+set (C1) — march's `norm_pat_rows` expands a `PatOr` at every depth before
+computing coverage (`typecheck.ml:3966`), so `Red | Green` must count as
+covering BOTH `Red` and `Green`, not neither. Anything else that isn't a
+`Pattern.con` (after peeling) covers nothing here — including `wild`/`var`,
+which are handled separately by the catch-all shortcut, not by name-set
+coverage. -/
+partial def patCoveredCtors : Pattern → List String
+  | .as _ p => patCoveredCtors p
+  | .or_ alts => alts.flatMap patCoveredCtors
+  | .con name _ => [bareCtorName name]
+  | .wild | .var _ _ | .tuple _ | .lit _ | .record _ | .unsupported => []
+
 /-- Is a `match_`'s arm list exhaustive over `scrutTy`, per march's
 `check_exhaustiveness` restricted to the guardless-coverage fragment it falls
 back to whenever any arm carries a `when` guard (`typecheck.ml:4546-4581`:
@@ -743,35 +783,86 @@ guarded-only match still falls through and panics — so only `guard = none`
 arms are ever consulted below, for both the wildcard/var catch-all shortcut
 and the constructor-set coverage test.
 
-- A guardless `Pattern.wild`/`Pattern.var` arm is a catch-all: exhaustive
-  regardless of the scrutinee type or any other arm.
-- Otherwise, collect the (bare-normalised) constructor names of every
-  guardless `Pattern.con` arm and test them against the scrutinee's full ctor
-  set — from `builtinCtors` by `scrutTy`'s head type name, or from
-  `userCtors` (a module tree's decoded `DType`s, see `dtypeCtorSets`) for a
-  user ADT. If the scrutinee's type resolves to NEITHER (unknown to this
-  checker entirely — no built-in, no decoded `DType`), the match is
-  conservatively treated as exhaustive: an unknown-type match is out of this
-  checker's fragment, and inventing a reject over it would be a false reject
-  this differential oracle must never manufacture (see the module docstring's
-  false-reject discipline). -/
+- A guardless arm whose pattern peels (through `Pattern.as`, `peelAs`) to
+  `Pattern.wild`/`Pattern.var` is a catch-all: exhaustive regardless of the
+  scrutinee type or any other arm (C2: `Red as r` binds, doesn't catch-all;
+  `x as y` does, because `x` alone would).
+- SAFETY NET (C1+C2, review finding): if any guardless arm's pattern is not
+  one of the modeled forms `isModeledArmPattern` recognizes — i.e. it's (or
+  recursively contains, through `as`/`or_`) an `unsupported`/`tuple`/`lit`/
+  `record` — the match is conservatively treated as exhaustive. This mirrors
+  the unknown-SCRUTINEE-TYPE carve-out two paragraphs below: both are "we do
+  not model this," and only ONE direction of not-modeling is safe to invent —
+  "cannot prove non-exhaustive ⇒ do not manufacture a reject." Before this
+  net, an unmodelled PATTERN (e.g. an or-pattern with no `PatOr` decode, or an
+  as-pattern nobody peeled) silently contributed nothing to coverage and was
+  judged NOT a catch-all either, i.e. treated as "covers nothing" — the
+  opposite, unsafe default from the type side, and the root cause of C1/C2's
+  false rejects.
+- Otherwise, collect the (bare-normalised, `Pattern.as`/`Pattern.or_`-aware)
+  constructor names every guardless arm covers (`patCoveredCtors`) and test
+  them against the scrutinee's full ctor set — from `userCtors` (a module
+  tree's decoded `DType`s, see `dtypeCtorSets`) FIRST, then `builtinCtors`,
+  by `scrutTy`'s head type name (C3, review finding: `List.find?` returns the
+  FIRST hit, so a user type that shadows a built-in name — e.g. a local
+  `type Result = Success(Int) | Failure(Int)` — must be judged against ITS
+  OWN ctors, not `Result`'s built-in `{Ok, Err}`; see
+  `accept/t82_local_type_exhaustive_shadows_stdlib_ctor`, which pins exactly
+  this restriction-to-the-declaring-module's-own-ctors behavior). If the
+  scrutinee's type resolves to NEITHER (unknown to this checker entirely — no
+  built-in, no decoded `DType`), the match is conservatively treated as
+  exhaustive: an unknown-type match is out of this checker's fragment, and
+  inventing a reject over it would be a false reject this differential oracle
+  must never manufacture (see the module docstring's false-reject
+  discipline).
+
+**Known shallowness (Finding I1, documented not fixed):** coverage above
+compares only TOP-LEVEL constructor names; a `Pattern.con`'s own argument
+patterns are never inspected. march instead runs a full Maranget coverage
+matrix over the whole arm column (`check_exhaustiveness`), so e.g.
+`type Inner = A | B`, `type Outer = W(Inner)`, matching `W(A) -> ..` alone IS
+flagged non-exhaustive by march but judged exhaustive here (a false accept —
+`W`, the only ctor of `Outer`, is "covered" without looking at whether `A`
+alone covers `Inner`). This is deliberately NOT implemented: no corpus
+target in this fragment needs it, and it is a materially larger analysis
+(a full pattern matrix, not a single constructor-name set). It would also
+become reachable for `Option`/tuple-headed scrutinees the moment the
+`Infer` builtin-ctor gap (`t59`'s pre-existing skip; see the `A3 slice (c),
+Task 3` fixtures below) is ever closed and such matches stop being screened
+out upstream.
+
+**Known false-accept class (Finding I2, documented not fixed):** a
+`Pattern.lit` arm list over a non-ADT scrutinee (`Int`/`String`/`Float`) has
+no built-in/user ctor set to test against at all — `headTypeName` resolves
+to e.g. `some "Int"`, which is in neither `builtinCtors` nor `userCtors` — so
+it falls into the unknown-type "conservatively exhaustive" branch above and
+this checker EXITS 0 on it. march, by contrast, DOES exhaustiveness-check
+literal patterns against a scrutinee's structure (`check_exhaustiveness`
+handles `PatLit` rows) and rejects `match n do 0 -> 1; 1 -> 2 end` (no
+catch-all) as non-exhaustive. This is therefore a live false-accept class,
+not merely a "skip" as an earlier draft of this docstring implied — `Int`/
+`String`/`Float` matches are otherwise fully in-fragment (they reach this
+gate at all, rather than being screened out by `hasUnsupported` upstream),
+so the unknown-type carve-out's conservatism here produces a genuine
+divergence from march, not an out-of-fragment skip. Left unfixed
+deliberately: narrowing the unknown-type rule to close this gap risks
+reintroducing a false reject elsewhere (the exact failure mode C1/C2 already
+demonstrated), which this differential oracle must never manufacture. -/
 def matchExhaustive (scrutTy : Ty) (userCtors : List (String × List String))
     (arms : List (Pattern × Option Term × Term)) : Bool :=
-  let isCatchAll : Pattern × Option Term × Term → Bool
-    | (.wild, none, _) | (.var _ _, none, _) => true
-    | _ => false
+  let isCatchAll : Pattern × Option Term × Term → Bool := fun (p, g, _) =>
+    g.isNone && match peelAs p with
+      | .wild | .var _ _ => true
+      | _ => false
   if arms.any isCatchAll then true
+  else if arms.any (fun (p, g, _) => g.isNone && !isModeledArmPattern p) then true
   else
     let covered : List String :=
-      arms.filterMap (fun (p, g, _) =>
-        if g.isSome then none
-        else match p with
-          | .con name _ => some (bareCtorName name)
-          | _ => none)
+      arms.flatMap (fun (p, g, _) => if g.isSome then [] else patCoveredCtors p)
     match headTypeName scrutTy with
     | none => true
     | some tyName =>
-        match (builtinCtors ++ userCtors).find? (fun (n, _) => n == tyName) with
+        match (userCtors ++ builtinCtors).find? (fun (n, _) => n == tyName) with
         | none => true
         | some (_, ctors) => ctors.all covered.contains
 
@@ -2495,5 +2586,131 @@ def npNonExhaustiveInheritedIntoNestedModule : Module := {
   schemes := [], insts := [], moduleCaps := [] }
 #eval checkCaps npNonExhaustiveInheritedIntoNestedModule   -- expect: violation naming no_panic
 example : (checkCaps npNonExhaustiveInheritedIntoNestedModule).isViolation = true := by native_decide
+
+-- ---------------------------------------------------------------------
+-- A3 slice (c) review findings C1 (or-patterns), C2 (as-patterns), C3
+-- (user-type shadowing a built-in ctor set) — all three were FALSE REJECTS
+-- (march accepts, this checker rejected) before the fixes above. See
+-- `matchExhaustive`'s docstring for the full citations.
+
+/-- C1: `Red | Green -> 0; Blue -> 2` over the `Color` user ADT — the
+or-pattern's coverage is the UNION of its alternatives (`Red`, `Green`),
+which together with the `Blue` arm covers the full ctor set → exhaustive →
+ok. Before the fix, `Pattern.or_` didn't exist (decoded to `.unsupported`)
+and contributed NOTHING to coverage, so this was a false reject. -/
+def npOrPatternCoversAlternatives : Module := {
+  decls := [
+  colorDType,
+  Decl.dmod "G" [
+    Decl.dopts ["no_panic"],
+    Decl.dfn "describe" [("c", Lin.unrestricted, none)] none
+      (Term.match_ (Term.var "c" npSpan colorTy)
+        [(Pattern.or_ [Pattern.con "Red" [], Pattern.con "Green" []], none,
+          Term.lit (Lit.int 0) (Ty.con "Int" [])),
+         (Pattern.con "Blue" [], none, Term.lit (Lit.int 2) (Ty.con "Int" []))]
+        (Ty.con "Int" []))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps npOrPatternCoversAlternatives   -- expect: ok
+example : (checkCaps npOrPatternCoversAlternatives).isViolation = false := by native_decide
+
+/-- C1 negative half (must still REJECT): the SAME or-pattern arm, with no
+`Blue` arm at all — `Red | Green` covers only 2 of `Color`'s 3 ctors → still
+non-exhaustive → violation. Proves the or-pattern fix didn't blunt the check
+into accepting everything. -/
+def npOrPatternStillNonExhaustive : Module := {
+  decls := [
+  colorDType,
+  Decl.dmod "G" [
+    Decl.dopts ["no_panic"],
+    Decl.dfn "describe" [("c", Lin.unrestricted, none)] none
+      (Term.match_ (Term.var "c" npSpan colorTy)
+        [(Pattern.or_ [Pattern.con "Red" [], Pattern.con "Green" []], none,
+          Term.lit (Lit.int 0) (Ty.con "Int" []))]
+        (Ty.con "Int" []))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps npOrPatternStillNonExhaustive   -- expect: violation naming no_panic (non-exhaustive)
+example : (checkCaps npOrPatternStillNonExhaustive).isViolation = true := by native_decide
+
+/-- C2: `Red as r -> 0; Green -> 1; Blue -> 2` — `peelAs` strips the `as`
+wrapper before the coverage test, so `Red as r` counts as covering `Red`
+exactly like a bare `Red` arm would → all 3 ctors covered → ok. Before the
+fix, `matchExhaustive` never peeled `Pattern.as`, so `Red as r`'s `.as`
+shape matched neither the catch-all test nor `Pattern.con`, contributing
+nothing to coverage — a false reject. -/
+def npAsPatternPeels : Module := {
+  decls := [
+  colorDType,
+  Decl.dmod "G" [
+    Decl.dopts ["no_panic"],
+    Decl.dfn "describe" [("c", Lin.unrestricted, none)] none
+      (Term.match_ (Term.var "c" npSpan colorTy)
+        [(Pattern.as "r" (Pattern.con "Red" []), none, Term.lit (Lit.int 0) (Ty.con "Int" [])),
+         (Pattern.con "Green" [], none, Term.lit (Lit.int 1) (Ty.con "Int" [])),
+         (Pattern.con "Blue" [], none, Term.lit (Lit.int 2) (Ty.con "Int" []))]
+        (Ty.con "Int" []))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps npAsPatternPeels   -- expect: ok
+example : (checkCaps npAsPatternPeels).isViolation = false := by native_decide
+
+/-- C2, catch-all half: `x as y -> ..` alone — peeling the `as` reaches a bare
+`Pattern.var`, so this is a catch-all regardless of the scrutinee type →
+exhaustive → ok, exactly as a plain `x -> ..` arm would be. -/
+def npAsPatternCatchAll : Module := {
+  decls := [Decl.dmod "G" [
+  Decl.dopts ["no_panic"],
+  Decl.dfn "get" [("o", Lin.unrestricted, none)] none
+    (Term.match_ (Term.var "o" npSpan optionIntTy)
+      [(Pattern.as "y" (Pattern.var "x" Lin.unrestricted), none,
+        Term.lit (Lit.int 0) (Ty.con "Int" []))]
+      (Ty.con "Int" []))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps npAsPatternCatchAll   -- expect: ok
+example : (checkCaps npAsPatternCatchAll).isViolation = false := by native_decide
+
+/-- C3: a user `type Result = Success(Int) | Failure(Int)` — same type NAME
+as the built-in `Result` (`{Ok, Err}`), different ctors entirely. Matching
+`Success`/`Failure` exhaustively must be judged against the USER's own ctor
+set, not the built-in one: `(userCtors ++ builtinCtors).find?` finds the
+user entry first → `{Success, Failure}` is the universe → both covered → ok.
+Before the fix (`(builtinCtors ++ userCtors).find?`), the built-in `Result`
+entry was found FIRST and this match was judged against `{Ok, Err}`, which
+`Success`/`Failure` can never satisfy — a false reject. -/
+def userResultCtors : List CtorSig :=
+  [ { name := "Success", argTys := [Ty.con "Int" []], resultTy := Ty.con "Result" [] },
+    { name := "Failure", argTys := [Ty.con "Int" []], resultTy := Ty.con "Result" [] } ]
+def userResultDType : Decl := Decl.dtype "Result" [] userResultCtors
+def userResultTy : Ty := Ty.con "Result" []
+def npUserResultShadowsBuiltin : Module := {
+  decls := [
+  userResultDType,
+  Decl.dmod "G" [
+    Decl.dopts ["no_panic"],
+    Decl.dfn "describe" [("r", Lin.unrestricted, none)] none
+      (Term.match_ (Term.var "r" npSpan userResultTy)
+        [(Pattern.con "Success" [Pattern.var "n" Lin.unrestricted], none,
+          Term.var "n" npSpan (Ty.con "Int" [])),
+         (Pattern.con "Failure" [Pattern.var "n" Lin.unrestricted], none,
+          Term.lit (Lit.int 0) (Ty.con "Int" []))]
+        (Ty.con "Int" []))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps npUserResultShadowsBuiltin   -- expect: ok
+example : (checkCaps npUserResultShadowsBuiltin).isViolation = false := by native_decide
+
+/-- C1+C2 safety net: a guardless `Pattern.tuple` arm (unmodelled by
+`isModeledArmPattern`) is the ENTIRE arm list — no `Pattern.con`/wildcard at
+all. `matchExhaustive` cannot prove this non-exhaustive through a pattern
+form it doesn't model, so per the safety-net rule it is conservatively
+judged exhaustive → ok, the same "cannot prove ⇒ do not manufacture a
+reject" discipline already applied to unknown scrutinee TYPES. -/
+def npUnmodelledPatternSafetyNet : Module := {
+  decls := [Decl.dmod "G" [
+  Decl.dopts ["no_panic"],
+  Decl.dfn "get" [("o", Lin.unrestricted, none)] none
+    (Term.match_ (Term.var "o" npSpan optionIntTy)
+      [(Pattern.tuple [Pattern.wild, Pattern.wild], none, Term.lit (Lit.int 0) (Ty.con "Int" []))]
+      (Ty.con "Int" []))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps npUnmodelledPatternSafetyNet   -- expect: ok
+example : (checkCaps npUnmodelledPatternSafetyNet).isViolation = false := by native_decide
 
 end MarchLean.CapCheck
