@@ -456,10 +456,12 @@ def bindLetFacts (name : String) (rhs : Term) (facts : DivFacts) : DivFacts :=
 /-- A guard condition in scope, paired with a `negated` flag — march's `dctx.path`
 (`division_safety.ml`'s `dctx.path : (A.expr * bool) list`). `negated = true`
 means we are on the ELSE side of the `if` that produced this entry, so the fact
-actually in scope is `not cond`, not `cond` itself. Populated ONLY by
+actually in scope is `not cond`, not `cond` itself. Populated by
 `divisionUnsafe`'s `.ite` arm (the then-branch pushes `(cond, false)`, the
-else-branch pushes `(cond, true)`), mirroring march's `EIf` arm in
-`iter_div_sites`. -/
+else-branch pushes `(cond, true)`) and by its `.match_` arm (an arm's BODY is
+scanned with that arm's guard pushed as `(g, false)` — reaching the body means
+the guard evaluated true), mirroring march's `EIf` and `EMatch` arms in
+`iter_div_sites` (`division_safety.ml:234-251`). -/
 abbrev DivPath := List (Term × Bool)
 
 /-- Does `t` mention any name in `names` anywhere in its subtree? A DELIBERATELY
@@ -678,13 +680,28 @@ partial def divisionUnsafe (facts : DivFacts) (path : DivPath) : Term → Bool
   -- A guard runs in the pattern's own binder scope (its names are already
   -- bound by the time the guard is evaluated), so it is scanned with the SAME
   -- retired facts/path as the body, not the outer ones.
+  --
+  -- **A SUCCESSFUL guard is a proof available to that arm's BODY** — march's
+  -- `EMatch` arm (`division_safety.ml:240-246`) scans the guard with the
+  -- retired-only `ac`, then rebuilds `ac' = { ac with path = (g, false) ::
+  -- ac.path }` and scans `arm.branch_body` with `ac'`. The flag is `false`
+  -- (NOT negated): reaching an arm's body means the guard EVALUATED TRUE, so
+  -- the fact in scope is `g` itself — exactly the `.ite` THEN-branch
+  -- treatment, and the opposite of its else-branch `(cond, true)`. Omitting
+  -- this push false-rejected `let d = 0; match x do Some(_) when d != 0 -> 10
+  -- / d | _ -> 0 end`, which march accepts (`noPanicMatchGuardProvesNonzero`
+  -- below pins it). Note the guard itself is still scanned WITHOUT its own
+  -- condition on the path — a guard cannot assume itself.
   | .match_ scrut arms _ =>
       divisionUnsafe facts path scrut ||
         arms.any (fun (p, g, e) =>
           let names := patBinderNames p
           let facts' := retireDivFacts names facts
           let path' := retireDivPath names path
-          (g.map (divisionUnsafe facts' path')).getD false || divisionUnsafe facts' path' e)
+          let bodyPath := match g with
+            | some cond => (cond, false) :: path'
+            | none      => path'
+          (g.map (divisionUnsafe facts' path')).getD false || divisionUnsafe facts' bodyPath e)
   | .unsupported _ => false
 
 /-- `no_panic`'s SECOND half (A3 slice (c) Task 3): a non-exhaustive `match`
@@ -2437,6 +2454,83 @@ def noPanicGuardedGreaterThanSafe : Module := {
   schemes := [], insts := [], moduleCaps := [] }
 #eval checkCaps noPanicGuardedGreaterThanSafe   -- expect: ok
 example : (checkCaps noPanicGuardedGreaterThanSafe).isViolation = false := by native_decide
+
+-- ---------------------------------------------------------------------
+-- Review Finding 3 pins: a MATCH-ARM guard is a proof available to that
+-- arm's BODY, exactly like an `if`'s then-branch. march's `EMatch` case
+-- (`division_safety.ml:240-246`) scans the guard with the retired-only `ac`
+-- and then scans the body with `{ ac with path = (g, false) :: ac.path }`.
+-- The three Finding C1 pins above cover only the `.ite` shape, so the
+-- `.match_` push had no test at all and was in fact missing — a live FALSE
+-- REJECT (confirmed against `march --check`, which accepts the first fixture
+-- below and rejects the second).
+
+/-- `let d = 0; match x do Some(_) when d != 0 -> 10 / d | _ -> 0 end` → ok.
+The arm's guard `d != 0` is on the path for that arm's BODY, and the pattern
+binds nothing that would retire the `d` it is about, so `pathProvesNonzero`
+discharges the `let`-tracked zero — exactly as it does on an `if`'s
+then-branch. march ACCEPTS this file. -/
+def noPanicMatchGuardProvesNonzero : Module := {
+  decls := [Decl.dmod "MG" [
+    Decl.dopts ["no_panic"],
+    Decl.dfn "f" [("x", Lin.unrestricted, none)] none
+      (Term.let_ "d" Lin.unrestricted none (Term.lit (Lit.int 0) divIntTy)
+        (Term.match_ (Term.var "x" divSp (Ty.con "Option" [divIntTy]))
+          [(Pattern.con "Some" [Pattern.wild],
+            some (Term.app (Term.var "!=" divSp divIntTy)
+              [Term.var "d" divSp divIntTy, Term.lit (Lit.int 0) divIntTy] divIntTy),
+            divTerm (Term.lit (Lit.int 10) divIntTy) (Term.var "d" divSp divIntTy)),
+           (Pattern.wild, none, Term.lit (Lit.int 0) divIntTy)]
+          divIntTy)
+        divIntTy)]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps noPanicMatchGuardProvesNonzero   -- expect: ok
+example : (checkCaps noPanicMatchGuardProvesNonzero).isViolation = false := by native_decide
+
+/-- Teeth for the pin above: the SAME shape with a guard that does NOT prove
+`d != 0` (`d == 0`, which `pathProvesNonzero`'s `proves "==" 0` rejects)
+stays a violation. The `.match_` push must put the guard on the path, not
+license the arm body wholesale. march REJECTS this file. -/
+def noPanicMatchGuardDoesNotProve : Module := {
+  decls := [Decl.dmod "MG" [
+    Decl.dopts ["no_panic"],
+    Decl.dfn "f" [("x", Lin.unrestricted, none)] none
+      (Term.let_ "d" Lin.unrestricted none (Term.lit (Lit.int 0) divIntTy)
+        (Term.match_ (Term.var "x" divSp (Ty.con "Option" [divIntTy]))
+          [(Pattern.con "Some" [Pattern.wild],
+            some (Term.app (Term.var "==" divSp divIntTy)
+              [Term.var "d" divSp divIntTy, Term.lit (Lit.int 0) divIntTy] divIntTy),
+            divTerm (Term.lit (Lit.int 10) divIntTy) (Term.var "d" divSp divIntTy)),
+           (Pattern.wild, none, Term.lit (Lit.int 0) divIntTy)]
+          divIntTy)
+        divIntTy)]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps noPanicMatchGuardDoesNotProve   -- expect: violation
+example : (checkCaps noPanicMatchGuardDoesNotProve).isViolation = true := by native_decide
+
+/-- Teeth, second direction: the guard is scanned in its OWN scope WITHOUT
+itself on the path (`a guard cannot assume itself`), mirroring march's
+`Option.iter (iter_div_sites f ac) arm.branch_guard` running before `ac'` is
+built. A division by the `let`-tracked zero INSIDE the guard expression is
+therefore still a violation even though the guard would, if assumed, prove
+its own divisor non-zero. -/
+def noPanicMatchGuardSelfAssumption : Module := {
+  decls := [Decl.dmod "MG" [
+    Decl.dopts ["no_panic"],
+    Decl.dfn "f" [("x", Lin.unrestricted, none)] none
+      (Term.let_ "d" Lin.unrestricted none (Term.lit (Lit.int 0) divIntTy)
+        (Term.match_ (Term.var "x" divSp (Ty.con "Option" [divIntTy]))
+          [(Pattern.con "Some" [Pattern.wild],
+            some (Term.app (Term.var "!=" divSp divIntTy)
+              [divTerm (Term.lit (Lit.int 10) divIntTy) (Term.var "d" divSp divIntTy),
+               Term.lit (Lit.int 0) divIntTy] divIntTy),
+            Term.lit (Lit.int 1) divIntTy),
+           (Pattern.wild, none, Term.lit (Lit.int 0) divIntTy)]
+          divIntTy)
+        divIntTy)]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps noPanicMatchGuardSelfAssumption   -- expect: violation
+example : (checkCaps noPanicMatchGuardSelfAssumption).isViolation = true := by native_decide
 
 /-- `let d = 5; 10 / d` → ok (a non-zero literal is trivially safe). -/
 def noPanicDivLetNonZero : Module := {
