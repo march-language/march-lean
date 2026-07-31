@@ -96,6 +96,13 @@ inductive Pattern where
   | lit (l : Lit)
   | record (fields : List (String × Pattern))
   | as (name : String) (p : Pattern)
+  -- Or-pattern (`p1 | p2 | ...`), march's `Ast.PatOr` (`ast.ml:49`), emitted
+  -- as `{"kind":"PatOr","patterns":[...]}` (`dump/ast_json.ml`). march's
+  -- `norm_pat_rows` expands a `PatOr` at every depth during exhaustiveness
+  -- (`typecheck.ml:3966`) — `MarchLean.CapCheck.matchExhaustive` mirrors that
+  -- by unioning each alternative's covered constructors (A3 slice (c) review
+  -- finding C1).
+  | or_ (alts : List Pattern)
   | unsupported
   deriving Repr, Inhabited
 
@@ -106,6 +113,7 @@ partial def Pattern.hasUnsupported : Pattern → Bool
   | .tuple ps => ps.any Pattern.hasUnsupported
   | .record fs => fs.any (fun (_, p) => p.hasUnsupported)
   | .as _ p => p.hasUnsupported
+  | .or_ alts => alts.any Pattern.hasUnsupported
   | .wild | .var _ _ | .lit _ => false
 
 /-- Term. Each node carries its resolved type `ty`. `var` and `field` also
@@ -128,7 +136,13 @@ inductive Term where
   | tuple (elems : List Term) (ty : Ty)
   | record (fields : List (String × Term)) (ty : Ty)
   | field (record : Term) (name : String) (span : Span) (ty : Ty)
-  | match_ (scrut : Term) (arms : List (Pattern × Term)) (ty : Ty)
+  -- Each arm's middle field is its optional `when` guard (A3 slice (c) Task
+  -- 3) — `none` for a guardless arm, `some g` for `pat when g -> body`. A
+  -- guardless arm's pattern counts toward `no_panic`'s exhaustiveness
+  -- coverage (`CapCheck.matchExhaustive`); a guarded arm's does not, mirroring
+  -- march's `check_exhaustiveness` (`typecheck.ml:4546`), which computes
+  -- coverage over the GUARDLESS branches only.
+  | match_ (scrut : Term) (arms : List (Pattern × Option Term × Term)) (ty : Ty)
   | unsupported (ty : Ty)
   deriving Repr, Inhabited
 
@@ -161,7 +175,8 @@ partial def Term.hasUnsupported : Term → Bool
      | .tuple es _ => es.any Term.hasUnsupported
      | .record fs _ => fs.any (fun (_, e) => e.hasUnsupported)
      | .field r _ _ _ => r.hasUnsupported
-     | .match_ s arms _ => s.hasUnsupported || arms.any (fun (p, e) => p.hasUnsupported || e.hasUnsupported)
+     | .match_ s arms _ => s.hasUnsupported ||
+         arms.any (fun (p, g, e) => p.hasUnsupported || (g.map Term.hasUnsupported).getD false || e.hasUnsupported)
      | _ => false)
 
 /-- Datatype constructor signature (from a `DType` decl). -/
@@ -229,6 +244,12 @@ inductive Decl where
   (see `CapCheck.checkCaps`'s docstring on `entryName` for the precise,
   narrower-than-it-looks scope of that exemption). -/
   | dproofcap (name : String)
+  /-- `opts no_panic, ...` — a declaration's behavioral-capability-cap
+  self-declaration list (A3 slice (c)), as bare cap names (e.g. `"no_panic"`).
+  In-fragment (`hasUnsupported = false`): the real emitted JSON is
+  `{"kind":"DOpts","opts":["no_panic"],"span":{…}}` (verified), and `opts` is
+  a plain `List String` — no further decoding needed. -/
+  | dopts (opts : List String)
   | unsupported
   deriving Repr, Inhabited
 
@@ -253,6 +274,7 @@ partial def Decl.hasUnsupported : Decl → Bool
   | .duse _ => false
   | .dextern _ _ => false
   | .dproofcap _ => false
+  | .dopts _ => false
 
 /-- Splice nested `dmod` decls into a single flat list, for the passes that
 treat a module as a transparent scope (inference, linearity). Cap checking
@@ -328,11 +350,11 @@ example : Ty.hasUnsupported (Ty.tuple [Ty.con "Int" [], Ty.err]) = true := by na
 private def intTy : Ty := Ty.con "Int" []
 private def dummySpan : Span := ⟨"f", 0, 0, 0, 0⟩
 private def okScrut : Term := Term.lit (Lit.int 0) intTy
-private def okArm : Pattern × Term := (Pattern.wild, Term.lit (Lit.int 1) intTy)
-private def badArm : Pattern × Term := (Pattern.unsupported, Term.lit (Lit.int 1) intTy)
+private def okArm : Pattern × Option Term × Term := (Pattern.wild, none, Term.lit (Lit.int 1) intTy)
+private def badArm : Pattern × Option Term × Term := (Pattern.unsupported, none, Term.lit (Lit.int 1) intTy)
 -- Nested inside a `con` pattern too, not just at the top level of the arm.
-private def badNestedArm : Pattern × Term :=
-  (Pattern.con "Some" [Pattern.unsupported], Term.lit (Lit.int 1) intTy)
+private def badNestedArm : Pattern × Option Term × Term :=
+  (Pattern.con "Some" [Pattern.unsupported], none, Term.lit (Lit.int 1) intTy)
 
 -- A match with only clean patterns/arms is in-fragment.
 example : Term.hasUnsupported (Term.match_ okScrut [okArm] intTy) = false := by native_decide
@@ -348,5 +370,11 @@ example : Pattern.hasUnsupported Pattern.unsupported = true := by native_decide
 example : Pattern.hasUnsupported (Pattern.tuple [Pattern.wild, Pattern.unsupported]) = true := by
   native_decide
 example : Pattern.hasUnsupported (Pattern.as "x" Pattern.unsupported) = true := by native_decide
+-- `Pattern.or_`: clean alternatives are in-fragment; an `unsupported`
+-- alternative anywhere in the list is not (A3 slice (c) review finding C1).
+example : Pattern.hasUnsupported (Pattern.or_ [Pattern.con "Red" [], Pattern.con "Green" []]) = false := by
+  native_decide
+example : Pattern.hasUnsupported (Pattern.or_ [Pattern.con "Red" [], Pattern.unsupported]) = true := by
+  native_decide
 
 end MarchLean.Syntax.Test

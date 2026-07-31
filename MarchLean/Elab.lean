@@ -137,8 +137,9 @@ def decodeLit (j : Json) : Except String (Option Lit) := do
   | _ => .ok none
 
 /-- Decode a `pattern` node. `PatWild`/`PatVar`/`PatCon`/`PatTuple`/`PatLit`/
-`PatRecord`/`PatAs` map onto the `Pattern` constructors of the same shape;
-`PatAtom` (actor-protocol atom patterns, out of the A1 fragment) → `.unsupported`. -/
+`PatRecord`/`PatAs`/`PatOr` map onto the `Pattern` constructors of the same
+shape; `PatAtom` (actor-protocol atom patterns, out of the A1 fragment) →
+`.unsupported`. -/
 partial def decodePattern (j : Json) : Except String Pattern := do
   match ← kindOf j with
   | "PatWild" => .ok Pattern.wild
@@ -170,6 +171,9 @@ partial def decodePattern (j : Json) : Except String Pattern := do
       let p ← decodePattern (← field j "pattern")
       let (n, _) ← decodeName (← field j "name")
       .ok (Pattern.as n p)
+  | "PatOr" =>
+      let alts ← (← (← field j "patterns").getArr?.mapError (fun _ => "patterns")).toList.mapM decodePattern
+      .ok (Pattern.or_ alts)
   | _ => .ok Pattern.unsupported
 
 /-- Decode a *surface* `ty` node (`TyCon`/`TyArrow`/..; a different tag
@@ -322,16 +326,11 @@ partial def decodeTerm (j : Json) : Except String Term := do
       let scrut ← decodeTerm (← field j "scrutinee")
       let branchesJ ← (← field j "branches").getArr?.mapError (fun _ => "branches")
       let arms ← branchesJ.toList.mapM (fun b => do
-        let guard ← field b "guard"
-        if !guard.isNull then
-          -- guarded arms aren't representable (`Term.match_`'s arms carry no
-          -- guard) — surface as an unsupported arm rather than silently
-          -- dropping the guard and risking a false accept.
-          pure (Pattern.unsupported, Term.unsupported Ty.unsupported)
-        else do
-          let p ← decodePattern (← field b "pattern")
-          let bodyTerm ← decodeTerm (← field b "body")
-          pure (p, bodyTerm))
+        let guardJ ← field b "guard"
+        let g ← if guardJ.isNull then pure none else (some <$> decodeTerm guardJ)
+        let p ← decodePattern (← field b "pattern")
+        let bodyTerm ← decodeTerm (← field b "body")
+        pure (p, g, bodyTerm))
       .ok (Term.match_ scrut arms ty)
   | "ETuple" =>
       let elemsJ ← (← field j "elements").getArr?.mapError (fun _ => "elements")
@@ -453,7 +452,7 @@ def declBindingName : Decl → Option String
   | .dfn n _ _ _ => some n
   | .dlet n _ => some n
   | .dtype n _ _ => some n
-  | .dmod _ _ | .dneeds _ | .duse _ | .dextern _ _ | .dproofcap _ | .unsupported => none
+  | .dmod _ _ | .dneeds _ | .duse _ | .dextern _ _ | .dproofcap _ | .dopts _ | .unsupported => none
 
 /-- Every binding name reachable once Task 4 flattens the tree (`dmod` is
 transparent to inference — its decls splice into the enclosing scope,
@@ -475,10 +474,11 @@ def hasNameCollision (decls : List Decl) : Bool :=
 /-- Decode a top-level `decl` node. `DFn`/`DLet`/`DType` are the A1 term/type
 fragment; `DMod`/`DNeeds`/`DUse`/`DExtern`/`DProofCap` are the A3
 module-structure and capability-declaration fragment (Task 2; `DProofCap`
-added for Finding I1 — see `Decl.dproofcap`). Every other decl kind (`DActor`,
-`DProtocol`, `DSig`, `DInterface`, `DImpl`, `DAlias`, `DOpts`,
-`DAlwaysLinearType`, `DTransitions`, `DApp`, `DDeriving`, `DSatisfy`, `DTest`,
-`DDescribe`, `DSetup`, `DSetupAll`) decodes to `Decl.unsupported`. -/
+added for Finding I1 — see `Decl.dproofcap`); `DOpts` is the A3 slice (c)
+behavioral-capability-cap declaration fragment (Task 1 — see `Decl.dopts`).
+Every other decl kind (`DActor`, `DProtocol`, `DSig`, `DInterface`, `DImpl`,
+`DAlias`, `DAlwaysLinearType`, `DTransitions`, `DApp`, `DDeriving`, `DSatisfy`,
+`DTest`, `DDescribe`, `DSetup`, `DSetupAll`) decodes to `Decl.unsupported`. -/
 partial def decodeDecl (j : Json) : Except String Decl := do
   match ← kindOf j with
   | "DFn" => do
@@ -496,9 +496,13 @@ partial def decodeDecl (j : Json) : Except String Decl := do
       -- threaded onto `Decl.dfn.retAnnot` so `CapCheck` can scan it for
       -- Check 1: march scans `param_tys @ ret_tys` (`check_module_needs`), and
       -- a `Cap(X)` in RETURN position is exactly the coverage gap this closes.
-      -- (`Decl.dlet` — the 0-param case — still carries no return field, so a
-      -- 0-param `fn () : Cap(X)` drops its return annotation as before; the M1
-      -- gap is about multi-param `Decl.dfn`s.)
+      -- (Commit `e671226` changed exactly this for the 0-param case: a
+      -- 0-param clause below now decodes to `Decl.dfn name [] retTy body` —
+      -- an empty-param `dfn`, not a `Decl.dlet` — so a 0-param `fn () :
+      -- Cap(X)` DOES carry its return annotation into Check 1's scan, same
+      -- as any N-ary `dfn`. `Decl.dlet` is reserved for a genuine top-level
+      -- `let x = ...` binding, which has no return annotation at all — see
+      -- the comment on the 0-param arm ~20 lines below.)
       let retTy ← (match fn.getObjVal? "ret_ty" with
         | .ok v => if v.isNull then pure none else do
             let t ← decodeSurfaceTy [] v
@@ -525,9 +529,26 @@ partial def decodeDecl (j : Json) : Except String Decl := do
             match paramsOpt with
             | none => .ok Decl.unsupported
             | some [] =>
-                -- 0-param clause: a plain value binding.
+                -- 0-param clause: still a genuine `Ast.DFn` in march's real
+                -- AST (verified directly: `fn fail() : Int do panic("boom")
+                -- end` emits `"kind":"DFn"`, never `"kind":"DLet"`), NOT an
+                -- `Ast.DLet`. march's behavioral-cap checks
+                -- (`check_pure_module`/`check_deterministic_module`/
+                -- `check_no_panic_module`, `typecheck.ml`) scan `Ast.DFn`
+                -- ONLY — folding a 0-param clause to `Decl.dlet` (the old
+                -- A2-era convenience) hid it from any `dfn`-only scan.
+                -- Decoding it to `Decl.dfn name [] retTy body` instead — an
+                -- empty param list, not a currying trick — keeps it visible
+                -- to `CapCheck`'s dfn-only scan, matching march's own
+                -- DFn-only behavioral scan exactly, and also lets it carry
+                -- its `retTy` annotation into Check 1's return-cap scan
+                -- (previously dropped for the 0-param case; see
+                -- `capsInReturnSignature`'s docstring). A genuine top-level
+                -- `Ast.DLet` (a real `let x = ...` binding, JSON
+                -- `{"kind":"DLet",...}`) is unaffected — it still decodes via
+                -- the separate `"DLet"` arm below to `Decl.dlet`.
                 let body ← decodeTerm bodyJ
-                .ok (Decl.dlet name body)
+                .ok (Decl.dfn name [] retTy body)
             | some params =>
                 -- N-ary: carry the whole param list directly (no currying),
                 -- plus the (in-fragment) return annotation for Check 1.
@@ -638,6 +659,13 @@ partial def decodeDecl (j : Json) : Except String Decl := do
       -- In-fragment (Finding I1): see `Decl.dproofcap`'s docstring.
       let (name, _) ← decodeName (← field j "name")
       .ok (Decl.dproofcap name)
+  | "DOpts" => do
+      -- `opts no_panic, ...` — a bare list of cap names (verified shape:
+      -- `{"kind":"DOpts","opts":["no_panic"],"span":{…}}`; `opts` is a plain
+      -- `List String`, not a list of name objects like `DNeeds.paths`).
+      let optsJ ← (← field j "opts").getArr?.mapError (fun _ => "DOpts.opts")
+      let opts ← optsJ.toList.mapM str
+      .ok (Decl.dopts opts)
   | _ => .ok Decl.unsupported
 
 partial def decodeConstraint (j : Json) : Except String Constraint := do
@@ -806,6 +834,17 @@ open Lean MarchLean.Elab MarchLean.Syntax
   | .error e => IO.println s!"parse failed: {e}"
   | .ok j    => IO.println (repr (decodeDecl j))
   -- expect: Except.ok (Decl.dproofcap "Migrated")
+
+-- A3 slice (c) Task 1: DOpts decodes to Decl.dopts, carrying the bare cap
+-- names (verified real emitter shape for `opts no_panic`:
+-- `{"kind":"DOpts","opts":["no_panic"],"span":{...}}` — `opts` is a plain
+-- `List String`, not a list of name objects).
+#eval show IO Unit from do
+  let j := Json.parse r#"{"kind":"DOpts","opts":["no_panic"],"span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}}"#
+  match j with
+  | .error e => IO.println s!"parse failed: {e}"
+  | .ok j    => IO.println (repr (decodeDecl j))
+  -- expect: Except.ok (Decl.dopts ["no_panic"])
 
 -- DMod: nested module, name + recursive decls (here containing a DNeeds).
 #eval show IO Unit from do

@@ -23,125 +23,172 @@
 # skips — they wrong-accept — and live in scripts/known-limitations.txt instead.
 #
 # Regenerate: run the harness, take the observed skip set (both sides).
-# --- accept side (71) ---
-accept/t07_generic_option_two_types.march                      # out-of-fragment construct in a declaration
-accept/t08_tuple_construct_destructure.march                   # out-of-fragment construct in a declaration
-accept/t10_record_update_existing_field.march                  # out-of-fragment construct in a declaration
-accept/t11_atom_nullary_eq_match.march                         # out-of-fragment construct in a declaration
-accept/t12_atom_payload_and_name_erasure.march                 # out-of-fragment construct in a declaration
-accept/t13_match_guard.march                                   # out-of-fragment construct in a declaration
-accept/t15_econd_chain.march                                   # out-of-fragment construct in a declaration
-accept/t16_letfn_factorial.march                               # out-of-fragment construct in a declaration
-accept/t17_letfn_generalized_after_block.march                 # out-of-fragment construct in a declaration
-accept/t22_generic_when_constraint_satisfied.march             # out-of-fragment construct in a declaration
-accept/t23_interface_impl_basic.march                          # out-of-fragment construct in a declaration
-accept/t24_interface_impl_generic_head.march                   # out-of-fragment construct in a declaration
-accept/t25_interface_default_method.march                      # out-of-fragment construct in a declaration
-accept/t26_impl_superclass_satisfied.march                     # out-of-fragment construct in a declaration
-accept/t27_user_iface_lexical_dispatch.march                   # out-of-fragment construct in a declaration
-accept/t28_derive_impl_tbl_dispatch.march                      # out-of-fragment construct in a declaration
-accept/t29_derive_eq_show.march                                # out-of-fragment construct in a declaration
-accept/t30_satisfy_wiring.march                                # out-of-fragment construct in a declaration
-accept/t31_cross_module_public_and_opaque_ptype.march          # out of modeled fragment: SKIP: unbound variable `Array.empty`
-accept/t32_qualified_cross_module_call.march                   # out of modeled fragment: SKIP: unbound variable `A.double`
-accept/t33_nested_module_lexical_resolution.march              # out of modeled fragment: SKIP: unbound variable `A.Inner.call_secret`
-accept/t34_opaque_ptype_qualified_annotation.march             # out of modeled fragment: SKIP: unbound variable `ConsistentHash.new`
-accept/t35_no_per_module_type_namespace.march                  # out-of-fragment construct in a declaration
-accept/t36_qualified_record_type_still_green.march             # out-of-fragment construct in a declaration
-accept/t37_use_all_stdlib_module.march                         # out of modeled fragment: SKIP: unbound variable `length`
-accept/t38_use_selector_named_import.march                     # out-of-fragment construct in a declaration
-accept/t39_actor_spawn_pid.march                               # out-of-fragment construct in a declaration
-accept/t40_actor_send_typed_payload.march                      # out-of-fragment construct in a declaration
-accept/t41_binary_protocol_chan_new.march                      # out-of-fragment construct in a declaration
-accept/t42_mpst_protocol_new.march                             # out-of-fragment construct in a declaration
-accept/t43_choose_offer_roundtrip.march                        # out-of-fragment construct in a declaration
-accept/t44_binary_choice_identical_branches.march              # out-of-fragment construct in a declaration
-accept/t53_migrate_pure_needs_io.march                         # out-of-fragment construct in a declaration
-accept/t54_cap_pure_arithmetic.march                           # out-of-fragment construct in a declaration
-accept/t55_cap_no_alloc_arithmetic.march                       # out-of-fragment construct in a declaration
-accept/t56_cap_no_extern_ok.march                              # out-of-fragment construct in a declaration
-accept/t58_revoke_cap_typechecks.march                         # out-of-fragment construct in a declaration
-accept/t59_cap_no_panic_guarded_guardless_catchall.march       # out-of-fragment construct in a declaration
-accept/t60_nested_id_polymorphic.march                         # out-of-fragment construct in a declaration
-accept/t62_mint_cap_public_declaring.march                     # out-of-fragment construct in a declaration
-accept/t67_linear_field_arith_single.march                     # out-of-fragment construct in a declaration
-accept/t68_linear_send_consumes.march                          # out-of-fragment construct in a declaration
-accept/t69_sibling_own_ctor.march                              # out-of-fragment construct in a declaration
-accept/t70_letq_chain_value.march                              # out-of-fragment construct in a declaration
-accept/t71_letq_tuple_pattern.march                            # out-of-fragment construct in a declaration
-accept/t72_letq_wildcard.march                                 # out-of-fragment construct in a declaration
-accept/t73_parallel_typed_as_sequential.march                  # out of modeled fragment: SKIP: unbound variable `List.range`
-accept/t74_crdt_identity_typed.march                           # out of modeled fragment: SKIP: unbound variable `CRDT.GCounter.increment`
-accept/t75_refine_precondition_satisfied.march                 # out-of-fragment construct in a declaration
-accept/t76_refine_postcondition_satisfied.march                # out-of-fragment construct in a declaration
-accept/t77_refine_hof_bypass_limitation.march                  # out-of-fragment construct in a declaration
-accept/t78_refine_divsafety_approved.march                     # out-of-fragment construct in a declaration
-accept/t79_offer_branch_dependent_continuation.march           # out-of-fragment construct in a declaration
-accept/t83_impl_distinct_types.march                           # out-of-fragment construct in a declaration
-accept/t84_impl_distinct_ifaces.march                          # out-of-fragment construct in a declaration
-accept/t85_impl_parametric_distinct.march                      # out-of-fragment construct in a declaration
-accept/t86_bare_none_unpinned.march                            # out of modeled fragment: SKIP: unknown constructor `None`
-accept/t87_spawn_pid_state.march                               # out-of-fragment construct in a declaration
-accept/t88_impl_distinct_modules.march                         # out-of-fragment construct in a declaration
-accept/t89_impl_general_iface_collision.march                  # out-of-fragment construct in a declaration
-accept/t90_impl_coherence_shared_ctor_double_collision.march   # out-of-fragment construct in a declaration
-reject/t02_unbound_var.march                                   # out-of-fragment construct in a declaration
-reject/t05_ctor_arity.march                                    # out-of-fragment construct in a declaration
-reject/t06_match_branch_mismatch.march                         # out-of-fragment construct in a declaration
-reject/t07_field_missing.march                                 # out-of-fragment construct in a declaration
-reject/t08_tuple_arity_mismatch.march                          # out-of-fragment construct in a declaration
-reject/t09_record_update_missing_field.march                   # out-of-fragment construct in a declaration
-reject/t10_guard_not_bool.march                                # out-of-fragment construct in a declaration
-reject/t11_econd_condition_not_bool.march                      # out-of-fragment construct in a declaration
-reject/t12_letfn_ret_annot_conflict.march                      # out-of-fragment construct in a declaration
-reject/t17_generic_when_constraint_unsatisfied.march           # out-of-fragment construct in a declaration
-reject/t18_impl_missing_method.march                           # out-of-fragment construct in a declaration
-reject/t19_impl_extra_method.march                             # out-of-fragment construct in a declaration
-reject/t20_impl_signature_mismatch.march                       # out-of-fragment construct in a declaration
-reject/t21_impl_unknown_interface.march                        # out-of-fragment construct in a declaration
-reject/t22_impl_superclass_unsatisfied.march                   # out-of-fragment construct in a declaration
-reject/t24_satisfy_missing_function.march                      # out-of-fragment construct in a declaration
-reject/t25_private_nested_member.march                         # out-of-fragment construct in a declaration
-reject/t26_cross_module_private_fn.march                       # out-of-fragment construct in a declaration
-reject/t27_use_selector_private_name.march                     # out-of-fragment construct in a declaration
-reject/t28_spawn_computed_actor.march                          # out-of-fragment construct in a declaration
-reject/t29_actor_send_wrong_payload.march                      # out-of-fragment construct in a declaration
-reject/t30_send_at_recv_state.march                            # out-of-fragment construct in a declaration
-reject/t31_close_before_end.march                              # out-of-fragment construct in a declaration
-reject/t32_invalid_choose_label.march                          # out-of-fragment construct in a declaration
-reject/t33_wrong_payload_type.march                            # out-of-fragment construct in a declaration
-reject/t34_recv_at_wrong_state.march                           # out-of-fragment construct in a declaration
-reject/t35_linear_used_twice.march                             # out-of-fragment construct in a declaration
-reject/t42_cap_no_panic_explicit_panic.march                   # out-of-fragment construct in a declaration
-reject/t43_cap_no_alloc_tuple.march                            # out-of-fragment construct in a declaration
-reject/t44_cap_no_extern_extern_block.march                    # out-of-fragment construct in a declaration
-reject/t45_cap_pure_file_write.march                           # out-of-fragment construct in a declaration
-reject/t46_cap_pure_random_bytes.march                         # out-of-fragment construct in a declaration
-reject/t47_cap_deterministic_unix_time_ms.march                # out-of-fragment construct in a declaration
-reject/t48_cap_no_panic_nonexhaustive_match.march              # out-of-fragment construct in a declaration
-reject/t50_cap_no_panic_guarded_nonexhaustive.march            # out-of-fragment construct in a declaration
-reject/t51_nested_id_launder_int_to_string.march               # out-of-fragment construct in a declaration
-reject/t52_nested_id_launder_box.march                         # out-of-fragment construct in a declaration
-reject/t53_nested_distinct_tvar_launder.march                  # out-of-fragment construct in a declaration
-reject/t54_entry_self_qualified_launder.march                  # out-of-fragment construct in a declaration
-reject/t55_cap_narrow_forges_proof_cap.march                   # out-of-fragment construct in a declaration
-reject/t56_mint_cap_external_module.march                      # out-of-fragment construct in a declaration
-reject/t57_mint_cap_pfn_declaring.march                        # out-of-fragment construct in a declaration
-reject/t62_linear_closure_capture.march                        # linear/affine binder 'r' captured in a closure; escape analysis not modeled
-reject/t63_linear_field_double_let.march                       # out-of-fragment construct in a declaration
-reject/t65_always_linear_drop.march                            # out-of-fragment construct in a declaration
-reject/t66_linear_use_after_send.march                         # out-of-fragment construct in a declaration
-reject/t67_letq_last_expr.march                                # out-of-fragment construct in a declaration
-reject/t68_letq_rhs_not_result.march                           # out-of-fragment construct in a declaration
-reject/t69_letq_body_not_result.march                          # out-of-fragment construct in a declaration
-reject/t70_letq_type_annotation.march                          # no module (parse failure)
-reject/t71_refine_precondition_violated.march                  # out-of-fragment construct in a declaration
-reject/t72_refine_postcondition_violated.march                 # out-of-fragment construct in a declaration
-reject/t73_refine_divsafety_insufficient.march                 # out-of-fragment construct in a declaration
-reject/t74_offer_wrong_branch_drive.march                      # out-of-fragment construct in a declaration
-reject/t75_drop_unclosed_end_channel.march                     # out-of-fragment construct in a declaration
-reject/t76_reuse_linear_param_endpoint.march                   # out-of-fragment construct in a declaration
-reject/t77_linear_field_double_param.march                     # out-of-fragment construct in a declaration
-reject/t79_impl_coherence_duplicate.march                      # out-of-fragment construct in a declaration
-reject/t80_impl_parametric_overlap.march                       # out-of-fragment construct in a declaration
-reject/t81_spawn_pid_cross_actor.march                         # out-of-fragment construct in a declaration
+# --- accept side (82) ---
+accept/t07_generic_option_two_types.march                          # out-of-fragment construct in a declaration
+accept/t08_tuple_construct_destructure.march                       # out-of-fragment construct in a declaration
+accept/t10_record_update_existing_field.march                      # out-of-fragment construct in a declaration
+accept/t11_atom_nullary_eq_match.march                             # out-of-fragment construct in a declaration
+accept/t12_atom_payload_and_name_erasure.march                     # out-of-fragment construct in a declaration
+accept/t15_econd_chain.march                                       # out-of-fragment construct in a declaration
+accept/t16_letfn_factorial.march                                   # out-of-fragment construct in a declaration
+accept/t17_letfn_generalized_after_block.march                     # out-of-fragment construct in a declaration
+accept/t22_generic_when_constraint_satisfied.march                 # out-of-fragment construct in a declaration
+accept/t23_interface_impl_basic.march                              # out-of-fragment construct in a declaration
+accept/t24_interface_impl_generic_head.march                       # out-of-fragment construct in a declaration
+accept/t25_interface_default_method.march                          # out-of-fragment construct in a declaration
+accept/t26_impl_superclass_satisfied.march                         # out-of-fragment construct in a declaration
+accept/t27_user_iface_lexical_dispatch.march                       # out-of-fragment construct in a declaration
+accept/t28_derive_impl_tbl_dispatch.march                          # out-of-fragment construct in a declaration
+accept/t29_derive_eq_show.march                                    # out-of-fragment construct in a declaration
+accept/t30_satisfy_wiring.march                                    # out-of-fragment construct in a declaration
+accept/t31_cross_module_public_and_opaque_ptype.march              # out of modeled fragment: SKIP: unbound variable `Array.empty`
+accept/t32_qualified_cross_module_call.march                       # out of modeled fragment: SKIP: unbound variable `A.double`
+accept/t33_nested_module_lexical_resolution.march                  # out of modeled fragment: SKIP: unbound variable `A.Inner.call_secret`
+accept/t34_opaque_ptype_qualified_annotation.march                 # out of modeled fragment: SKIP: unbound variable `ConsistentHash.new`
+accept/t35_no_per_module_type_namespace.march                      # out-of-fragment construct in a declaration
+accept/t36_qualified_record_type_still_green.march                 # out-of-fragment construct in a declaration
+accept/t37_use_all_stdlib_module.march                             # out of modeled fragment: SKIP: unbound variable `length`
+accept/t38_use_selector_named_import.march                         # out-of-fragment construct in a declaration
+accept/t39_actor_spawn_pid.march                                   # out-of-fragment construct in a declaration
+accept/t40_actor_send_typed_payload.march                          # out-of-fragment construct in a declaration
+accept/t41_binary_protocol_chan_new.march                          # out-of-fragment construct in a declaration
+accept/t42_mpst_protocol_new.march                                 # out-of-fragment construct in a declaration
+accept/t43_choose_offer_roundtrip.march                            # out-of-fragment construct in a declaration
+accept/t44_binary_choice_identical_branches.march                  # out-of-fragment construct in a declaration
+accept/t53_migrate_pure_needs_io.march                             # out-of-fragment construct in a declaration
+accept/t58_revoke_cap_typechecks.march                             # out-of-fragment construct in a declaration
+accept/t59_cap_no_panic_guarded_guardless_catchall.march           # out of modeled fragment: SKIP: unknown constructor pattern `Some`
+accept/t60_nested_id_polymorphic.march                             # out-of-fragment construct in a declaration
+accept/t62_mint_cap_public_declaring.march                         # out of modeled fragment: SKIP: unbound variable `mint_cap`
+accept/t67_linear_field_arith_single.march                         # out-of-fragment construct in a declaration
+accept/t68_linear_send_consumes.march                              # out-of-fragment construct in a declaration
+accept/t69_sibling_own_ctor.march                                  # out-of-fragment construct in a declaration
+accept/t70_letq_chain_value.march                                  # out-of-fragment construct in a declaration
+accept/t71_letq_tuple_pattern.march                                # out-of-fragment construct in a declaration
+accept/t72_letq_wildcard.march                                     # out-of-fragment construct in a declaration
+accept/t73_parallel_typed_as_sequential.march                      # out of modeled fragment: SKIP: unbound variable `List.range`
+accept/t74_crdt_identity_typed.march                               # out of modeled fragment: SKIP: unbound variable `CRDT.GCounter.increment`
+accept/t75_refine_precondition_satisfied.march                     # out-of-fragment construct in a declaration
+accept/t76_refine_postcondition_satisfied.march                    # out-of-fragment construct in a declaration
+accept/t77_refine_hof_bypass_limitation.march                      # out-of-fragment construct in a declaration
+accept/t78_refine_divsafety_approved.march                         # out-of-fragment construct in a declaration
+accept/t79_offer_branch_dependent_continuation.march               # out-of-fragment construct in a declaration
+accept/t83_impl_distinct_types.march                               # out-of-fragment construct in a declaration
+accept/t84_impl_distinct_ifaces.march                              # out-of-fragment construct in a declaration
+accept/t85_impl_parametric_distinct.march                          # out-of-fragment construct in a declaration
+accept/t86_bare_none_unpinned.march                                # out of modeled fragment: SKIP: unknown constructor `None`
+accept/t87_spawn_pid_state.march                                   # out-of-fragment construct in a declaration
+accept/t88_impl_distinct_modules.march                             # out-of-fragment construct in a declaration
+accept/t89_impl_general_iface_collision.march                      # out-of-fragment construct in a declaration
+accept/t90_impl_coherence_shared_ctor_double_collision.march       # out-of-fragment construct in a declaration
+accept/t92_loop_protocol_two_iterations.march                      # out-of-fragment construct in a declaration
+accept/t104_lambda_param_annotation_enforced.march                 # out-of-fragment construct in a declaration
+accept/t105_loop_stop_two_iterations_close.march                   # out-of-fragment construct in a declaration
+accept/t105_refine_adt_tag_satisfied.march                         # out-of-fragment construct in a declaration
+accept/t106_refine_adt_unknown_skipped.march                       # out-of-fragment construct in a declaration
+accept/t107_refine_string_len_satisfied.march                      # out-of-fragment construct in a declaration
+accept/t108_refine_record_field_satisfied.march                    # out-of-fragment construct in a declaration
+accept/t109_refine_relational_satisfiable.march                    # out-of-fragment construct in a declaration
+accept/t110_refine_unproven_post_not_propagated.march              # out-of-fragment construct in a declaration
+accept/t111_refine_hof_callback_satisfied.march                    # out-of-fragment construct in a declaration
+accept/t112_refine_float_satisfied.march                           # out-of-fragment construct in a declaration
+accept/t113_refine_float_nan_only_skipped.march                    # out-of-fragment construct in a declaration
+accept/t114_refine_bool_satisfied.march                            # out-of-fragment construct in a declaration
+accept/t115_refine_list_nonempty_satisfied.march                   # out-of-fragment construct in a declaration
+accept/t116_refine_list_nonempty_unknown_skipped.march             # out-of-fragment construct in a declaration
+accept/t117_refine_list_nonempty_named_binder.march                # out-of-fragment construct in a declaration
+accept/t118_refine_length_guard_discharges.march                   # out-of-fragment construct in a declaration
+accept/t119_cap_no_panic_impl_body_guarded_division.march          # out-of-fragment construct in a declaration
+accept/t121_cap_no_panic_nonlinear_divisor_refinement.march        # out-of-fragment construct in a declaration
+accept/t125_impl_method_contract_satisfied.march                   # out-of-fragment construct in a declaration
+accept/t126_entry_module_shadows_list_length.march                 # out-of-fragment construct in a declaration
+accept/t127_entry_module_shadows_string_byte_size.march            # out-of-fragment construct in a declaration
+accept/t128_refine_list_contract_composes_call.march               # out-of-fragment construct in a declaration
+accept/t129_refine_tag_contract_composes_call.march                # out-of-fragment construct in a declaration
+accept/t130_refine_let_annotation_checked_and_composes.march       # out-of-fragment construct in a declaration
+reject/t02_unbound_var.march                                       # out-of-fragment construct in a declaration
+reject/t05_ctor_arity.march                                        # out-of-fragment construct in a declaration
+reject/t06_match_branch_mismatch.march                             # out-of-fragment construct in a declaration
+reject/t07_field_missing.march                                     # out-of-fragment construct in a declaration
+reject/t08_tuple_arity_mismatch.march                              # out-of-fragment construct in a declaration
+reject/t09_record_update_missing_field.march                       # out-of-fragment construct in a declaration
+reject/t11_econd_condition_not_bool.march                          # out-of-fragment construct in a declaration
+reject/t12_letfn_ret_annot_conflict.march                          # out-of-fragment construct in a declaration
+reject/t17_generic_when_constraint_unsatisfied.march               # out-of-fragment construct in a declaration
+reject/t18_impl_missing_method.march                               # out-of-fragment construct in a declaration
+reject/t19_impl_extra_method.march                                 # out-of-fragment construct in a declaration
+reject/t20_impl_signature_mismatch.march                           # out-of-fragment construct in a declaration
+reject/t21_impl_unknown_interface.march                            # out-of-fragment construct in a declaration
+reject/t22_impl_superclass_unsatisfied.march                       # out-of-fragment construct in a declaration
+reject/t24_satisfy_missing_function.march                          # out-of-fragment construct in a declaration
+reject/t25_private_nested_member.march                             # out-of-fragment construct in a declaration
+reject/t26_cross_module_private_fn.march                           # out-of-fragment construct in a declaration
+reject/t27_use_selector_private_name.march                         # out-of-fragment construct in a declaration
+reject/t28_spawn_computed_actor.march                              # out-of-fragment construct in a declaration
+reject/t29_actor_send_wrong_payload.march                          # out-of-fragment construct in a declaration
+reject/t30_send_at_recv_state.march                                # out-of-fragment construct in a declaration
+reject/t31_close_before_end.march                                  # out-of-fragment construct in a declaration
+reject/t32_invalid_choose_label.march                              # out-of-fragment construct in a declaration
+reject/t33_wrong_payload_type.march                                # out-of-fragment construct in a declaration
+reject/t34_recv_at_wrong_state.march                               # out-of-fragment construct in a declaration
+reject/t35_linear_used_twice.march                                 # out-of-fragment construct in a declaration
+reject/t51_nested_id_launder_int_to_string.march                   # out-of-fragment construct in a declaration
+reject/t52_nested_id_launder_box.march                             # out-of-fragment construct in a declaration
+reject/t53_nested_distinct_tvar_launder.march                      # out-of-fragment construct in a declaration
+reject/t54_entry_self_qualified_launder.march                      # out-of-fragment construct in a declaration
+reject/t55_cap_narrow_forges_proof_cap.march                       # out of modeled fragment: SKIP: unbound variable `App.consume`
+reject/t56_mint_cap_external_module.march                          # out of modeled fragment: SKIP: unbound variable `mint_cap`
+reject/t57_mint_cap_pfn_declaring.march                            # out of modeled fragment: SKIP: unbound variable `mint_cap`
+reject/t62_linear_closure_capture.march                            # linear/affine binder 'r' captured in a closure; escape analysis not modeled
+reject/t63_linear_field_double_let.march                           # out-of-fragment construct in a declaration
+reject/t65_always_linear_drop.march                                # out-of-fragment construct in a declaration
+reject/t66_linear_use_after_send.march                             # out-of-fragment construct in a declaration
+reject/t67_letq_last_expr.march                                    # out-of-fragment construct in a declaration
+reject/t68_letq_rhs_not_result.march                               # out-of-fragment construct in a declaration
+reject/t69_letq_body_not_result.march                              # out-of-fragment construct in a declaration
+reject/t70_letq_type_annotation.march                              # no module (parse failure)
+reject/t71_refine_precondition_violated.march                      # out-of-fragment construct in a declaration
+reject/t72_refine_postcondition_violated.march                     # out-of-fragment construct in a declaration
+reject/t73_refine_divsafety_insufficient.march                     # out-of-fragment construct in a declaration
+reject/t74_offer_wrong_branch_drive.march                          # out-of-fragment construct in a declaration
+reject/t75_drop_unclosed_end_channel.march                         # out-of-fragment construct in a declaration
+reject/t76_reuse_linear_param_endpoint.march                       # out-of-fragment construct in a declaration
+reject/t77_linear_field_double_param.march                         # out-of-fragment construct in a declaration
+reject/t79_impl_coherence_duplicate.march                          # out-of-fragment construct in a declaration
+reject/t80_impl_parametric_overlap.march                           # out-of-fragment construct in a declaration
+reject/t81_spawn_pid_cross_actor.march                             # out-of-fragment construct in a declaration
+reject/t82_or_pattern_binding.march                                # out-of-fragment construct in a declaration
+reject/t91_choice_tail_step_required.march                         # out-of-fragment construct in a declaration
+reject/t93_steps_after_loop_unreachable.march                      # out-of-fragment construct in a declaration
+reject/t94_chan_new_multiparty_protocol.march                      # out-of-fragment construct in a declaration
+reject/t95_offer_unrefined_continuation.march                      # out-of-fragment construct in a declaration
+reject/t96_offer_missing_branch_arm.march                          # out-of-fragment construct in a declaration
+reject/t97_offer_label_shadow_bypass.march                         # out-of-fragment construct in a declaration
+reject/t98_offer_unrefined_laundered_annotation.march              # out-of-fragment construct in a declaration
+reject/t99_offer_unrefined_laundered_if_join.march                 # out-of-fragment construct in a declaration
+reject/t100_offer_unrefined_laundered_fn_param.march               # out-of-fragment construct in a declaration
+reject/t101_loop_branch_hides_post_choose_tail.march               # out-of-fragment construct in a declaration
+reject/t102_offer_unrefined_laundered_lambda_param.march           # out-of-fragment construct in a declaration
+reject/t103_offer_unrefined_laundered_inner_fn_param.march         # out-of-fragment construct in a declaration
+reject/t104_refine_adt_tag_violated.march                          # out-of-fragment construct in a declaration
+reject/t105_refine_adt_narrowing_violated.march                    # out-of-fragment construct in a declaration
+reject/t106_refine_string_len_violated.march                       # out-of-fragment construct in a declaration
+reject/t106_stop_outside_loop.march                                # out-of-fragment construct in a declaration
+reject/t107_refine_record_field_violated.march                     # out-of-fragment construct in a declaration
+reject/t107_steps_after_stop_unreachable.march                     # out-of-fragment construct in a declaration
+reject/t108_refine_relational_violated.march                       # out-of-fragment construct in a declaration
+reject/t109_refine_induction_propagates.march                      # out-of-fragment construct in a declaration
+reject/t110_refine_hof_callback_violated.march                     # out-of-fragment construct in a declaration
+reject/t111_refine_hof_alias_violated.march                        # out-of-fragment construct in a declaration
+reject/t112_refine_float_violated.march                            # out-of-fragment construct in a declaration
+reject/t113_refine_bool_violated.march                             # out-of-fragment construct in a declaration
+reject/t114_refine_list_nonempty_violated.march                    # out-of-fragment construct in a declaration
+reject/t115_refine_list_nonempty_named_violated.march              # out-of-fragment construct in a declaration
+reject/t116_refine_stdlib_head_empty.march                         # out of modeled fragment: SKIP: unbound variable `List.head`
+reject/t117_refine_length_guard_contradiction.march                # out-of-fragment construct in a declaration
+reject/t120_cap_no_panic_impl_body_division.march                  # out-of-fragment construct in a declaration
+reject/t122_cap_no_panic_nonlinear_divisor_proves_nothing.march    # out-of-fragment construct in a declaration
+reject/t124_impl_method_contract_obliges_caller.march              # out-of-fragment construct in a declaration
+reject/t129_refine_weaker_contract_composition_still_fails.march   # out-of-fragment construct in a declaration
+reject/t130_refine_tag_composition_narrowed_violation.march        # out-of-fragment construct in a declaration
+reject/t131_refine_let_annotation_false.march                      # out-of-fragment construct in a declaration

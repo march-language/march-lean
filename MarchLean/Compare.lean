@@ -217,7 +217,7 @@ partial def termSpanTys (env : TyEnv) (isCallee : Bool) : Term → List (Span ×
       (if isCallee && !isArrowShaped env ty then [] else [(span, ty)]) ++ termSpanTys env false r
   | .match_ scrut arms _ =>
       termSpanTys env false scrut ++
-        (arms.map (fun (_, body) => termSpanTys env false body)).foldl (· ++ ·) []
+        (arms.map (fun (_, _, body) => termSpanTys env false body)).foldl (· ++ ·) []
   | .unsupported _ => []
 
 /-- `termSpanTys`, dispatched over one declaration (`dtype` carries no
@@ -230,7 +230,7 @@ def declSpanTys (env : TyEnv) : Decl → List (Span × Ty)
   -- `(span, ty)` pairs to contribute. `dmod` is inert-but-unreachable here:
   -- `inferModule` flattens nested `dmod`s via `flattenDecls` before this is
   -- ever called, so its children already appear as top-level decls.
-  | .dmod .. | .dneeds _ | .duse _ | .dextern .. | .dproofcap _ => []
+  | .dmod .. | .dneeds _ | .duse _ | .dextern .. | .dproofcap _ | .dopts _ => []
   | .unsupported => []
 
 /-- Every `(span, resolved_ty)` pair for every `var`/`field` node in the

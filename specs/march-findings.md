@@ -71,3 +71,84 @@ IO-freedom) in `MarchLean/CapCheck.lean` (`bodyCallsIO`) and cross-checking
 its behavior against march's `calls_in_expr` line by line.
 
 **Status.** reported upstream: https://github.com/march-language/march/issues/82 (filed 2026-07-24)
+
+---
+
+## Finding: the SECOND `calls_in_expr` (pure/deterministic/no_panic) has the identical missing-`ETuple` gap, and feeds three checks, not one
+
+**What was found.** The entry above flagged that march's source defines a
+second, unrelated `let rec calls_in_expr` (then at line 8063) but only
+attributed it to "the panic-surface/no-panic check." That was incomplete:
+this second copy is the single shared body-walk behind **three** checks —
+`check_pure_module`, `check_deterministic_module`, and
+`check_no_panic_module` — and it ends in the exact same catch-all `| _ ->
+acc` with no `ETuple` (or `ERecord`/`EList`) arm as the first copy. A direct
+call hidden inside a tuple element is therefore invisible to `cap pure`,
+`cap deterministic`, and `cap no_panic` alike, not just to the no-panic
+check. This is the root cause of three false REJECTs surfaced by
+`MarchLean/CapCheck.lean`'s `bodyCalls` (a deliberately total walk that
+already handles `.tuple`, per Check 8's fix) against march's real,
+non-total walk.
+
+**Reproducers.** All three verified directly against
+`_build/default/bin/main.exe` and `march-lean-check` on this branch:
+
+```march
+mod P do
+  cap pure
+  needs IO.Console
+  fn f() : (Unit, Int) do (println("hi"), 1) end
+end
+```
+- march (`--check`): exit 0 (ACCEPT) — `println` inside the `ETuple` is
+  invisible to `calls_in_expr`.
+- `march-lean-check`: exit 1 (REJECT) — `cap pure: fn `f`... performs a
+  side effect`.
+
+```march
+mod P do
+  cap deterministic
+  needs IO.Clock
+  fn f() : (Int, Int) do (unix_time_ms(()), 1) end
+end
+```
+- march: exit 0 (ACCEPT). `march-lean-check`: exit 1 (REJECT) — `cap
+  deterministic: fn `f`... performs a non-deterministic operation`.
+
+```march
+mod P do
+  cap no_panic
+  fn f() : (Unit, Int) do (panic("boom"), 1) end
+end
+```
+- march: exit 0 (ACCEPT). `march-lean-check`: exit 1 (REJECT) — `cap
+  no_panic: fn `f`... may panic (explicit panic)`.
+
+**march's source location.** `lib/typecheck/typecheck.ml`, the second `let
+rec calls_in_expr` (currently lines 8834–8863; catch-all `| _ -> acc` at
+line 8863, no `ETuple`/`ERecord`/`EList` arm — structurally identical to the
+first copy's gap). Called from `check_no_panic_module` (line 8886, body
+scan inside `check_no_panic_module` at line 8879), `check_pure_module`
+(line 9009, function starts line 9003), and `check_deterministic_module`
+(line 9074, function starts line 9068).
+
+**Which side is wrong.** march. `MarchLean/CapCheck.lean`'s `bodyCalls` is
+a single generalised walk (Task 1 of this slice) shared by Check 8 and by
+the `cap pure`/`deterministic`/`no_panic` explicit-call scan; it is total
+over every `Term` constructor including `.tuple`, matching the checker's own
+already-established correct behavior for Check 8 above. march's traversal
+has the same gap in its second copy, letting a banned call leak out of a
+`cap pure`/`deterministic`/`no_panic` function through a tuple literal.
+
+**How it was found.** A3 slice (c), generalising `bodyCallsIO` to
+`bodyCalls` and reusing it for the `pure`/`deterministic`/`no_panic`
+explicit-call scan; the resulting three false REJECTs (oracle rejects,
+march accepts) were traced to this second `calls_in_expr` copy by reading
+`typecheck.ml` end to end and confirming empirically with the reproducers
+above (2026-07-31).
+
+**Status.** reported upstream: NOT YET — same underlying defect class as
+march#82 but a distinct source location (second copy, three different call
+sites); should be reported as its own issue or as an amendment to #82 since
+the fix (adding `ETuple`/`ERecord`/`EList` arms to *this* `calls_in_expr`,
+not just the first one) is a separate code change.
