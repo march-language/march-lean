@@ -392,6 +392,18 @@ partial def bodyCalls (banned : List String) : Term → Bool
   | .match_ scrut arms _ =>
       bodyCalls banned scrut ||
         arms.any (fun (_, g, e) => (g.map (bodyCalls banned)).getD false || bodyCalls banned e)
+  -- `.opaque_` (`ECond`/`ERecordUpdate`/`EAtom`/`EAssert`/`EDbg`/`ELetFn`/
+  -- `ELetQ`/`ESend`/`ESpawn`) RECURSES. Its own shape is unmodelled, but it
+  -- carries the exact child-expression list march's `calls_in_expr` descends
+  -- into for those kinds (`typecheck.ml:7734-7750`), and `calls_in_expr` is
+  -- the shared body-walk behind `check_pure_module`,
+  -- `check_deterministic_module`, `check_no_panic_module` and Check 8. A
+  -- banned call inside `match do c -> println("leak") end` or
+  -- `send(p, unix_time_ms())` must therefore be found HERE — before the skip
+  -- gate — or the file exits 2 while march exits 1. Recursing costs nothing
+  -- in false-reject exposure: it can only ever ADD a `true`, i.e. only ever
+  -- turn a skip into a reject that march also renders.
+  | .opaque_ children _ => children.any (bodyCalls banned)
   -- LOAD-BEARING: this arm is safe returning `false` (rather than `true`,
   -- which would be the conservative choice) ONLY because
   -- `MarchLeanCheck.lean`'s `run` invokes `CapCheck.checkCaps` BEFORE the
@@ -403,6 +415,20 @@ partial def bodyCalls (banned : List String) : Term → Bool
   -- arm itself reports "no IO here". If the driver is ever reordered so the
   -- skip gate runs before (or independently of) `checkCaps`, this arm
   -- becomes a false accept and must be revisited.
+  --
+  -- **That ordering dependency is now DEEPER, not merely inherited.**
+  -- `Term.opaque_` exists solely to exploit it: the constructor hard-codes
+  -- `Term.hasUnsupported = true` (so the file still skips, so `Infer` and
+  -- `Linearity` never judge a construct they have no rules for — the exact
+  -- mechanism that produced the previous slice's false rejects) WHILE its
+  -- children stay visible to this walk and its siblings (`bodyAllocates`,
+  -- `divisionVerdict`, `matchesIn`, `termMentionsAny`). The whole value of
+  -- the constructor is the window between `checkCaps` and the skip gate. If
+  -- anyone reorders `MarchLeanCheck.run` so the skip gate precedes (or
+  -- short-circuits) `checkCaps`, `Term.opaque_` stops detecting ANYTHING —
+  -- it does not degrade to "conservative", it degrades to silent — and this
+  -- arm becomes a false accept besides. Reorder the driver only by first
+  -- deleting `Term.opaque_`.
   | .unsupported _ => false
 
 /-- `bodyCallsIO`, kept as a thin specialisation of `bodyCalls` over
@@ -444,6 +470,16 @@ partial def bodyAllocates : Term → Bool
   | .match_ scrut arms _ =>
       bodyAllocates scrut ||
         arms.any (fun (_, g, e) => (g.map bodyAllocates).getD false || bodyAllocates e)
+  -- `.opaque_` RECURSES, and contributes NO allocation of its own. Verified
+  -- against march's `no_alloc.ml` directly: its four allocating arms are
+  -- `ETuple (_::_)`, `ERecord`, `ECon (_, _::_)` and `ELam` — none of the
+  -- nine `opaque_` kinds is among them, and `check_expr` has an explicit
+  -- recurse-only arm for every one (`ELetFn`, `ELetQ`, `ECond`, `ESpawn`,
+  -- `EAssert`, `EDbg`, `ESend`, `ERecordUpdate`, `EAtom`;
+  -- `no_alloc.ml:41-63`). Note in particular that march does NOT treat
+  -- `ERecordUpdate` as an allocation even though it treats `ERecord` as one,
+  -- so this arm must not answer `true` the way `.record` does.
+  | .opaque_ children _ => children.any bodyAllocates
   | .unsupported _ => false
 
 /-- Division operators march's own division-safety pass flags
@@ -544,6 +580,15 @@ partial def termMentionsAny (names : List String) : Term → Bool
   | .match_ scrut arms _ =>
       termMentionsAny names scrut ||
         arms.any (fun (_, g, e) => (g.map (termMentionsAny names)).getD false || termMentionsAny names e)
+  -- `.opaque_` RECURSES. This walk is the DELIBERATELY over-approximate
+  -- `expr_mentions`, whose only use is to DISCARD a path fact when a name it
+  -- talks about is rebound; over-approximating loses information (a division
+  -- goes unproven → skip) instead of inventing a proof. Recursing therefore
+  -- moves strictly in the safe direction, and matches march, whose
+  -- `expr_mentions` is itself total over `Ast.expr`. Leaving it at `false`
+  -- would let a stale guard about an outer `d` survive a rebinding hidden in
+  -- an `ELetQ`/`ELetFn` child and license a WRONG non-zero proof.
+  | .opaque_ children _ => children.any (termMentionsAny names)
   | .unsupported _ => false
 
 /-- Drop every path entry whose condition mentions a name in `names` — march's
@@ -769,6 +814,17 @@ def divisorVerdict (facts : DivFacts) (path : DivPath) (divisor : Term) : DivVer
     | .lit _ _ | .app _ _ _ | .lam _ _ _ | .let_ _ _ _ _ _ _
     | .letfn _ _ _ _ _ _ _ | .ite _ _ _ _ | .con _ _ _ | .tuple _ _
     | .record _ _ | .field _ _ _ _ | .match_ _ _ _ => .divZero
+    -- `.opaque_` as the DIVISOR ITSELF (`10 / dbg(x)`, `10 / :tag(x)`, ...)
+    -- stays at "cannot judge", deliberately NOT joined into the `.divZero`
+    -- row above. All nine kinds really do land in march's arm-4 catch-all
+    -- today, so rejecting would be right — but this is a JUDGEMENT site, not
+    -- a collector, and the whole point of this slice is that `opaque_`
+    -- carries children WITHOUT modelling the node. Answering `unknown` keeps
+    -- the file's verdict exactly what it was before `opaque_` existed (the
+    -- enclosing decl's `hasUnsupported` sends it to exit 2 regardless), so
+    -- the slice adds detection only where it can also justify it. Tightening
+    -- this to `.divZero` is a separate, separately-verified change.
+    | .opaque_ _ _ => .unknown
     -- `.unsupported` is `decodeTerm`'s open catch-all for march `kind`s this
     -- fragment does not decode — including ones that do not exist yet. Every
     -- kind it currently covers IS in march's arm 4, but a future one need not
@@ -925,6 +981,24 @@ partial def divisionVerdict (facts : DivFacts) (path : DivPath) : Term → DivVe
             | none      => path'
           ((g.map (divisionVerdict facts' path')).getD .safe).join
             (divisionVerdict facts' bodyPath e))))
+  -- `.opaque_` RECURSES — but with BOTH channels EMPTIED, and that is the
+  -- load-bearing part of this arm. march's `iter_div_sites`
+  -- (`division_safety.ml:204-269`) walks all nine kinds too, but it walks
+  -- them KNOWING their shape: `ELetFn`/`ELetQ` retire the names they bind
+  -- (`under (n :: lam_param_names ps) body`, `under (pat_binders p) body`)
+  -- and `ECond` pushes each arm's condition onto `path`. `Term.opaque_`
+  -- records neither binders nor arm structure, so we cannot reproduce either.
+  -- Carrying the OUTER facts/path in unchanged would be unsound in the
+  -- false-REJECT direction: a stale `d = 0` fact surviving into an `ELetFn`
+  -- body that rebinds `d` would manufacture a `divZero` march never renders.
+  -- Emptying both channels is conservative on both sides — with no facts a
+  -- `var` divisor answers `unknown` (skip, never a fabricated reject), and
+  -- with no path nothing is fabricated as PROVEN non-zero either. What
+  -- survives is exactly the two judgements march makes unconditionally, with
+  -- no solver, no refinement escape and no path escape: a literal-zero
+  -- divisor (arm 1) and a complex divisor (arm 4). So `10 / 0` hidden in a
+  -- `cond` arm is now the reject march says it is, and nothing else moves.
+  | .opaque_ children _ => DivVerdict.joinAll (children.map (divisionVerdict [] []))
   | .unsupported _ => .safe
 
 /-- `no_panic`'s SECOND half (A3 slice (c) Task 3): a non-exhaustive `match`
@@ -1268,6 +1342,16 @@ partial def matchesIn : Term → List (Ty × List (Pattern × Option Term × Ter
   | .match_ scrut arms _ =>
       (scrut.ty, arms) :: (matchesIn scrut ++ arms.flatMap (fun (_, g, e) =>
         (g.map matchesIn).getD [] ++ matchesIn e))
+  -- `.opaque_` RECURSES: a pure collector, and a non-exhaustive `match`
+  -- nested inside a `cond` arm or a `let?` continuation is exactly as much a
+  -- runtime-panic surface as a top-level one. march agrees — its
+  -- exhaustiveness diagnostic is recorded by the typechecker's own total
+  -- expression walk, which visits these nodes, and `check_no_panic_module`
+  -- then promotes the recorded span to an error. `matchExhaustive` remains
+  -- the judgement site and remains conservative (unsure ⇒ "exhaustive"), so
+  -- adding nodes here cannot manufacture a reject on a match this checker
+  -- cannot actually classify.
+  | .opaque_ children _ => children.flatMap matchesIn
   | .unsupported _ => []
 
 /-- Does `t` (a function body) contain any non-exhaustive `match_` at all,

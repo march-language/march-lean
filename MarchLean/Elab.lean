@@ -278,15 +278,44 @@ mutual
 /-- Decode an expr node into a `Term`. Every arm reads the node's own
 `resolved_ty` first (via `decodeResolvedTy`) so it's threaded as `ty` on
 whichever constructor is produced, including the `unsupported` fallback for
-any `kind` not handled below (`ECond`/`EPipe`/`EAnnot`/`EHole`/`EAtom`/
-`ESend`/`ESpawn`/`EResultRef`/`EDbg`/`ELetFn`/`ELetQ`/`EAssert`/`ESigil` —
-none of these appear in the 8 real samples; `Term` has a dedicated `letfn`
-constructor for a future `ELetFn` decoder, but since no sample exercises it
-this task leaves it on the unsupported fallback rather than guessing at an
-undertested currying/sequencing shape). `ELet` is handled only via
-`decodeBlockStmts` (inside `EBlock`) — it never reaches this dispatch
-directly, since march's grammar only produces `ELet` as one element of an
-`EBlock`'s expr list. -/
+any `kind` not handled below (`EPipe`/`EAnnot`/`EHole`/`EResultRef`/`ESigil`
+— plus, by design, every march `kind` that does not exist yet). `Term` has a
+dedicated `letfn` constructor for a future `ELetFn` decoder, but since no
+sample exercises it this file does not guess at an undertested
+currying/sequencing shape: `ELetFn` decodes to `opaque_` (below) instead.
+`ELet` is handled only via `decodeBlockStmts` (inside `EBlock`) — it never
+reaches this dispatch directly, since march's grammar only produces `ELet` as
+one element of an `EBlock`'s expr list.
+
+**The `opaque_` arms.** Nine `kind`s — `ECond`, `ERecordUpdate`, `EAtom`,
+`EAssert`, `EDbg`, `ELetFn`, `ELetQ`, `ESend`, `ESpawn` — are still not
+modelled, but each can NEST arbitrary sub-expressions, and march's
+`calls_in_expr` (`typecheck.ml:7704-7752`) walks into all of them. They
+therefore decode to `Term.opaque_ children ty`, carrying exactly the
+sub-expression list march's own walk descends into and in march's order, so
+`CapCheck`'s cap-layer walks can find a `cap pure`/`deterministic`/
+`no_alloc`/`no_panic` violation hiding inside one. `Term.opaque_` still
+reports `hasUnsupported = true`, so nothing else about these files changes —
+they still hit the whole-file skip gate. Child fields were read off the
+emitter (`lib/dump/ast_json.ml:379-503`), NOT guessed:
+
+| `kind`          | emitter fields                    | children (march order) |
+|-----------------|-----------------------------------|------------------------|
+| `ECond`         | `arms : [{cond, body}]`           | `cond`,`body` per arm, in order (`calls_in_expr`: `calls_in_expr (calls_in_expr a ce) be`) |
+| `ERecordUpdate` | `base`, `fields : [{name,value}]` | `base` then each `value` |
+| `EAtom`         | `atom`, `args`                    | `args` (`atom` is a bare string) |
+| `EAssert`       | `expr`                            | `expr` |
+| `EDbg`          | `expr` (NULLABLE — `dbg()`)       | `[]` when null, else `expr` |
+| `ELetFn`        | `name`,`params`,`ret_ty`,`body`   | `body` only — `params` are `param_to_json` records (`name`/`ty`/`lin`), no exprs, and march's `ELetFn` arm walks only `body` |
+| `ELetQ`         | `pattern`,`value`,`cont`          | `value` then `cont` |
+| `ESend`         | `cap`, `msg`                      | `cap` then `msg` |
+| `ESpawn`        | `actor`                           | `actor` |
+
+`EPipe`/`ESigil` are deliberately NOT here: `Desugar` eliminates both before
+emission (`lib/desugar/desugar.ml:543-586`, `:733-744`), so arms for them
+would be dead code. `EAnnot`/`EHole`/`EResultRef` are also excluded — no
+parser production reaches them here, and `EHole`/`EResultRef` are leaves with
+no sub-expression a capability could hide in. -/
 partial def decodeTerm (j : Json) : Except String Term := do
   let ty ← decodeResolvedTy j
   match ← kindOf j with
@@ -352,6 +381,53 @@ partial def decodeTerm (j : Json) : Except String Term := do
       let t ← decodeTerm (← field j "then_")
       let e ← decodeTerm (← field j "else_")
       .ok (Term.ite c t e ty)
+  -- ── The nine `opaque_` kinds (see this function's docstring for the
+  -- field-by-field emitter correspondence). Shape is NOT modelled; only the
+  -- child EXPRESSIONS march's `calls_in_expr` walks are carried.
+  | "ECond" =>
+      -- `arms : [{cond, body}]` — BOTH halves are expressions, and march's
+      -- `ECond` arm folds `cond` then `body` for each arm in order.
+      let armsJ ← (← field j "arms").getArr?.mapError (fun _ => "arms")
+      let kids ← armsJ.toList.mapM (fun a => do
+        let c ← decodeTerm (← field a "cond")
+        let b ← decodeTerm (← field a "body")
+        pure [c, b])
+      .ok (Term.opaque_ kids.flatten ty)
+  | "ERecordUpdate" =>
+      let base ← decodeTerm (← field j "base")
+      let fsJ ← (← field j "fields").getArr?.mapError (fun _ => "fields")
+      let vals ← fsJ.toList.mapM (fun f => do decodeTerm (← field f "value"))
+      .ok (Term.opaque_ (base :: vals) ty)
+  | "EAtom" =>
+      let argsJ ← (← field j "args").getArr?.mapError (fun _ => "args")
+      let args ← argsJ.toList.mapM decodeTerm
+      .ok (Term.opaque_ args ty)
+  | "EAssert" =>
+      let e ← decodeTerm (← field j "expr")
+      .ok (Term.opaque_ [e] ty)
+  | "EDbg" =>
+      -- `dbg()` emits `"expr": null` (`json_opt expr_to_json`); march's own
+      -- `EDbg (None, _)` arm contributes nothing, so an absent child is an
+      -- EMPTY child list, not a decode error.
+      let eJ ← field j "expr"
+      if eJ.isNull then .ok (Term.opaque_ [] ty)
+      else do .ok (Term.opaque_ [← decodeTerm eJ] ty)
+  | "ELetFn" =>
+      -- `params` carry no expressions (`param_to_json` = name/ty/lin) and
+      -- march's `ELetFn` arm walks only `body`.
+      let body ← decodeTerm (← field j "body")
+      .ok (Term.opaque_ [body] ty)
+  | "ELetQ" =>
+      let value ← decodeTerm (← field j "value")
+      let cont ← decodeTerm (← field j "cont")
+      .ok (Term.opaque_ [value, cont] ty)
+  | "ESend" =>
+      let cap ← decodeTerm (← field j "cap")
+      let msg ← decodeTerm (← field j "msg")
+      .ok (Term.opaque_ [cap, msg] ty)
+  | "ESpawn" =>
+      let actor ← decodeTerm (← field j "actor")
+      .ok (Term.opaque_ [actor] ty)
   | _ => .ok (Term.unsupported ty)
 
 /-- Desugar an `EBlock`'s flat expr list into `Term`'s nested-`let_` shape.

@@ -867,6 +867,13 @@ partial def infer (s : Supply) (ctx : Ctx) : Term → InferM MTy
         let bt ← infer s ctx' body
         unify s resTy bt
       pure resTy
+  -- Both out-of-fragment escapes throw identically. `Term.opaque_` carries its
+  -- children only so `CapCheck` (which runs BEFORE the skip gate) can walk
+  -- them; it models NO typing rule of its own, so reaching here would mean the
+  -- gate at `Compare.inferModule` had failed, and a throw is exactly the loud
+  -- failure that wants. `Term.hasUnsupported` hard-codes `true` for `opaque_`
+  -- precisely so this is unreachable.
+  | .opaque_ _ _ => throw "infer: opaque node (should have been skip-gated)"
   | .unsupported _ => throw "infer: unsupported node (should have been skip-gated)"
 
 /-- Build one poly-1 scheme `∀a[:cls]. build a` by minting a fresh
