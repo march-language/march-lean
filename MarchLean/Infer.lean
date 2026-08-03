@@ -909,6 +909,11 @@ def builtins (s : Supply) : InferM (List (String × EnvEntry)) := do
   let cap := fun (t : MTy) => MTy.con "Cap" [t]
   let capIO := cap (MTy.con "IO" [])
   out := ("cap_narrow", .scheme (← mkPoly1 s [] (fun a => arr capIO (cap a)))) :: out
+  -- `println : ∀a. a → ()` — UNCONSTRAINED, and deliberately NOT the
+  -- `Mono (String → ())` that march's builtin table registers at
+  -- `typecheck.ml:1951`. See the `println` note below for why march's own
+  -- effective signature is this one.
+  out := ("println", .scheme (← mkPoly1 s [] (fun a => arr a u))) :: out
   pure <| out ++ [
     -- The IO capability root, threaded from the entry point. (typecheck.ml:1971)
     mono "root_cap" capIO,
@@ -920,7 +925,13 @@ def builtins (s : Supply) : InferM (List (String × EnvEntry)) := do
     mono "not" (arr b b),
     mono "++" (arr str (arr str str)), mono "string_concat" (arr str (arr str str)),
     mono "string_length" (arr str i),
-    mono "print" (arr str u), mono "println" (arr str u),
+    -- `print` is NOT prelude-shadowed (stdlib/prelude.march defines no
+    -- `fn print`), so it keeps march's builtin `Mono (String → ())`
+    -- (`typecheck.ml:1950`) — verified directly: `print(1)` is rejected by
+    -- march with "expected `String` but got `Int`". Ditto `print_int` /
+    -- `print_float`. `println` is the sole exception and is registered
+    -- polymorphically above.
+    mono "print" (arr str u),
     mono "print_int" (arr i u), mono "print_float" (arr f u),
     mono "int_to_string" (arr i str), mono "float_to_string" (arr f str),
     mono "bool_to_string" (arr b str)
@@ -944,6 +955,46 @@ def builtins (s : Supply) : InferM (List (String × EnvEntry)) := do
 -- A real fix needs `println`/`print`/etc. modeled as polymorphic-over-`Show`
 -- (or some other coverage-gap-safe treatment of builtin-ADT term/pattern
 -- resolution), which is out of this task's scope.
+--
+-- UPDATE (println fix): the `println : String → ()` half of that blocker is
+-- GONE — `println` is now `∀a. a → ()` (see the note below), so a bare `None`
+-- reaching `println` no longer fails to unify. The `builtinCtorSigs` decision
+-- itself is UNCHANGED and still reverted: it was never re-attempted here, and
+-- any future attempt must re-verify `accept/t59` and `accept/t86` from scratch
+-- rather than assume this note cleared the way.
+--
+-- ── Why `println` is `∀a. a → ()` and not `String → ()` ──
+--
+-- march's builtin env DOES register `("println", Mono (TArrow (t_string,
+-- t_unit)))` (`typecheck.ml:1951`), but that entry is DEAD for any real
+-- program: march's stdlib prelude defines a user-level
+--
+--     fn println(x) do print(show(x)) ; print("\n") end
+--
+-- at `stdlib/prelude.march:243`, and `bin/main.ml:214-217` UNWRAPS
+-- prelude.march's `mod` body into the entry module's own top-level scope
+-- (prelude.march is the head of `stdlib_file_list`, `bin/main.ml:236`), so
+-- this ordinary declaration SHADOWS the builtin binding at every call site.
+--
+-- That shadowing binding is `∀a. a → ()` with NO class constraint, not
+-- `∀a. Show(a) => a → ()`. march only attaches DECLARED constraints to a
+-- function scheme — `bound_constraints` from `fn_bounds`
+-- (`typecheck.ml:6926`) and `class_constraints` from a `when` clause
+-- (`typecheck.ml:7051`), spliced onto the generalized type at
+-- `typecheck.ml:7139-7165`. The `CInterface ("Show", _)` that the body's
+-- `show(x)` raises is never captured into the scheme; it goes to
+-- `env.pending_constraints` and is discharged at the declaration boundary,
+-- where its type is still an unresolved `TVar` and `discharge` takes the
+-- `| TVar _ -> ()   (* Still polymorphic — cannot check yet *)` branch
+-- (`typecheck.ml:7530-7531`) and drops it.
+--
+-- Verified directly against march (`--check`, exit 0 = accept): `println(1)`,
+-- `println(true)`, `println((1, "a"))`, `println({ x: 1, y: 2 })`,
+-- `println(Red)` for a `type Color = Red | Green` with NO `impl Show`, and
+-- `println(some_fn_name)` ALL accept. A `Show`-constrained scheme modeled here
+-- would therefore be a FALSE REJECT source (this checker models no `impl`
+-- declarations at all, so every user ADT would look Show-less) — strictly
+-- worse than the unconstrained scheme, which can only over-accept.
 
 /-- Infer every declaration of a module, returning the `(span, MTy)` record
 for each `var`/`field` node (Task 6 diffs these against march's computed
@@ -1381,6 +1432,94 @@ march rejects the same program for the same reason (typecheck.ml:4684). -/
   | .error _ => IO.println "value-restriction-ok: true"
   | .ok _    => IO.println "value-restriction-ok: FALSE (net wrongly polymorphic)"
 -- expected: value-restriction-ok: true
+
+/-! ### `println` is `∀a. a → ()` (println-of-non-String fixtures)
+
+Pins the shapes that the `String → ()` signature used to FALSE-REJECT.
+march's real `println` comes from `stdlib/prelude.march:243`, shadows the
+builtin table's `Mono (String → ())` (`typecheck.ml:1951`), and carries NO
+`Show` constraint (see the long note above `inferModule'`). Each fixture below
+throws — failing the build — when the shape it pins regresses, so these are
+assertions rather than printed observations.
+
+`native_decide` is not usable for these: `InferM = ExceptT String IO`, so
+every `Infer`/`Compare` entry point is `IO`-bound and there is no pure
+`Decidable` proposition to discharge. The `native_decide` fixtures in this
+repo all live in `Syntax`/`CapCheck`, whose functions are pure. Throwing
+`#eval`s are the strongest machine-checked form available here. -/
+
+/-- Run `infer` on `println(arg)` and report whether it succeeded. -/
+private def printlnAccepts (arg : Term) : IO Bool := do
+  let s ← Supply.new
+  let ctx ← freshCtx s
+  let call := Term.app (Term.var "println" dSpan dTy) [arg] dTy
+  match ← (infer s ctx call).run with
+  | .ok _ => pure true
+  | .error _ => pure false
+
+/-- Same, for the non-shadowed `print` (must stay `String → ()`). -/
+private def printAccepts (arg : Term) : IO Bool := do
+  let s ← Supply.new
+  let ctx ← freshCtx s
+  let call := Term.app (Term.var "print" dSpan dTy) [arg] dTy
+  match ← (infer s ctx call).run with
+  | .ok _ => pure true
+  | .error _ => pure false
+
+private def pin (label : String) (actual expected : Bool) : IO Unit := do
+  IO.println s!"{label}: {actual}"
+  if actual != expected then
+    throw (IO.userError s!"{label}: expected {expected}, got {actual}")
+
+/- `println(1)`, `println(true)`, `println(1.5)`, `println((1, true))` and
+`println("hi")` all accept — exactly march's behaviour (all five verified
+directly against `march --check`, exit 0). The first four were the live false
+rejects: they produced "cannot unify String with Int|Bool" under the old
+monomorphic signature, which is what made all 8
+`specs/lang/grammar/parse/*.march` files reject. -/
+#eval show IO Unit from do
+  pin "println-int"    (← printlnAccepts (Term.lit (Lit.int 1) dTy)) true
+  pin "println-bool"   (← printlnAccepts (Term.lit (Lit.bool true) dTy)) true
+  pin "println-float"  (← printlnAccepts (Term.lit (Lit.float "1.5") dTy)) true
+  pin "println-string" (← printlnAccepts (Term.lit (Lit.str "hi") dTy)) true
+  pin "println-tuple"
+    (← printlnAccepts (Term.tuple [Term.lit (Lit.int 1) dTy,
+                                   Term.lit (Lit.bool true) dTy] dTy)) true
+-- expected: println-int/bool/float/string/tuple all true
+
+/- The `println` result is `()` regardless of the argument type — the return
+is fixed by the scheme, only the domain is quantified. -/
+#eval show IO Unit from do
+  let s ← Supply.new
+  let ctx ← freshCtx s
+  let call := Term.app (Term.var "println" dSpan dTy) [Term.lit (Lit.int 1) dTy] dTy
+  match ← (do let t ← infer s ctx call; zonk s t).run with
+  | .ok t => pin "println-returns-unit" (t matches MTy.tuple []) true
+  | .error e => throw (IO.userError s!"println-returns-unit-ERROR: {e}")
+-- expected: println-returns-unit: true
+
+/- Two calls at DIFFERENT argument types in one context both succeed — i.e.
+`println` really is a scheme that re-instantiates per call site, not a
+monomorphic binding that the first call site pins down. -/
+#eval show IO Unit from do
+  let s ← Supply.new
+  let ctx ← freshCtx s
+  let p := fun (a : Term) => Term.app (Term.var "println" dSpan dTy) [a] dTy
+  let both := Term.tuple [p (Term.lit (Lit.int 1) dTy),
+                          p (Term.lit (Lit.str "hi") dTy)] dTy
+  match ← (infer s ctx both).run with
+  | .ok _ => pin "println-two-instantiations" true true
+  | .error e => throw (IO.userError s!"println-two-instantiations-FAIL: {e}")
+-- expected: println-two-instantiations: true
+
+/- SIBLING BUILTINS — `print` is NOT prelude-shadowed and must stay
+`String → ()`. `print(1)` is rejected by march ("expected `String` but got
+`Int`", verified directly), so this checker must keep rejecting it too:
+widening `print` alongside `println` would be a false ACCEPT. -/
+#eval show IO Unit from do
+  pin "print-string-accepts" (← printAccepts (Term.lit (Lit.str "hi") dTy)) true
+  pin "print-int-rejects"    (← printAccepts (Term.lit (Lit.int 1) dTy)) false
+-- expected: print-string-accepts: true / print-int-rejects: false
 
 end Test
 end MarchLean.Infer
