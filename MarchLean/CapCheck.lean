@@ -4020,4 +4020,149 @@ def opqNoPanicNonExhaustiveMatchInChild : Module := {
 #eval checkCaps opqNoPanicNonExhaustiveMatchInChild   -- expect: violation naming no_panic
 example : (checkCaps opqNoPanicNonExhaustiveMatchInChild).isViolation = true := by native_decide
 
+-- ---------------------------------------------------------------------
+-- TRAILING `ELet` (a `do` block's last/only statement).
+--
+-- ROOT CAUSE these pin: `Elab.decodeTerm` had NO `"ELet"` arm. march's
+-- emitter does not wrap a single-statement block in an `EBlock`, and
+-- `decodeBlockStmts` hands an `EBlock`'s FINAL element straight back to
+-- `decodeTerm` — so a trailing `let` hit the `| _ => Term.unsupported`
+-- fallback and its right-hand side was DISCARDED before any walk below ever
+-- saw it. Every cap walk went blind at once: `bodyCalls`, `bodyAllocates`,
+-- `divisionVerdict` and `matchesIn`. march rejected
+-- `fn f() : Unit do let q = println("leak") end`; we exited 2.
+--
+-- This was NOT an `opaque_` bug and NOT specific to the app-fn position that
+-- surfaced it (`{ p with x: println("leak") }` applied to `()`): `bodyCalls`'s
+-- generic `.app fn args` arm was always correct, it just never received a
+-- term. The shapes below are what the FIXED decoder now emits, so they pin
+-- the contract between decoder and cap layer, not the decoder's own dispatch
+-- (that is pinned by the `#eval`s in `Elab`'s `Test` namespace).
+--
+-- Every violating fixture was verified end to end against the real march
+-- binary (march exit 1 naming the cap; `--emit-core-ast | march-lean-check`
+-- exited 2 before this fix and exits 1 after). Every clean counterpart was
+-- verified ACCEPTED by march and must NOT produce a violation here.
+
+/-- A trailing `let` has no continuation, so `decodeTerm`'s `ELet` arm makes
+`Term.unsupported` the `let_`'s BODY. That is what keeps `hasUnsupported`
+true (the file still skips, `Infer`/`Linearity` still never judge it) while
+leaving the RHS on a real `let_` — so `divisionVerdict`'s fact/path
+retirement still applies to the bound name, which `opaque_` could not offer.
+If this ever becomes `false`, the trailing-let shape stops skipping and every
+fixture below turns into a false-reject risk. -/
+def trailingLet (rhs : Term) (ty : Ty) : Term :=
+  Term.let_ "q" Lin.unrestricted none rhs (Term.unsupported ty) ty
+
+example : (trailingLet opqInert opqIntTy).hasUnsupported = true := by native_decide
+
+/-- The reported reproducer, exactly: `let q = { p with x: println("leak") }`
+as a fn body, where march parses the record-update as the FN of a zero-arg
+`EApp`. Two previously-fatal layers at once — the trailing `let` (which used
+to drop everything) and the `opaque_` in app-fn position. -/
+def letAppFnOpaqueViolating : Module := opqPureMod
+  (trailingLet
+    (Term.app
+      (Term.opaque_ [Term.var "p" opqSp opqIntTy, opqBanned] opqIntTy) [] opqIntTy)
+    opqIntTy)
+#eval checkCaps letAppFnOpaqueViolating   -- expect: violation naming `pure`
+example : (checkCaps letAppFnOpaqueViolating).isViolation = true := by native_decide
+
+/-- Near-miss: same two layers, no banned call. march ACCEPTS — a violation
+here would be a false reject. -/
+def letAppFnOpaqueClean : Module := opqPureMod
+  (trailingLet
+    (Term.app
+      (Term.opaque_ [Term.var "p" opqSp opqIntTy, opqInert] opqIntTy) [] opqIntTy)
+    opqIntTy)
+#eval checkCaps letAppFnOpaqueClean   -- expect: ok
+example : (checkCaps letAppFnOpaqueClean).isViolation = false := by native_decide
+
+/-- The general case, with no `opaque_` involved at all: a banned call sitting
+DIRECTLY in a trailing let's RHS. This is the fixture that shows the bug was
+never about the app-fn position. -/
+def letTrailingBannedCall : Module := opqPureMod (trailingLet opqBanned opqUnitTy)
+#eval checkCaps letTrailingBannedCall   -- expect: violation naming `pure`
+example : (checkCaps letTrailingBannedCall).isViolation = true := by native_decide
+
+/-- Sibling walk `bodyAllocates`: a non-empty tuple in a trailing let's RHS. -/
+def letTrailingAllocates : Module := {
+  decls := [Decl.dmod "NA" [
+    Decl.dopts ["no_alloc"],
+    Decl.dfn "f" [] none
+      (trailingLet (Term.tuple [opqInert, opqInert] opqIntTy) opqIntTy)]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps letTrailingAllocates   -- expect: violation naming no_alloc
+example : (checkCaps letTrailingAllocates).isViolation = true := by native_decide
+
+/-- Sibling walk `divisionVerdict`: `let q = 10 / 0` as the whole body. -/
+def letTrailingDivZero : Module := {
+  decls := [Decl.dmod "NP" [
+    Decl.dopts ["no_panic"],
+    Decl.dfn "f" [] none
+      (trailingLet
+        (Term.app (Term.var "/" opqSp opqIntTy)
+          [Term.lit (Lit.int 10) opqIntTy, Term.lit (Lit.int 0) opqIntTy] opqIntTy)
+        opqIntTy)]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps letTrailingDivZero   -- expect: violation naming no_panic
+example : (checkCaps letTrailingDivZero).isViolation = true := by native_decide
+
+/-- Near-miss for the above: `let q = 10 / 2`. march ACCEPTS. -/
+def letTrailingDivNonZero : Module := {
+  decls := [Decl.dmod "NP" [
+    Decl.dopts ["no_panic"],
+    Decl.dfn "f" [] none
+      (trailingLet
+        (Term.app (Term.var "/" opqSp opqIntTy)
+          [Term.lit (Lit.int 10) opqIntTy, Term.lit (Lit.int 2) opqIntTy] opqIntTy)
+        opqIntTy)]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps letTrailingDivNonZero   -- expect: ok
+example : (checkCaps letTrailingDivNonZero).isViolation = false := by native_decide
+
+/-- Sibling walk `matchesIn`: a non-exhaustive `match` in a trailing let's
+RHS. (An `Int` scrutinee would NOT pin this — `matchExhaustive` is
+deliberately conservative there and answers "exhaustive"; only a user ADT
+whose constructors it can enumerate exercises the walk.) -/
+def letTrailingNonExhaustiveMatch : Module := {
+  decls := [
+  colorDType,
+  Decl.dmod "G" [
+    Decl.dopts ["no_panic"],
+    Decl.dfn "describe" [("c", Lin.unrestricted, none)] none
+      (trailingLet
+        (Term.match_ (Term.var "c" npSpan colorTy)
+          [(Pattern.con "Red" [], none, Term.lit (Lit.int 0) opqIntTy)]
+          opqIntTy)
+        opqIntTy)]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps letTrailingNonExhaustiveMatch   -- expect: violation naming no_panic
+example : (checkCaps letTrailingNonExhaustiveMatch).isViolation = true := by native_decide
+
+/-- SEPARATE SIBLING, same class: a NON-`PatVar`/`PatWild` `ELet` binder in
+NON-tail position. `decodeBlockStmts` used to answer `Term.unsupported` for
+the whole element, throwing away both the RHS and the entire remainder of the
+block; it now answers `Term.opaque_ [rhs, rest]`. Verified against march:
+`let (a, b) = (println("leak"), 1)` followed by `a` is a reject we skipped.
+`opaque_` (not a synthetic `let_ "_"`) is the right carrier here because it
+empties `divisionVerdict`'s channels, so a stale fact about a name the
+destructuring pattern rebinds cannot manufacture a false reject. -/
+def letDestructuringBinderViolating : Module := opqPureMod
+  (Term.opaque_
+    [Term.tuple [opqBanned, opqInert] opqIntTy, Term.var "a" opqSp opqIntTy]
+    opqIntTy)
+#eval checkCaps letDestructuringBinderViolating   -- expect: violation naming `pure`
+example : (checkCaps letDestructuringBinderViolating).isViolation = true := by native_decide
+
+/-- Near-miss for the above: `let (a, b) = (1, 2)` then `a`, under `cap pure`.
+march ACCEPTS. (This fixture is `cap pure`, not `no_alloc` — the tuple IS an
+allocation, so it would legitimately violate `no_alloc`.) -/
+def letDestructuringBinderClean : Module := opqPureMod
+  (Term.opaque_
+    [Term.tuple [opqInert, opqInert] opqIntTy, Term.var "a" opqSp opqIntTy]
+    opqIntTy)
+#eval checkCaps letDestructuringBinderClean   -- expect: ok
+example : (checkCaps letDestructuringBinderClean).isViolation = false := by native_decide
+
 end MarchLean.CapCheck
