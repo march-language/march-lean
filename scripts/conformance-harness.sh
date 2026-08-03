@@ -78,6 +78,31 @@
 #       .lake/build/bin/march-lean-check — NOT `lake exe march-lean-check`,
 #       which re-triggers a build check on every invocation and is far too
 #       slow over a whole corpus). Required.
+#   --lang-dir PATH              (env LANG_DIR)
+#       Path to march's specs/lang root, enabling the THREE additional
+#       corpora below on top of --corpus-dir's accept/ + reject/. OPTIONAL:
+#       omit it and this script scans exactly what it always has (the
+#       --corpus-dir sweep is untouched either way — the extra corpora are
+#       purely additive), but the summary then prints
+#       "EXTRA CORPORA: NOT SCANNED" so the missing coverage is loud rather
+#       than silent. CI passes it.
+#
+#         specs/lang/grammar/parse   accept-side (parse/ ⇒ expect accept)
+#         specs/lang/grammar/reject  reject-side (reject/ ⇒ expect reject)
+#         specs/lang/golden          accept-side (golden/ ⇒ expect accept)
+#
+#       Expected verdict is still derived SOLELY from the file's parent
+#       directory name (the corpus-violation mechanism — see step 5 above);
+#       `parse` and `golden` simply join `accept` in the accept-side arm of
+#       that same case statement, and grammar/reject's own `reject` basename
+#       already lands in the reject-side arm. Non-*.march files (e.g.
+#       specs/lang/golden/INDEX.md) are not matched by the glob and so are
+#       skipped automatically.
+#
+#       Ledger paths for these corpora are directory-qualified
+#       ("grammar/parse/pNN_….march", "grammar/reject/rNN_….march",
+#       "golden/gNN_….march") so they never collide with the --corpus-dir
+#       entries ("accept/…", "reject/…") in scripts/expected-skips.txt.
 #   -h, --help
 #       Print this help and exit 0.
 #
@@ -107,6 +132,7 @@ print_help() {
 march_bin="${MARCH_BIN:-}"
 corpus_dir="${CORPUS_DIR:-}"
 lean_check_bin="${MARCH_LEAN_CHECK_BIN:-}"
+lang_dir="${LANG_DIR:-}"
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -122,6 +148,10 @@ while [ $# -gt 0 ]; do
             lean_check_bin="$2"; shift 2 ;;
         --march-lean-check-bin=*)
             lean_check_bin="${1#--march-lean-check-bin=}"; shift ;;
+        --lang-dir)
+            lang_dir="$2"; shift 2 ;;
+        --lang-dir=*)
+            lang_dir="${1#--lang-dir=}"; shift ;;
         -h|--help)
             print_help; exit 0 ;;
         *)
@@ -151,6 +181,28 @@ if [ ! -d "$corpus_dir/accept" ] || [ ! -d "$corpus_dir/reject" ]; then
     echo "error: CORPUS_DIR must contain accept/ and reject/ subdirectories: $corpus_dir" >&2
     exit 1
 fi
+# The set of directories to sweep, one "DIR|REL_PREFIX" pair per line.
+# REL_PREFIX is what the file's ledger path is built from; the file's own
+# parent-directory NAME (not this prefix) is what the expected verdict is
+# derived from, exactly as before.
+scan_specs="$corpus_dir/accept|accept
+$corpus_dir/reject|reject"
+
+if [ -n "$lang_dir" ]; then
+    if [ ! -d "$lang_dir" ]; then
+        echo "error: --lang-dir is not a directory: $lang_dir" >&2
+        exit 1
+    fi
+    for extra in grammar/parse grammar/reject golden; do
+        if [ ! -d "$lang_dir/$extra" ]; then
+            echo "error: --lang-dir is missing the expected subdirectory $extra: $lang_dir" >&2
+            exit 1
+        fi
+        scan_specs="$scan_specs
+$lang_dir/$extra|$extra"
+    done
+fi
+
 if ! command -v jq >/dev/null 2>&1; then
     echo "error: jq is required (used to read the \"verdict\" field out of --emit-core-ast JSON)" >&2
     exit 1
@@ -185,20 +237,25 @@ fi
 json_tmp="$(mktemp)"
 trap 'rm -f "$json_tmp"' EXIT
 
-for f in "$corpus_dir"/accept/*.march "$corpus_dir"/reject/*.march; do
+while IFS='|' read -r scan_dir rel_prefix; do
+  [ -n "$scan_dir" ] || continue
+  for f in "$scan_dir"/*.march; do
     [ -e "$f" ] || continue
     total=$((total + 1))
 
     # expected_verdict comes solely from the file's parent directory name —
-    # the corpus's own naming convention (accept/ vs reject/) — independent
-    # of anything march or Lean report.
+    # the corpus's own naming convention (accept/ vs reject/, plus grammar's
+    # parse/ and the golden/ corpus, which are accept-side by the same
+    # convention) — independent of anything march or Lean report.
     parent_dir="$(basename "$(dirname "$f")")"
     case "$parent_dir" in
-        accept) expected_verdict="accept" ;;
+        accept|parse|golden) expected_verdict="accept" ;;
         reject) expected_verdict="reject" ;;
         *) expected_verdict="unknown" ;;
     esac
-    rel_path="$parent_dir/$(basename "$f")"
+    # Ledger path: directory-qualified by the scan spec's REL_PREFIX so
+    # grammar/reject/rNN never collides with the types corpus's reject/tNN.
+    rel_path="$rel_prefix/$(basename "$f")"
 
     if "$march_bin" --check "$f" >/dev/null 2>&1; then
         march_verdict="accept"
@@ -258,7 +315,10 @@ for f in "$corpus_dir"/accept/*.march "$corpus_dir"/reject/*.march; do
         # ledger-tracked (see the ledger-enforcement block after the loop).
         skip_files="$skip_files$f (lean_verdict=skip, march_verdict=$march_verdict)"$'\n'
         observed_skip_paths="$observed_skip_paths$rel_path"$'\n'
-        if [ "$parent_dir" = "accept" ]; then
+        # Accept-side vs reject-side is the file's EXPECTED verdict (i.e. its
+        # directory placement), which now covers grammar/parse and golden on
+        # the accept side and grammar/reject on the reject side.
+        if [ "$expected_verdict" = "accept" ]; then
             accept_skip_paths="$accept_skip_paths$rel_path"$'\n'
         else
             reject_skip_n=$((reject_skip_n + 1))
@@ -288,7 +348,10 @@ for f in "$corpus_dir"/accept/*.march "$corpus_dir"/reject/*.march; do
         # above); either way this is intentionally excluded from
         # match_count.
     fi
-done
+  done
+done <<EOF
+$scan_specs
+EOF
 
 mismatch_n=$(printf '%s' "$mismatch_files" | grep -c . || true)
 error_n=$(printf '%s' "$error_files" | grep -c . || true)
@@ -345,6 +408,11 @@ echo "==================================================================="
 echo "Conformance harness summary"
 echo "==================================================================="
 echo "corpus:            $corpus_dir"
+if [ -n "$lang_dir" ]; then
+    echo "extra corpora:     $lang_dir/{grammar/parse,grammar/reject,golden}"
+else
+    echo "extra corpora:     NOT SCANNED (--lang-dir not given)"
+fi
 echo "march binary:      $march_bin"
 echo "march-lean-check:  $lean_check_bin"
 echo "-------------------------------------------------------------------"

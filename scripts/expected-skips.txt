@@ -22,7 +22,24 @@
 # reason ERASED from the Core AST A2 sees (desugared-away constructs) are NOT
 # skips — they wrong-accept — and live in scripts/known-limitations.txt instead.
 #
-# Regenerate: run the harness, take the observed skip set (both sides).
+# PATH FORMAT / multi-corpus note. The harness's `--corpus-dir` sweep
+# (specs/lang/types) yields the historical two-segment paths `accept/NAME` and
+# `reject/NAME`. Its `--lang-dir` sweep adds three more corpora, whose entries
+# are DIRECTORY-QUALIFIED so they can never collide with those:
+#
+#   grammar/parse/NAME    specs/lang/grammar/parse   — accept-side (34 files)
+#   grammar/reject/NAME   specs/lang/grammar/reject  — reject-side (12 files)
+#   golden/NAME           specs/lang/golden          — accept-side (46 files)
+#
+# Same invariant, same both-directions enforcement; one ledger, four sections.
+# (An extension of the existing format rather than a second file: the harness
+# compares ONE observed-skip set against ONE ledger, and splitting it would
+# mean duplicating the both-directions diff logic per corpus for no gain.)
+# The expected verdict for these is still derived from the file's parent
+# DIRECTORY NAME, exactly as for accept/ and reject/ — `parse` and `golden`
+# simply join `accept` on the accept side.
+#
+# Regenerate: run the harness, take the observed skip set (all four sections).
 # --- accept side (88) ---
 accept/t07_generic_option_two_types.march                          # out-of-fragment construct in a declaration
 accept/t08_tuple_construct_destructure.march                       # out-of-fragment construct in a declaration
@@ -201,3 +218,89 @@ reject/t131_refine_let_annotation_false.march                      # out-of-frag
 reject/t133_refine_trusted_violation_not_rescued.march             # out-of-fragment construct in a declaration
 reject/t134_refine_postcondition_strict_undischarged.march         # out-of-fragment construct in a declaration
 reject/t138_refine_impl_param_remedy_enforced.march                # out-of-fragment construct in a declaration
+
+# --- grammar/parse side (21) ---
+# specs/lang/grammar/parse: 34 files, all march-ACCEPT (a parse-shape
+# corpus). 13 are judged (accept/accept); the 21 below skip.
+grammar/parse/p02_match_multi_expr_arms.march                      # out-of-fragment construct in a declaration
+grammar/parse/p05_pipe_left_to_right_chain.march                   # out-of-fragment construct in a declaration
+grammar/parse/p06_field_access_vs_application.march                # out-of-fragment construct in a declaration
+grammar/parse/p07_list_comprehension_with_guard.march              # out of modeled fragment: SKIP: unbound variable `List.map`
+grammar/parse/p10_match_multi_expr_arms_three_way.march            # out-of-fragment construct in a declaration
+grammar/parse/p11_if_else_if_chain.march                           # out-of-fragment construct in a declaration
+grammar/parse/p13_rich_type_annotation.march                       # out-of-fragment construct in a declaration
+grammar/parse/p14_list_and_atom_payload_patterns.march             # out-of-fragment construct in a declaration
+grammar/parse/p16_interface_impl_pair.march                        # out-of-fragment construct in a declaration
+grammar/parse/p17_generic_type_record_variant.march                # out-of-fragment construct in a declaration
+grammar/parse/p18_actor_handler_supervise.march                    # out-of-fragment construct in a declaration
+grammar/parse/p19_app_on_start_supervisor_spec.march               # out-of-fragment construct in a declaration
+grammar/parse/p20_protocol_choose_session_type.march               # out-of-fragment construct in a declaration
+grammar/parse/p21_transitions_state_machine.march                  # out-of-fragment construct in a declaration
+grammar/parse/p24_two_line_call_juxtaposition.march                # out-of-fragment construct in a declaration
+grammar/parse/p25_letq_block_fold.march                            # out-of-fragment construct in a declaration
+grammar/parse/p26_cond_arm_ge_le.march                             # out-of-fragment construct in a declaration
+grammar/parse/p27_leading_pipe_arm_separator.march                 # out-of-fragment construct in a declaration
+grammar/parse/p28_cond_single_line_no_separator.march              # out-of-fragment construct in a declaration
+grammar/parse/p31_record_pattern_in_let.march                      # out-of-fragment construct in a declaration
+grammar/parse/p33_paren_stmt_after_bare_ident.march                # out-of-fragment construct in a declaration
+
+# --- grammar/reject side (12) ---
+# specs/lang/grammar/reject: 12 files, all march-REJECT, and ALL 12 skip.
+# 11 are SYNTAX errors: march's --emit-core-ast emits an envelope with no
+# module at all, so there is nothing for an AST-level checker to judge
+# ("no module (parse failure)") — this whole corpus is structurally out of
+# reach for A2, which is exactly what the ledger is for. The 12th (r05)
+# does parse and skips for the ordinary out-of-fragment reason.
+grammar/reject/r01_then_keyword_rejected.march                     # no module (parse failure)
+grammar/reject/r03_chained_comparison_nonassoc.march               # no module (parse failure)
+grammar/reject/r04_malformed_comprehension_missing_in.march        # no module (parse failure)
+grammar/reject/r05_letq_last_in_block.march                        # out-of-fragment construct in a declaration
+grammar/reject/r06_if_missing_else.march                           # no module (parse failure)
+grammar/reject/r09_pub_fn_keyword_rejected.march                   # no module (parse failure)
+grammar/reject/r10_second_top_level_mod_rejected.march             # no module (parse failure)
+grammar/reject/r11_supervise_missing_strategy.march                # no module (parse failure)
+grammar/reject/r12_cap_unknown_directive.march                     # no module (parse failure)
+grammar/reject/r13_protocol_step_missing_payload_type.march        # no module (parse failure)
+grammar/reject/r14_curried_call_not_chained.march                  # no module (parse failure)
+grammar/reject/r15_letq_type_annotation.march                      # no module (parse failure)
+
+# --- golden side (36) ---
+# specs/lang/golden: 46 files (plus a non-*.march INDEX.md the glob never
+# matches), all march-ACCEPT. 10 are judged (accept/accept); the 36 below
+# skip.
+golden/g04_adt_match.march                                         # out-of-fragment construct in a declaration
+golden/g05_adt_payload.march                                       # out-of-fragment construct in a declaration
+golden/g06_hof.march                                               # out-of-fragment construct in a declaration
+golden/g07_match_lit.march                                         # out-of-fragment construct in a declaration
+golden/g09_literals.march                                          # out-of-fragment construct in a declaration
+golden/g13_strict_bool.march                                       # out-of-fragment construct in a declaration
+golden/g14_tuple_let.march                                         # out-of-fragment construct in a declaration
+golden/g15_tuple_match.march                                       # out-of-fragment construct in a declaration
+golden/g17_record_literal_field.march                              # out-of-fragment construct in a declaration
+golden/g18_record_update.march                                     # out-of-fragment construct in a declaration
+golden/g19_record_update_multi_field.march                         # out-of-fragment construct in a declaration
+golden/g20_record_nested.march                                     # out-of-fragment construct in a declaration
+golden/g21_atom_match.march                                        # out-of-fragment construct in a declaration
+golden/g22_atom_payload_match.march                                # out-of-fragment construct in a declaration
+golden/g23_atom_returning_fn.march                                 # out-of-fragment construct in a declaration
+golden/g24_nested_con_tuple.march                                  # out-of-fragment construct in a declaration
+golden/g25_guard_fallthrough.march                                 # out-of-fragment construct in a declaration
+golden/g26_catchall.march                                          # out-of-fragment construct in a declaration
+golden/g27_guard_binding.march                                     # out-of-fragment construct in a declaration
+golden/g28_letfn_factorial.march                                   # out-of-fragment construct in a declaration
+golden/g29_letfn_capture.march                                     # out-of-fragment construct in a declaration
+golden/g30_letfn_sum_result.march                                  # out-of-fragment construct in a declaration
+golden/g31_cond_middle_arm.march                                   # out-of-fragment construct in a declaration
+golden/g32_cond_all_false_catchall.march                           # out-of-fragment construct in a declaration
+golden/g34_nested_tuple_let.march                                  # out-of-fragment construct in a declaration
+golden/g35_actor_spawn_send.march                                  # out-of-fragment construct in a declaration
+golden/g36_actor_receive.march                                     # out-of-fragment construct in a declaration
+golden/g37_actor_lifecycle.march                                   # out-of-fragment construct in a declaration
+golden/g38_chan_int_echo.march                                     # out-of-fragment construct in a declaration
+golden/g39_chan_choose_offer.march                                 # out-of-fragment construct in a declaration
+golden/g40_actor_foreign_msg_drop.march                            # out-of-fragment construct in a declaration
+golden/g42_letq_short_circuit.march                                # out-of-fragment construct in a declaration
+golden/g43_parallel_determinism.march                              # out of modeled fragment: SKIP: unbound variable `List.range`
+golden/g44_crdt_convergence.march                                  # out of modeled fragment: SKIP: unbound variable `CRDT.GCounter.add`
+golden/g45_dual_position_borrow.march                              # out of modeled fragment: SKIP: unbound variable `String.byte_size`
+golden/g46_refinement_erasure.march                                # out-of-fragment construct in a declaration
