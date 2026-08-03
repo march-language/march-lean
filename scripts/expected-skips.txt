@@ -23,7 +23,7 @@
 # skips — they wrong-accept — and live in scripts/known-limitations.txt instead.
 #
 # Regenerate: run the harness, take the observed skip set (both sides).
-# --- accept side (82) ---
+# --- accept side (88) ---
 accept/t07_generic_option_two_types.march                          # out-of-fragment construct in a declaration
 accept/t08_tuple_construct_destructure.march                       # out-of-fragment construct in a declaration
 accept/t10_record_update_existing_field.march                      # out-of-fragment construct in a declaration
@@ -106,6 +106,12 @@ accept/t127_entry_module_shadows_string_byte_size.march            # out-of-frag
 accept/t128_refine_list_contract_composes_call.march               # out-of-fragment construct in a declaration
 accept/t129_refine_tag_contract_composes_call.march                # out-of-fragment construct in a declaration
 accept/t130_refine_let_annotation_checked_and_composes.march       # out-of-fragment construct in a declaration
+accept/t132_refine_trusted_rescues_cap_verified.march              # out-of-fragment construct in a declaration
+accept/t135_refine_postcondition_strict_trusted.march              # out-of-fragment construct in a declaration
+accept/t136_refine_qualified_predicate_warns.march                 # out-of-fragment construct in a declaration
+accept/t137_refine_interface_signature_warns.march                 # out-of-fragment construct in a declaration
+accept/t139_nested_module_shadows_list_length_extern.march         # out-of-fragment construct in a declaration
+accept/t140_refine_sig_signature_warns.march                       # out-of-fragment construct in a declaration
 reject/t02_unbound_var.march                                       # out-of-fragment construct in a declaration
 reject/t05_ctor_arity.march                                        # out-of-fragment construct in a declaration
 reject/t06_match_branch_mismatch.march                             # out-of-fragment construct in a declaration
@@ -192,3 +198,6 @@ reject/t124_impl_method_contract_obliges_caller.march              # out-of-frag
 reject/t129_refine_weaker_contract_composition_still_fails.march   # out-of-fragment construct in a declaration
 reject/t130_refine_tag_composition_narrowed_violation.march        # out-of-fragment construct in a declaration
 reject/t131_refine_let_annotation_false.march                      # out-of-fragment construct in a declaration
+reject/t133_refine_trusted_violation_not_rescued.march             # out-of-fragment construct in a declaration
+reject/t134_refine_postcondition_strict_undischarged.march         # out-of-fragment construct in a declaration
+reject/t138_refine_impl_param_remedy_enforced.march                # out-of-fragment construct in a declaration

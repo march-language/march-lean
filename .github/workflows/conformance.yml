@@ -60,25 +60,42 @@ jobs:
           build-args: march-lean-check
           use-mathlib-cache: false
 
-      # Pinned to a march main SHA (not a branch) for reproducibility. Bumped
-      # for A3 slice (c): the old pin (f5baae9, 171-file corpus) predates
-      # `--emit-core-ast`'s `PatOr` node, which Task 3's or-pattern decoding
-      # requires — that pin cannot decode the or-pattern corpus files at
-      # all. This pin (0a119c9d) is march main HEAD as of the slice (c)
-      # Task 4 repin (2026-07-30); its corpus has grown to 233 files. Drift
-      # between the two pins was verified additive and safe:
-      # lib/dump/ast_json.ml gained exactly `PatOr` and `ProtoStop`,
-      # bin/main.ml's changes are codegen/target-dispatch only, and the
-      # envelope keys (format_version, module_caps) are unchanged. Bump
-      # periodically; no need to chase every push. setup-march builds march
-      # from source and caches the result keyed on this SHA (actions/cache
-      # under the hood), so repeat runs at the same pin skip the OCaml
+      # Pinned to a march main SHA (not a branch) for reproducibility. This
+      # pin (7c1d701c) is march main HEAD as of the post-slice-(c)
+      # re-baseline (2026-08-03); its corpus has grown to 242 files. It
+      # supersedes 0a119c9d, which was 28 commits behind.
+      #
+      # Drift from 0a119c9d was assessed before bumping:
+      #   - lib/dump/ast_json.ml: UNCHANGED. The emitter envelope is
+      #     identical; format_version and module_caps keys untouched.
+      #   - typecheck.ml +599, refine_check.ml +870, new precond_infer.ml
+      #     (580) — but exactly ONE new Err.error-level check across all of
+      #     it: `cap verified` (undischarged return-type constraint). That
+      #     is a sixth behavioral capability cap and it is NOT modeled here,
+      #     because it requires refinement-obligation discharge, which is
+      #     out of fragment. Its corpus files (accept/t132, accept/t135,
+      #     reject/t133) skip today for unrelated refinement-syntax reasons
+      #     — so we are currently safe by accident, not by design. If those
+      #     files ever stop skipping, `cap verified` becomes a live
+      #     false-accept source. See specs/march-findings.md.
+      #   - march#136 (calls_in_expr now total over Ast.expr) IS included in
+      #     this pin. It fixes the blind spot that made our deliberately
+      #     total bodyCalls disagree with march on calls nested in tuples,
+      #     records, and lambdas.
+      #
+      # Corpus grew 233 -> 242; all 9 new files skip (refinement-typed) and
+      # every pre-existing skip is unchanged, so the ledger delta is purely
+      # additive.
+      #
+      # Bump periodically; no need to chase every push. setup-march builds
+      # march from source and caches the result keyed on this SHA (actions/
+      # cache under the hood), so repeat runs at the same pin skip the OCaml
       # build entirely.
       - name: Set up March
         id: setup-march
         uses: march-language/setup-march@main
         with:
-          march-version: 0a119c9d2103c6f786b32ab9e031af9d29687684
+          march-version: 7c1d701cf561c13ad094845f52175f449e1c1892
 
       # Only the static-semantics corpus is needed from march's own repo
       # (the binary itself came from setup-march above); pinned to the
