@@ -147,11 +147,21 @@ march accepts) were traced to this second `calls_in_expr` copy by reading
 `typecheck.ml` end to end and confirming empirically with the reproducers
 above (2026-07-31).
 
-**Status.** reported upstream: NOT YET — same underlying defect class as
-march#82 but a distinct source location (second copy, three different call
-sites); should be reported as its own issue or as an amendment to #82 since
-the fix (adding `ETuple`/`ERecord`/`EList` arms to *this* `calls_in_expr`,
-not just the first one) is a separate code change.
+**Status.** FIXED UPSTREAM — https://github.com/march-language/march/pull/136
+(`fix(typecheck): calls_in_expr is now total over Ast.expr`), merged as
+`9a373001`. The fix went further than this finding asked: it added an explicit
+arm for EVERY `Ast.expr` constructor to BOTH copies of `calls_in_expr` and
+removed the `| _ -> acc` catch-all entirely, so a future constructor fails to
+compile here rather than silently falling through the scan again.
+
+Confirmed converged: `(println("hi"), 1)` under `cap pure` is now rejected by
+march AND by `march-lean-check`. The deliberate `bodyCalls` over-detection that
+this finding documented is no longer a divergence.
+
+Note the fix INVERTED the coverage relationship for a while — march's total
+walk reached constructs our decoder mapped to `Term.unsupported`, so we skipped
+where march rejected. Closed separately by `Term.opaque_` (nine AST kinds) and
+by the `ELet` decode fix.
 
 ---
 
