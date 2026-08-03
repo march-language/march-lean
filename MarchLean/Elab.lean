@@ -283,9 +283,34 @@ any `kind` not handled below (`EPipe`/`EAnnot`/`EHole`/`EResultRef`/`ESigil`
 dedicated `letfn` constructor for a future `ELetFn` decoder, but since no
 sample exercises it this file does not guess at an undertested
 currying/sequencing shape: `ELetFn` decodes to `opaque_` (below) instead.
-`ELet` is handled only via `decodeBlockStmts` (inside `EBlock`) — it never
-reaches this dispatch directly, since march's grammar only produces `ELet` as
-one element of an `EBlock`'s expr list.
+**`ELet` reaches this dispatch directly, and MUST have an arm here.** An
+earlier revision of this docstring asserted the opposite ("march's grammar
+only produces `ELet` as one element of an `EBlock`'s expr list"), and that
+assertion was FALSE — it cost a whole class of false skips. march's emitter
+does not wrap a single-statement `do` block in an `EBlock` at all: a fn body
+that is one `ELet` is emitted as a bare `ELet` node, and `decodeBlockStmts`
+funnels an `EBlock`'s FINAL element straight back here too (`[last] =>
+decodeTerm last`). With no `ELet` arm, both shapes fell to the
+`| _ => Term.unsupported` fallback at the bottom of this match, DISCARDING the
+binding's right-hand side — and with it any `println` / allocation /
+`10 / 0` / non-exhaustive `match` hiding in it. march rejected
+`fn f() do let q = println("leak") end`; we exited 2. (The narrow symptom
+that surfaced this was an `EApp` whose `fn` is an `ERecordUpdate` — but the
+app-fn position was a red herring: `bodyCalls`'s generic `.app fn args` arm
+was always correct, it simply never got a term to walk.)
+
+A trailing `ELet` has no continuation to be the `Term.let_` body, so this arm
+supplies `Term.unsupported` as the body. That keeps the RHS structurally
+where every `CapCheck` walk already expects it (a real `let_`, so
+`divisionVerdict`'s fact/path retirement still applies to the bound name —
+unlike `opaque_`, which must empty both channels) while `hasUnsupported`
+stays `true` through the unsupported body, so `Compare.inferModule`'s step-(1)
+skip gate still fires and `Infer`/`Linearity` never judge the node. A
+non-`PatVar`/`PatWild` pattern cannot be curried into `Term.let_`'s
+plain-`String` binder, so it decodes to `Term.opaque_ [rhs]` instead: still
+cap-transparent, still out of fragment, and — because `opaque_` empties
+`divisionVerdict`'s channels — it cannot let a stale fact about a name the
+pattern rebinds manufacture a false reject.
 
 **The `opaque_` arms.** Nine `kind`s — `ECond`, `ERecordUpdate`, `EAtom`,
 `EAssert`, `EDbg`, `ELetFn`, `ELetQ`, `ESend`, `ESpawn` — are still not
@@ -428,13 +453,39 @@ partial def decodeTerm (j : Json) : Except String Term := do
   | "ESpawn" =>
       let actor ← decodeTerm (← field j "actor")
       .ok (Term.opaque_ [actor] ty)
+  -- A TRAILING `ELet` — a `do` block's last (or only) statement. See this
+  -- function's docstring: this arm's absence silently discarded the binding's
+  -- RHS, hiding `cap` violations from every `CapCheck` walk at once.
+  | "ELet" =>
+      let binding ← field j "binding"
+      let patJ ← field binding "pattern"
+      let rhs ← decodeTerm (← field binding "expr")
+      match ← kindOf patJ with
+      | "PatVar" =>
+          let (n, _) ← decodeName (← field patJ "name")
+          let lin ← decodeLin (← field binding "lin")
+          let annot ← decodeOptAnnot binding
+          .ok (Term.let_ n lin annot rhs (Term.unsupported ty) ty)
+      | "PatWild" =>
+          let lin ← decodeLin (← field binding "lin")
+          let annot ← decodeOptAnnot binding
+          .ok (Term.let_ "_" lin annot rhs (Term.unsupported ty) ty)
+      | _ => .ok (Term.opaque_ [rhs] ty)
   | _ => .ok (Term.unsupported ty)
 
 /-- Desugar an `EBlock`'s flat expr list into `Term`'s nested-`let_` shape.
-An `ELet` element binds its pattern (must be `PatVar`/`PatWild` — anything
-else can't be curried into `Term.let_`'s plain-`String` binder, so the whole
-block decodes to `Term.unsupported` rather than misrepresenting the
-binding) around the recursively-decoded rest of the block. A non-`ELet`
+An `ELet` element binds its pattern around the recursively-decoded rest of
+the block. The pattern must be `PatVar`/`PatWild` — anything else can't be
+curried into `Term.let_`'s plain-`String` binder, so rather than
+misrepresenting the binding the element decodes to
+`Term.opaque_ [rhs, rest]`. (It used to decode to a bare
+`Term.unsupported blockTy`, which threw away BOTH the binding's RHS and the
+entire remainder of the block: `let (a, b) = (println("leak"), 1); a` is a
+march reject that we skipped. `opaque_` keeps both children visible to the
+`CapCheck` walks while still reporting `hasUnsupported = true`, and — unlike
+a synthetic `let_ "_"` — it empties `divisionVerdict`'s fact/path channels,
+so a stale fact about a name the destructuring pattern rebinds cannot
+manufacture a false reject.) A non-`ELet`
 statement in non-tail position (e.g. a `print(..)` call whose result is
 discarded) is sequenced the same way, under a synthetic `"_"` binder — this
 is the standard let-sequencing encoding of `e; rest`, and is exactly the
@@ -460,7 +511,12 @@ partial def decodeBlockStmts (exprs : List Json) (blockTy : Ty) : Except String 
           | "PatWild" => pure (some "_")
           | _ => pure none : Except String (Option String))
         match nameOpt with
-        | none => .ok (Term.unsupported blockTy)
+        | none =>
+            -- Out-of-fragment BINDER, not an out-of-fragment block: keep both
+            -- the RHS and the rest of the block walkable (docstring above).
+            let rhs ← decodeTerm (← field binding "expr")
+            let body ← decodeBlockStmts rest blockTy
+            .ok (Term.opaque_ [rhs, body] blockTy)
         | some name =>
             let lin ← decodeLin (← field binding "lin")
             let annot ← decodeOptAnnot binding
@@ -1038,5 +1094,37 @@ private def collisionEnvelope (nestedName : String) : String :=
       | .ok none => IO.println "UNEXPECTED: none"
       | .ok (some t) => IO.println s!"decoded={repr t}, hasUnsupported={t.hasUnsupported}"
   -- expect: decoded=Ty.con "Tagged" [Ty.con "Int" [], Ty.con "Realtime" []], hasUnsupported=false
+
+-- A TRAILING `ELet` reaches `decodeTerm` directly (march emits a
+-- single-statement `do` block as a bare node, with no `EBlock` wrapper, and
+-- `decodeBlockStmts` routes an `EBlock`'s FINAL element back here too) and
+-- MUST keep its RHS. Before the `"ELet"` arm existed this fell to
+-- `| _ => Term.unsupported`, silently discarding the right-hand side and
+-- blinding `bodyCalls`/`bodyAllocates`/`divisionVerdict`/`matchesIn` at once.
+-- The `let_`'s BODY is `Term.unsupported` (there is no continuation), which
+-- is what keeps `hasUnsupported = true` and the file skipping.
+#eval show IO Unit from do
+  let j := Json.parse r#"{"kind":"ELet","resolved_ty":{"kind":"TCon","name":"Unit","args":[]},"binding":{"pattern":{"kind":"PatVar","name":{"txt":"q","span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}}},"lin":{"kind":"Unrestricted"},"expr":{"kind":"EVar","resolved_ty":{"kind":"TCon","name":"Unit","args":[]},"name":{"txt":"println","span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}}}}}"#
+  match j with
+  | .error e => IO.println s!"parse failed: {e}"
+  | .ok j    =>
+      match decodeTerm j with
+      | .error e => IO.println s!"decode failed: {e}"
+      | .ok t => IO.println s!"decoded={repr t}, hasUnsupported={t.hasUnsupported}"
+  -- expect: Term.let_ "q" .. (rhs = Term.var "println" ..) (body = Term.unsupported);
+  -- hasUnsupported=true
+
+-- A trailing `ELet` whose pattern is NOT `PatVar`/`PatWild` cannot be curried
+-- into `Term.let_`'s plain-`String` binder, so it decodes to
+-- `Term.opaque_ [rhs]` — still cap-transparent, still out of fragment.
+#eval show IO Unit from do
+  let j := Json.parse r#"{"kind":"ELet","resolved_ty":{"kind":"TCon","name":"Unit","args":[]},"binding":{"pattern":{"kind":"PatTuple","elements":[]},"lin":{"kind":"Unrestricted"},"expr":{"kind":"EVar","resolved_ty":{"kind":"TCon","name":"Unit","args":[]},"name":{"txt":"println","span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}}}}}"#
+  match j with
+  | .error e => IO.println s!"parse failed: {e}"
+  | .ok j    =>
+      match decodeTerm j with
+      | .error e => IO.println s!"decode failed: {e}"
+      | .ok t => IO.println s!"decoded={repr t}, hasUnsupported={t.hasUnsupported}"
+  -- expect: Term.opaque_ [Term.var "println" ..] (Ty.con "Unit" []); hasUnsupported=true
 
 end MarchLean.Elab.Test
