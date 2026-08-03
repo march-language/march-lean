@@ -3773,4 +3773,251 @@ def npOrPatternUnderCapStillNonExhaustive : Module := {
 #eval checkCaps npOrPatternUnderCapStillNonExhaustive   -- expect: violation naming no_panic (non-exhaustive)
 example : (checkCaps npOrPatternUnderCapStillNonExhaustive).isViolation = true := by native_decide
 
+-- ---------------------------------------------------------------------
+-- `Term.opaque_`: the nine unmodelled-but-child-carrying march kinds.
+--
+-- The 242-file conformance corpus CANNOT regression-test any of this: a
+-- census found NO file combining a `cap` directive with a capability
+-- violation inside any of these constructors. A green harness run is
+-- therefore no evidence at all here, and these hand-built pins are the only
+-- coverage. Each fixture reproduces the exact CHILD-LIST ARRANGEMENT
+-- `Elab.decodeTerm` produces for that `kind` (see its docstring's table),
+-- since that arrangement — not the node's shape, which is not modelled — is
+-- the whole contract between the decoder and the cap layer.
+--
+-- Every violating shape below was verified end to end against the real
+-- march binary: march rejects it naming the capability, and
+-- `march --emit-core-ast | march-lean-check` now exits 1 (it exited 2
+-- before `Term.opaque_`). Every non-violating counterpart was verified to be
+-- ACCEPTED by march, and must NOT produce a violation here — a `violation`
+-- on one of those would be a false reject, the worst error class this
+-- oracle has.
+
+def opqSp : Span := ⟨"o", 0, 0, 0, 0⟩
+def opqUnitTy : Ty := Ty.con "Unit" []
+def opqIntTy : Ty := Ty.con "Int" []
+
+/-- `println("x")` — an `IO.Console` builtin, banned under `cap pure`. This is
+the violation every `*Violating` fixture below hides inside an `opaque_`. -/
+def opqBanned : Term :=
+  Term.app (Term.var "println" opqSp opqUnitTy)
+    [Term.lit (Lit.str "x") (Ty.con "String" [])] opqUnitTy
+
+/-- An inert child: no call, no allocation, no division. -/
+def opqInert : Term := Term.lit (Lit.int 1) opqIntTy
+
+/-- `mod P do cap pure ... fn f() do <body> end end`. -/
+def opqPureMod (body : Term) : Module := {
+  decls := [Decl.dmod "P" [Decl.dopts ["pure"], Decl.dfn "f" [] none body]],
+  schemes := [], insts := [], moduleCaps := [] }
+
+/-- The invariant the whole design rests on: an `opaque_` node is out of
+fragment REGARDLESS of its children, so `Compare.inferModule`'s whole-file
+skip gate still fires and `Infer`/`Linearity` never judge it. If this ever
+becomes `false`, every one of the nine fixtures below turns into a
+false-reject risk. -/
+example : (Term.opaque_ [] opqIntTy).hasUnsupported = true := by native_decide
+example : (Term.opaque_ [opqInert] opqIntTy).hasUnsupported = true := by native_decide
+
+/-- `ECond` — `match do c1 -> println("x") ... end`. Children are the arms
+flattened as `cond, body, cond, body, ...`; BOTH halves are expressions and
+march's `calls_in_expr` folds both. -/
+def opqCondViolating : Module := opqPureMod
+  (Term.opaque_ [Term.var "c1" opqSp (Ty.con "Bool" []), opqBanned,
+                 Term.var "c2" opqSp (Ty.con "Bool" []), opqInert] opqIntTy)
+#eval checkCaps opqCondViolating   -- expect: violation naming `pure`
+example : (checkCaps opqCondViolating).isViolation = true := by native_decide
+
+/-- `ECond` near-miss: same shape, no banned call anywhere. march ACCEPTS. -/
+def opqCondClean : Module := opqPureMod
+  (Term.opaque_ [Term.var "c1" opqSp (Ty.con "Bool" []), opqInert,
+                 Term.var "c2" opqSp (Ty.con "Bool" []), opqInert] opqIntTy)
+#eval checkCaps opqCondClean   -- expect: ok
+example : (checkCaps opqCondClean).isViolation = false := by native_decide
+
+/-- `ERecordUpdate` — `{ r with a: println("x") }`. Children are `base`
+followed by each field's `value`; the field NAMES carry no expression. -/
+def opqRecordUpdateViolating : Module := opqPureMod
+  (Term.opaque_ [Term.var "r" opqSp opqIntTy, opqBanned] opqIntTy)
+#eval checkCaps opqRecordUpdateViolating   -- expect: violation naming `pure`
+example : (checkCaps opqRecordUpdateViolating).isViolation = true := by native_decide
+
+def opqRecordUpdateClean : Module := opqPureMod
+  (Term.opaque_ [Term.var "r" opqSp opqIntTy, opqInert] opqIntTy)
+#eval checkCaps opqRecordUpdateClean   -- expect: ok
+example : (checkCaps opqRecordUpdateClean).isViolation = false := by native_decide
+
+/-- `EAtom` — `:tag(println("x"))`. Children are `args`; the atom itself is a
+bare string in the envelope, not an expression. -/
+def opqAtomViolating : Module := opqPureMod (Term.opaque_ [opqBanned] opqIntTy)
+#eval checkCaps opqAtomViolating   -- expect: violation naming `pure`
+example : (checkCaps opqAtomViolating).isViolation = true := by native_decide
+
+def opqAtomClean : Module := opqPureMod (Term.opaque_ [opqInert] opqIntTy)
+#eval checkCaps opqAtomClean   -- expect: ok
+example : (checkCaps opqAtomClean).isViolation = false := by native_decide
+
+/-- `EAssert` — `assert println("x") > 0`. One child, `expr`. -/
+def opqAssertViolating : Module := opqPureMod
+  (Term.opaque_ [Term.app (Term.var ">" opqSp (Ty.con "Bool" []))
+                   [opqBanned, opqInert] (Ty.con "Bool" [])] opqUnitTy)
+#eval checkCaps opqAssertViolating   -- expect: violation naming `pure`
+example : (checkCaps opqAssertViolating).isViolation = true := by native_decide
+
+def opqAssertClean : Module := opqPureMod
+  (Term.opaque_ [Term.app (Term.var ">" opqSp (Ty.con "Bool" []))
+                   [opqInert, opqInert] (Ty.con "Bool" [])] opqUnitTy)
+#eval checkCaps opqAssertClean   -- expect: ok
+example : (checkCaps opqAssertClean).isViolation = false := by native_decide
+
+/-- `EDbg` — `dbg(println("x"))`. One child when `expr` is present. -/
+def opqDbgViolating : Module := opqPureMod (Term.opaque_ [opqBanned] opqUnitTy)
+#eval checkCaps opqDbgViolating   -- expect: violation naming `pure`
+example : (checkCaps opqDbgViolating).isViolation = true := by native_decide
+
+/-- `EDbg` with NO expression — bare `dbg()` emits `"expr": null`, which
+decodes to an EMPTY child list (march's own `EDbg (None, _)` arm contributes
+nothing). Nothing to find, and no decode error either. -/
+def opqDbgNullaryClean : Module := opqPureMod (Term.opaque_ [] opqUnitTy)
+#eval checkCaps opqDbgNullaryClean   -- expect: ok
+example : (checkCaps opqDbgNullaryClean).isViolation = false := by native_decide
+
+/-- `ELetFn` — a nested `fn g() do println("x") end` inside a block. The child
+is `body` ONLY: `params` are `param_to_json` records (name/ty/lin) carrying no
+expression, and march's `ELetFn` arm of `calls_in_expr` walks only `body`. -/
+def opqLetFnViolating : Module := opqPureMod (Term.opaque_ [opqBanned] opqIntTy)
+#eval checkCaps opqLetFnViolating   -- expect: violation naming `pure`
+example : (checkCaps opqLetFnViolating).isViolation = true := by native_decide
+
+def opqLetFnClean : Module := opqPureMod (Term.opaque_ [opqInert] opqIntTy)
+#eval checkCaps opqLetFnClean   -- expect: ok
+example : (checkCaps opqLetFnClean).isViolation = false := by native_decide
+
+/-- `ELetQ` — `let? v = r` with the banned call in the CONTINUATION. Children
+are `value` then `cont`; the pattern binds names but carries no expression.
+The `cont` position is the one that matters: parser folding turns the rest of
+the enclosing block into it, so most real code puts its work there. -/
+def opqLetQViolating : Module := opqPureMod
+  (Term.opaque_ [Term.var "r" opqSp opqIntTy, opqBanned] opqIntTy)
+#eval checkCaps opqLetQViolating   -- expect: violation naming `pure`
+example : (checkCaps opqLetQViolating).isViolation = true := by native_decide
+
+def opqLetQClean : Module := opqPureMod
+  (Term.opaque_ [Term.var "r" opqSp opqIntTy, opqInert] opqIntTy)
+#eval checkCaps opqLetQClean   -- expect: ok
+example : (checkCaps opqLetQClean).isViolation = false := by native_decide
+
+/-- `ESend` — `send(p, println("x"))`. Children are `cap` then `msg`. -/
+def opqSendViolating : Module := opqPureMod
+  (Term.opaque_ [Term.var "p" opqSp opqIntTy, opqBanned] opqUnitTy)
+#eval checkCaps opqSendViolating   -- expect: violation naming `pure`
+example : (checkCaps opqSendViolating).isViolation = true := by native_decide
+
+def opqSendClean : Module := opqPureMod
+  (Term.opaque_ [Term.var "p" opqSp opqIntTy, opqInert] opqUnitTy)
+#eval checkCaps opqSendClean   -- expect: ok
+example : (checkCaps opqSendClean).isViolation = false := by native_decide
+
+/-- `ESpawn` — `spawn(<expr>)`. One child, `actor`. march additionally
+requires that child to be a bare actor name, so in WELL-TYPED code nothing can
+hide there; the arm exists because `calls_in_expr` walks it anyway and because
+`--emit-core-ast` still emits an AST for a program march rejects. -/
+def opqSpawnViolating : Module := opqPureMod (Term.opaque_ [opqBanned] opqUnitTy)
+#eval checkCaps opqSpawnViolating   -- expect: violation naming `pure`
+example : (checkCaps opqSpawnViolating).isViolation = true := by native_decide
+
+def opqSpawnClean : Module := opqPureMod
+  (Term.opaque_ [Term.var "Counter" opqSp opqIntTy] opqUnitTy)
+#eval checkCaps opqSpawnClean   -- expect: ok
+example : (checkCaps opqSpawnClean).isViolation = false := by native_decide
+
+/-- The other three cap-layer walks reach through `opaque_` too.
+
+`no_panic` / `divisionVerdict`: a LITERAL-ZERO divisor hidden in an
+`opaque_` child is a violation — march's arm 1 errors on it unconditionally,
+with no solver, no refinement escape and no path escape, so the emptied
+facts/path this arm recurses with cannot cost us the answer. -/
+def opqNoPanicDivZeroInChild : Module := {
+  decls := [Decl.dmod "NP" [
+    Decl.dopts ["no_panic"],
+    Decl.dfn "f" [] none
+      (Term.opaque_ [divTerm (Term.lit (Lit.int 10) divIntTy)
+                             (Term.lit (Lit.int 0) divIntTy)] divIntTy)]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps opqNoPanicDivZeroInChild   -- expect: violation naming no_panic
+example : (checkCaps opqNoPanicDivZeroInChild).isViolation = true := by native_decide
+
+/-- ...and a NON-zero literal divisor in the same position stays ok. -/
+def opqNoPanicDivNonZeroInChild : Module := {
+  decls := [Decl.dmod "NP" [
+    Decl.dopts ["no_panic"],
+    Decl.dfn "f" [] none
+      (Term.opaque_ [divTerm (Term.lit (Lit.int 10) divIntTy)
+                             (Term.lit (Lit.int 2) divIntTy)] divIntTy)]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps opqNoPanicDivNonZeroInChild   -- expect: ok
+example : (checkCaps opqNoPanicDivNonZeroInChild).isViolation = false := by native_decide
+
+/-- The emptied-channels choice, pinned. A `let d = 0` fact in scope OUTSIDE
+an `opaque_` must NOT be carried into its children: `opaque_` records no
+binders, so an `ELetFn`/`ELetQ` child that REBINDS `d` would be judged against
+a stale fact and false-reject a program march accepts. `divisionVerdict`
+recurses with empty facts AND empty path, so `10 / d` inside the child is an
+undischarged variable — `DivVerdict.unknown`, i.e. a SKIP, never a reject. -/
+def opqNoPanicStaleFactNotCarried : Module := {
+  decls := [Decl.dmod "NP" [
+    Decl.dopts ["no_panic"],
+    Decl.dfn "f" [] none
+      (Term.let_ "d" Lin.unrestricted none (Term.lit (Lit.int 0) divIntTy)
+        (Term.opaque_ [divTerm (Term.lit (Lit.int 10) divIntTy)
+                               (Term.var "d" divSp divIntTy)] divIntTy)
+        divIntTy)]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps opqNoPanicStaleFactNotCarried   -- expect: skip, NOT violation
+example : (checkCaps opqNoPanicStaleFactNotCarried).isViolation = false := by native_decide
+example : (checkCaps opqNoPanicStaleFactNotCarried).isSkip = true := by native_decide
+
+/-- `no_alloc` / `bodyAllocates`: an allocation NESTED in an `opaque_` child is
+found (march's `no_alloc.ml` recurses into all nine kinds)... -/
+def opqNoAllocTupleInChild : Module := {
+  decls := [Decl.dmod "NA" [
+    Decl.dopts ["no_alloc"],
+    Decl.dfn "f" [] none
+      (Term.opaque_ [Term.tuple [opqInert, opqInert] (Ty.tuple [opqIntTy, opqIntTy])]
+        opqIntTy)]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps opqNoAllocTupleInChild   -- expect: violation naming no_alloc
+example : (checkCaps opqNoAllocTupleInChild).isViolation = true := by native_decide
+
+/-- ...but the `opaque_` node itself allocates NOTHING. This matters most for
+`ERecordUpdate`: march flags `ERecord` as an allocation and does NOT flag
+`ERecordUpdate` (`no_alloc.ml:23` vs `:62`), so this arm must not copy
+`.record`'s unconditional `true`. -/
+def opqNoAllocNodeItselfIsNotAnAllocation : Module := {
+  decls := [Decl.dmod "NA" [
+    Decl.dopts ["no_alloc"],
+    Decl.dfn "f" [] none
+      (Term.opaque_ [Term.var "r" opqSp opqIntTy, opqInert] opqIntTy)]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps opqNoAllocNodeItselfIsNotAnAllocation   -- expect: ok
+example : (checkCaps opqNoAllocNodeItselfIsNotAnAllocation).isViolation = false := by native_decide
+
+/-- `no_panic` / `matchesIn`: a non-exhaustive `match` nested inside an
+`opaque_` child (e.g. inside a `cond` arm) is as much a runtime-panic surface
+as a top-level one, and is reached. -/
+def opqNoPanicNonExhaustiveMatchInChild : Module := {
+  decls := [
+  colorDType,
+  Decl.dmod "G" [
+    Decl.dopts ["no_panic"],
+    Decl.dfn "describe" [("c", Lin.unrestricted, none)] none
+      (Term.opaque_
+        [Term.match_ (Term.var "c" npSpan colorTy)
+          [(Pattern.con "Red" [], none, Term.lit (Lit.int 0) opqIntTy)]
+          opqIntTy]
+        opqIntTy)]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps opqNoPanicNonExhaustiveMatchInChild   -- expect: violation naming no_panic
+example : (checkCaps opqNoPanicNonExhaustiveMatchInChild).isViolation = true := by native_decide
+
 end MarchLean.CapCheck
