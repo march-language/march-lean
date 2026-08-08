@@ -1081,7 +1081,7 @@ wrong-return-type reject) was invisible to this oracle.
    simply keeps SCC members grouped "and relies on the pass-1 placeholder
    for the cyclic edges" (`typecheck.ml:8531-8532`). A run containing
    duplicate `fn` names is left unpermuted entirely.
-3. **`check_fn`** (`typecheck.ml:6837-6900`): a fresh *monomorphic*
+3. **`check_fn`** (`typecheck.ml:6842-6900`): a fresh *monomorphic*
    self-reference variable shadows the placeholder for the body, so a
    recursive call is monomorphic — **polymorphic recursion is rejected**,
    verified directly (`fn sz(x : a) : Int do if true do 0 else sz((x, x))
@@ -1860,7 +1860,7 @@ the `ctx.addMono name recTy` self-binding, and still is. Well-typed side. -/
 -- expected: selfrec-ok-accepted: true
 
 /- Self-recursion, ill-typed side: the self-reference is MONOMORPHIC (march
-uses a fresh monomorphic self var, `typecheck.ml:6860-6866`, which is also
+uses a fresh monomorphic self var, `typecheck.ml:6860-6890`, which is also
 why march REJECTS polymorphic recursion — verified). Calling `fact` on a
 `String` must therefore be rejected, not skipped. -/
 #eval show IO Unit from do
