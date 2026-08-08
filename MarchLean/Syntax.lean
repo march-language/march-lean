@@ -216,6 +216,28 @@ partial def Term.hasUnsupported : Term → Bool
          arms.any (fun (p, g, e) => p.hasUnsupported || (g.map Term.hasUnsupported).getD false || e.hasUnsupported)
      | _ => false)
 
+/-- A declaration's visibility — march's `Ast.visibility`, the `fn` vs `pfn`
+distinction. Emitted on every `DFn` as `fn.vis`
+(`{"kind":"Public"}` / `{"kind":"Private"}` — `lib/dump/ast_json.ml`'s
+`visibility_to_json`, threaded from `fn_def_to_json`).
+
+Carried because march's **Check 6** (proof-cap production enforcement,
+`typecheck.ml:8091-8140`) branches on it: a PRIVATE function of a proof cap's
+own declaring module may not mint that cap, while a PUBLIC one may — public
+functions of the declaring module ARE the minting surface. Without this field
+the two are indistinguishable and Check 6's same-module branch cannot be
+modelled at all (it was a confirmed false accept; see
+`CapCheck.checkOneModule`'s Check 6 block).
+
+Named `pub`/`priv` rather than `public`/`private` because both of those are
+Lean keywords. The decoder defaults to `pub` on ANY unrecognised or missing
+`vis` payload — `pub` is the verdict-free value (Check 6's same-module branch
+fires only on `priv`), so a decode failure degrades to no-reject, never to a
+false reject. -/
+inductive Vis where
+  | pub | priv
+  deriving DecidableEq, Repr, Inhabited
+
 /-- Datatype constructor signature (from a `DType` decl). -/
 structure CtorSig where
   name : String
@@ -223,7 +245,58 @@ structure CtorSig where
   resultTy : Ty         -- e.g. Box(a)
   deriving Repr, Inhabited
 
-/-- Declaration (only what the fragment checks; others → `unsupported`). -/
+/-- Declaration (only what the fragment checks; others → `unsupported`).
+
+**There is deliberately no declaration-level analogue of `Term.opaque_`.**
+The idea — decode `DImpl`/`DActor`/`DTest`/`DDescribe`/`DSetup`/`DSetupAll`/
+`DInterface` to a node carrying their child terms, with `hasUnsupported`
+hard-coded `true` so inference never sees them, letting `CapCheck` walk them
+— was evaluated against the live march source and REJECTED. Four reasons,
+in descending order of weight:
+
+1. **It closes no false-accept class.** All seven forms already decode to
+   `Decl.unsupported`, which forces the whole-file skip gate before any
+   accept can be reached, so today's verdict on each is exit 2, not exit 0
+   — every cell was probed (see `CapCheck`'s module docstring). The change
+   would convert skips into rejects: more confirmations, but not a
+   correctness fix, and it would buy them at the cost of (2).
+
+2. **It would GENERATE false rejects — the worst class.** `Term.opaque_` is
+   safe because every cap-layer consumer of a term (`bodyCalls`,
+   `bodyAllocates`, `divisionVerdict`) is a "does X occur anywhere below"
+   scan that stays sound over an unordered bag of subterms. Declaration
+   walks are not like that. march's `division_safety.ml` calls
+   `check_body ~root errctx params body` with a DIFFERENT parameter
+   environment per form: an actor handler's parameters are in scope and may
+   carry REFINEMENTS that discharge a divisor (its own comment: "an actor
+   handler's parameters may be refined"). A children-only bag discards
+   them, so the walk would run at `divisionVerdict [] []` and reject a
+   divisor march proves safe. `DImpl` is worse still — march STRIPS a
+   method's param refinements unless the name is `adoptable`
+   (`Refine_check.adoptable_impl_methods`, a cross-declaration analysis
+   this checker does not model at all), so both including and omitting them
+   diverges.
+
+3. **The forms are not uniform in what walks them.** Division safety is the
+   ONLY error-level check that reaches any of the seven; `pure` /
+   `deterministic` / `no_alloc` / `no_panic` (both halves) / Checks 6/7/8
+   are all `DFn`-only, and Check 1 additionally scans `DActor` handler
+   SIGNATURES — types, which a `children : List Term` bag cannot carry at
+   all. `DDescribe` inherits `no_panic` from its enclosing module while
+   `DMod` re-derives it. So each gate would need its own "ignore this node"
+   arm plus per-form inheritance metadata: the same one-cell-at-a-time
+   discipline the idea was meant to replace, plus a node that silently
+   under-informs Check 1.
+
+4. **The coverage on offer is smaller than the form list suggests.** `DApp`
+   — the form with the most reachable bodies — is desugared to a real
+   `DFn __app_init__` before `--emit-core-ast`, so it is already covered as
+   an ordinary `dfn` and already agrees with march.
+
+The correct structural protection is the class-(a)/(b) invariant stated in
+`CapCheck`'s module docstring, enforced by keeping `Decl.hasUnsupported`'s
+match wildcard-free, so adding a `Decl` constructor is a compile error that
+forces an explicit decision. -/
 inductive Decl where
   /-- Function declaration, modeled N-ARILY to match march's `DFn` faithfully
   (`params : List`, a clause's full parameter list). No currying — the whole
@@ -247,8 +320,12 @@ inductive Decl where
   `Infer.inferModule'`'s `dfn` arm unifies the inferred BODY type against it,
   exactly as it already does for each param annotation — march checks a
   clause's body against its declared return type, and leaving this
-  unconstrained was a live false-accept class (see that arm's comment). -/
-  | dfn (name : String) (params : List (String × Lin × Option Ty)) (retAnnot : Option Ty) (body : Term)
+  unconstrained was a live false-accept class (see that arm's comment).
+
+  `vis` is the `fn`/`pfn` marker (see `Vis`), read ONLY by Check 6. It is the
+  FIRST field purely so the many hand-built fixtures below and in `CapCheck`
+  read `Decl.dfn .pub "name" …`; nothing about the position is semantic. -/
+  | dfn (vis : Vis) (name : String) (params : List (String × Lin × Option Ty)) (retAnnot : Option Ty) (body : Term)
   | dlet (name : String) (rhs : Term)
   | dtype (name : String) (params : List String) (ctors : List CtorSig)
   /-- A nested module, `mod Name do … end`. Carried as a TREE because `needs`
@@ -303,7 +380,7 @@ through `List Decl` inside `dmod` isn't structurally recognized by the
 kernel, matching how `Term.hasUnsupported` handles its own nesting. -/
 partial def Decl.hasUnsupported : Decl → Bool
   | .unsupported => true
-  | .dfn _ params retAnnot body =>
+  | .dfn _ _ params retAnnot body =>
       params.any (fun (_, _, a) => optTyHasUnsupported a)
         || optTyHasUnsupported retAnnot || body.hasUnsupported
   | .dlet _ body => body.hasUnsupported

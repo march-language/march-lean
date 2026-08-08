@@ -221,7 +221,7 @@ partial def checkTerm : Term → CheckResult
   | .lit _ _ | .var _ _ _ | .opaque_ _ _ | .unsupported _ => .ok
 
 def checkDecl : Decl → CheckResult
-  | .dfn _ ps _ body =>
+  | .dfn _ _ ps _ body =>
       match enforceParams ps body with
       | .ok => checkTerm body
       | other => other
@@ -247,14 +247,14 @@ open MarchLean.Syntax MarchLean.Result MarchLean.Linearity
 
 -- linear param used exactly once -> ok
 def linOnce : Module :=
-  { decls := [Decl.dfn "f" [("x", Lin.linear, none)] none
+  { decls := [Decl.dfn .pub "f" [("x", Lin.linear, none)] none
       (Term.var "x" ⟨"f",1,1,1,2⟩ (Ty.con "Int" []))],
     schemes := [], insts := [] }
 #eval (repr (checkLinearity linOnce))  -- expected: CheckResult.ok
 
 -- linear param used twice -> reject
 def linTwice : Module :=
-  { decls := [Decl.dfn "f" [("x", Lin.linear, none)] none
+  { decls := [Decl.dfn .pub "f" [("x", Lin.linear, none)] none
       (Term.tuple [Term.var "x" ⟨"f",1,1,1,2⟩ (Ty.con "Int" []),
                    Term.var "x" ⟨"f",1,3,1,4⟩ (Ty.con "Int" [])] (Ty.tuple [Ty.con "Int" [], Ty.con "Int" []]))],
     schemes := [], insts := [] }
@@ -262,7 +262,7 @@ def linTwice : Module :=
 
 -- linear param never used -> reject
 def linNever : Module :=
-  { decls := [Decl.dfn "f" [("x", Lin.linear, none)] none (Term.lit (Lit.int 1) (Ty.con "Int" []))],
+  { decls := [Decl.dfn .pub "f" [("x", Lin.linear, none)] none (Term.lit (Lit.int 1) (Ty.con "Int" []))],
     schemes := [], insts := [] }
 #eval (repr (checkLinearity linNever)) -- expected: CheckResult.reject ...
 
@@ -271,7 +271,7 @@ def linNever : Module :=
 -- any single execution path only one arm runs, so this is exactly one use,
 -- not two. Summing (the pre-fix behaviour) would wrongly reject this.
 def linMatchBalanced : Module :=
-  { decls := [Decl.dfn "f" [("x", Lin.linear, none)] none
+  { decls := [Decl.dfn .pub "f" [("x", Lin.linear, none)] none
       (Term.match_ (Term.lit (Lit.bool true) (Ty.con "Bool" []))
         [(Pattern.wild, none, Term.var "x" ⟨"f",1,1,1,2⟩ (Ty.con "Int" [])),
          (Pattern.wild, none, Term.var "x" ⟨"f",1,3,1,4⟩ (Ty.con "Int" []))]
@@ -286,7 +286,7 @@ def linMatchBalanced : Module :=
 -- would be misattributed to the outer linear param, masking the real
 -- unused-linear-binder bug.
 def linMatchShadowed : Module :=
-  { decls := [Decl.dfn "f" [("x", Lin.linear, none)] none
+  { decls := [Decl.dfn .pub "f" [("x", Lin.linear, none)] none
       (Term.match_ (Term.lit (Lit.int 0) (Ty.con "Int" []))
         [(Pattern.var "x" Lin.unrestricted, none, Term.var "x" ⟨"f",1,1,1,2⟩ (Ty.con "Int" []))]
         (Ty.con "Int" []))],
@@ -344,7 +344,7 @@ def linearCapturedInClosure : Module :=
 -- program that also HAS a closure (over an unrelated unrestricted value), must
 -- still be checked normally (ok), not skipped.
 def linearNotCaptured : Module :=
-  { decls := [Decl.dfn "f" [("x", Lin.linear, none)] none
+  { decls := [Decl.dfn .pub "f" [("x", Lin.linear, none)] none
       (Term.let_ "g" Lin.unrestricted none
         (Term.lam [("y", Lin.unrestricted, none)] (Term.var "y" ⟨"f",1,1,1,2⟩ (Ty.con "Int" []))
                   (Ty.arrow (Ty.con "Int" []) (Ty.con "Int" [])))
