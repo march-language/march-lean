@@ -126,7 +126,7 @@ matter for Check 1 — body uses are Check 1b, which is warning-only and not
 implemented. Return-type caps are handled separately by
 `capsInReturnSignature` (they are gated differently — see `checkOneModule`). -/
 def capsInSignature : Decl → List String
-  | .dfn _ params _ _ =>
+  | .dfn _ _ params _ _ =>
       params.flatMap (fun (_, _, annot) =>
         match annot with | some t => capsInTy t | none => [])
   | _ => []
@@ -142,7 +142,7 @@ this gate). For **Check 8**, `checkOneModule` calls this UNGATED — correctly
 so, since march's own Check 8 tests `own_caps <> []` directly and is not
 subject to Check 1's self-declaration exemption at all. -/
 def capsInReturnSignature : Decl → List String
-  | .dfn _ _ retAnnot _ =>
+  | .dfn _ _ _ retAnnot _ =>
       match retAnnot with | some t => capsInTy t | none => []
   | _ => []
 
@@ -1478,7 +1478,8 @@ def checkOneModule (modName : String) (decls : List Decl)
     (moduleCaps : List (String × List String))
     (selfDeclaredCaps : List String := [])
     (inheritedCaps : List String := [])
-    (userCtors : List (String × List String) := []) : CapResult :=
+    (userCtors : List (String × List String) := [])
+    (foreignProofCaps : List String := []) : CapResult :=
   let declared := declaredNeeds decls
   -- Check 1 — signature Cap(X) coverage over `param_tys @ ret_tys`
   -- (march's `check_module_needs`). Parameter caps are ALWAYS scanned.
@@ -1528,6 +1529,76 @@ def checkOneModule (modName : String) (decls : List Decl)
   | some (m, r) =>
       .violation s!"Check 4: module `{modName}` imports `{m}` which requires `Cap({r})`, but `{r}` is not declared in `needs`"
   | none =>
+  -- Check 6 — proof-cap PRODUCTION enforcement (`typecheck.ml:8091-8140`).
+  -- A proof capability may be minted only by a PUBLIC function of its own
+  -- declaring module; everyone else may pass one through but never conjure
+  -- one. march reads this off the SIGNATURE alone: for each `Ast.DFn`, for
+  -- each cap path in `fn_ret_ty` that is a registered proof cap
+  -- (`env.proof_caps`) and does NOT also appear among the clause parameter
+  -- types, it errors when the cap's declaring module differs from this
+  -- module OR this fn is `pfn` (`def.fn_vis = Ast.Private`). The body is
+  -- irrelevant — this is a pure signature check.
+  --
+  -- **This was a live FALSE ACCEPT, reachable with a fully-in-fragment
+  -- file.** `mod Db4 do proof cap M  type Box(a) = Empty | Full(a)
+  -- pfn make() : Box(Cap(Db4.M)) do Empty end  fn main() do println("hi")
+  -- end end` is march exit 1 ("private function `make` in `Db4` cannot mint
+  -- `Cap(Db4.M)`.") and was exit 0 here: nothing in this file scanned return
+  -- signatures for proof-cap PRODUCTION, only Check 1's `needs` COVERAGE,
+  -- which the self-declaration exemption (Finding I1) satisfies. Two further
+  -- shapes were verified against the binary: the same fn with the `proof cap`
+  -- declared textually AFTER it (still rejects — the entry module's check
+  -- runs against `final_env`, threaded through the WHOLE top-level decl list,
+  -- so it is order-insensitive), and a nested `mod Inner` whose PUBLIC fn
+  -- returns the enclosing module's proof cap (rejects via the
+  -- `declaring_mod <> mod_name` branch, visibility irrelevant).
+  --
+  -- The two inputs are supplied by the caller and encode march's env
+  -- threading exactly as Finding I1 already established it:
+  --   * `selfDeclaredCaps` — proof caps whose declaring module IS this
+  --     module. Non-empty ONLY for the file's entry module (`checkCaps`);
+  --     always `[]` for a nested `dmod`, because march's
+  --     `check_module_needs` for a nested module runs on the OUTER env
+  --     captured BEFORE that module's own decls were folded, so a nested
+  --     module's own `proof cap` is invisible to its own check. Verified:
+  --     `mod Top do mod Inner do proof cap M  pfn forge() :
+  --     Box(Cap(Inner.M)) do Empty end end … end` reports Check 1
+  --     ("`Inner.M` is not declared in `needs`"), NOT Check 6 — the cap is
+  --     not in `env.proof_caps` yet at all. This checker reproduces that
+  --     verdict already, so the same `[]` that keeps Check 1 faithful keeps
+  --     Check 6 faithful.
+  --   * `foreignProofCaps` — proof caps visible in `env.proof_caps` whose
+  --     declaring module is NOT this one, accumulated POSITIONALLY by
+  --     `checkDecls` (same sequential fold as `inherited`; see its
+  --     docstring). A `proof cap` written after a nested `mod` does not
+  --     reach it, exactly as a `cap` directive does not.
+  --
+  -- **Gated on the module being ENTIRELY in fragment**, exactly like the
+  -- return-cap half of Check 1 above, and for a sharper reason than Check
+  -- 1's: this check's verdict depends on the PARAMETER cap list being
+  -- COMPLETE. A param whose surface type this checker cannot decode lands as
+  -- `Ty.unsupported`, from which `capsInTy` extracts nothing — if march's
+  -- own `cap_paths_in_surface_ty` found the returned cap in that same param,
+  -- march sees a pass-through and accepts while an ungated check here would
+  -- reject. That is a FALSE REJECT, the worst class, so the check declines
+  -- to fire at all unless every declaration in this module decoded
+  -- faithfully. Costs nothing: such a file skips (exit 2) downstream anyway.
+  let fullyInFragment := !decls.any Decl.hasUnsupported
+  let check6 := if !fullyInFragment then none else decls.findSome? (fun d =>
+    match d with
+    | .dfn vis name _ _ _ =>
+        let paramCaps := capsInSignature d
+        (capsInReturnSignature d).findSome? (fun c =>
+          if paramCaps.contains c then none
+          else if foreignProofCaps.contains c then
+            some s!"Check 6: fn `{name}` in module `{modName}` returns `Cap({c})`, a proof capability declared in another module — only that module's public functions can construct it"
+          else if vis == Vis.priv && selfDeclaredCaps.contains c then
+            some s!"Check 6: private fn `{name}` in module `{modName}` cannot mint `Cap({c})` — only public functions of its declaring module can"
+          else none)
+    | _ => none)
+  match check6 with
+  | some msg => .violation msg
+  | none =>
   -- Check 7 — realtime exclusion (typecheck.ml:7162-7182). A fn whose
   -- PARAMETER signature carries BOTH a `Tagged(_, Realtime)` type and a
   -- `Cap(X)` with X ∈ {Alloc, IO, Panic} (the excluded roots — NOT other IO
@@ -1557,11 +1628,11 @@ def checkOneModule (modName : String) (decls : List Decl)
     | .con "Cap" [.con r []] => r == "Alloc" || r == "IO" || r == "Panic"
     | _ => false
   let paramTysOf : Decl → List Ty
-    | .dfn _ params _ _ => params.filterMap (fun (_, _, a) => a)
+    | .dfn _ _ params _ _ => params.filterMap (fun (_, _, a) => a)
     | _ => []
   match decls.find? (fun d =>
       (paramTysOf d).any isRealtimeTagged && (paramTysOf d).any isExcludedCap) with
-  | some (.dfn name params _ _) =>
+  | some (.dfn _ name params _ _) =>
       let excludedName :=
         match (params.filterMap (fun (_, _, a) => a)).find? isExcludedCap with
         | some (.con "Cap" [.con r []]) => r
@@ -1584,13 +1655,13 @@ def checkOneModule (modName : String) (decls : List Decl)
   -- of what it calls.
   match decls.find? (fun d =>
       match d with
-      | .dfn name _ _ body =>
+      | .dfn _ name _ _ body =>
           isMigrateFnName name &&
             (bodyCallsIO body
               || !(capsInSignature d).isEmpty
               || !(capsInReturnSignature d).isEmpty)
       | _ => false) with
-  | some (.dfn name _ _ _) =>
+  | some (.dfn _ name _ _ _) =>
       .violation s!"Check 8: fn `{name}` in module `{modName}` ends in `_migrate_state` but performs IO or its signature carries a capability"
   | _ =>
   -- Finding I2: EVERY extern block implies `Cap(IO.Foreign)` onto EVERY
@@ -1686,7 +1757,7 @@ def checkOneModule (modName : String) (decls : List Decl)
   -- half of `no_panic` deliberately keep consulting `opts` alone, below.
   let effective := opts ++ inheritedCaps
   let dfns := decls.filterMap (fun d => match d with
-    | .dfn name _ _ body => some (name, body)
+    | .dfn _ name _ _ body => some (name, body)
     | _ => none)
   -- `pure` (typecheck.ml:8232): bans EVERY name in `builtinCaps` (the whole
   -- builtin→cap table, IO/Alloc/Panic alike) UNION the four extra names that
@@ -1889,22 +1960,44 @@ that half unchanged; only this positional fold changes here.
 `checkCaps`) is threaded through UNCHANGED at every level — unlike
 `inherited`, it is not positional or scoped: a `match` anywhere may scrutinize
 a user ADT declared anywhere else in the file, so every recursive
-`checkOneModule` call gets the same complete table. -/
+`checkOneModule` call gets the same complete table.
+
+`curMod`/`proofCaps` carry march's `env.proof_caps` for Check 6, and are
+threaded by the SAME positional fold as `inherited`, for the same reason:
+march registers a `proof cap` inside the sequential `check_decl` fold
+(`typecheck.ml:10325-10335`, `proof_caps = (full_path, env.current_module) ::
+env.proof_caps`), so a nested `mod` sees only the proof caps declared BEFORE
+it. `curMod` is the name of the module whose decl list is being folded —
+needed because march keys each entry by `current_module ^ "." ^ name`, so the
+qualified path depends on where the `proof cap` sits, not on where it is
+used. A `Decl.dproofcap` adds its entry for the REST of this same list; a
+`Decl.dmod` recurses with `curMod` rebound to the child's name (so a
+grandchild sees the child's own proof caps, which march's fold also reaches)
+while the child's OWN `checkOneModule` call gets the pre-fold set — the
+Finding I1 asymmetry, verified for Check 6 in `checkOneModule`'s Check 6
+block. Siblings never see what a subtree declared, exactly as with
+`inherited`. -/
 partial def checkDecls (moduleCaps : List (String × List String))
-    (inherited : List String) (userCtors : List (String × List String)) :
+    (inherited : List String) (userCtors : List (String × List String))
+    (curMod : String) (proofCaps : List (String × String)) :
     List Decl → CapResult
   | [] => .ok
   | .dopts o :: rest =>
       let inherited' := (inherited ++ o).filter inheritableBehavioralCaps.contains
-      checkDecls moduleCaps inherited' userCtors rest
+      checkDecls moduleCaps inherited' userCtors curMod proofCaps rest
+  | .dproofcap n :: rest =>
+      checkDecls moduleCaps inherited userCtors curMod
+        ((s!"{curMod}.{n}", curMod) :: proofCaps) rest
   | .dmod name inner :: rest =>
       -- `CapResult.andThen` keeps the old leftmost-violation behaviour while
       -- letting a `skip` from ANY module survive a clean sibling — see its
       -- docstring for the tier order (violation > skip > ok).
-      (checkOneModule name inner moduleCaps (inheritedCaps := inherited) (userCtors := userCtors)).andThen
-        ((checkDecls moduleCaps inherited userCtors inner).andThen   -- nested modules, same positional fold
-          (checkDecls moduleCaps inherited userCtors rest))          -- siblings never see what `inner` declared
-  | _ :: rest => checkDecls moduleCaps inherited userCtors rest
+      let foreign := (proofCaps.filter (fun (_, dm) => dm != name)).map (·.1)
+      (checkOneModule name inner moduleCaps (inheritedCaps := inherited)
+          (userCtors := userCtors) (foreignProofCaps := foreign)).andThen
+        ((checkDecls moduleCaps inherited userCtors name proofCaps inner).andThen   -- nested modules, same positional fold
+          (checkDecls moduleCaps inherited userCtors curMod proofCaps rest))        -- siblings never see what `inner` declared
+  | _ :: rest => checkDecls moduleCaps inherited userCtors curMod proofCaps rest
 
 /-- Entry point. Also checks the top level as an implicit module, so a file
 with `needs`/`Cap(X)` outside any `mod` block is still checked.
@@ -1952,7 +2045,17 @@ def checkCaps (m : Module) : CapResult :=
     -- reaches it. Starting the fold at `[]` and letting `checkDecls` itself
     -- accumulate `Decl.dopts` as it walks `m.decls` in order gets this right
     -- without any whole-list pre-collection here.
-    (checkDecls m.moduleCaps [] userCtors m.decls)
+    --
+    -- Check 6's proof-cap accumulator starts empty for the same reason and is
+    -- accumulated by the same fold, keyed by `m.entryName` (march's
+    -- `env.current_module` while folding the entry module's own decls). Note
+    -- the deliberate asymmetry with `selfDeclaredCaps` above: the ENTRY
+    -- module's own Check 6 uses the WHOLE-list `selfDeclaredCaps` (march runs
+    -- its `check_module_needs` with `final_env`, so order does not matter
+    -- there — verified: a `pfn` written BEFORE its module's `proof cap`
+    -- declaration still rejects), while a nested `dmod` sees only what this
+    -- positional fold has reached.
+    (checkDecls m.moduleCaps [] userCtors m.entryName [] m.decls)
 
 end MarchLean.CapCheck
 
@@ -1964,7 +2067,7 @@ open MarchLean.Syntax
 def siblingViolation : Module := {
   decls := [Decl.dmod "Store" [
     Decl.dneeds ["IO.FileRead"],
-    Decl.dfn "save" [("cap", Lin.unrestricted,
+    Decl.dfn .pub "save" [("cap", Lin.unrestricted,
                       some (Ty.con "Cap" [Ty.con "IO.FileWrite" []]))]
              none (Term.lit (Lit.unit) (Ty.con "Unit" []))]],
   schemes := [], insts := [], moduleCaps := [] }
@@ -1975,7 +2078,7 @@ def siblingViolation : Module := {
 def rootCovers : Module := {
   decls := [Decl.dmod "Server" [
     Decl.dneeds ["IO"],
-    Decl.dfn "listen" [("cap", Lin.unrestricted,
+    Decl.dfn .pub "listen" [("cap", Lin.unrestricted,
                         some (Ty.con "Cap" [Ty.con "IO.Network" []]))]
              none (Term.lit (Lit.unit) (Ty.con "Unit" []))]],
   schemes := [], insts := [], moduleCaps := [] }
@@ -2020,7 +2123,7 @@ def externCovered : Module := {
 /-- A module with no caps at all is trivially fine — the overwhelmingly
 common case, and it must not be flagged. -/
 def noCapsAtAll : Module := {
-  decls := [Decl.dfn "f" [] none (Term.lit (Lit.int 1) (Ty.con "Int" []))],
+  decls := [Decl.dfn .pub "f" [] none (Term.lit (Lit.int 1) (Ty.con "Int" []))],
   schemes := [], insts := [], moduleCaps := [] }
 #eval checkCaps noCapsAtAll
   -- expect: ok
@@ -2051,7 +2154,7 @@ uncovered RETURN cap is a Check 1 violation — the param `Cap(IO.Console)` is
 covered by `needs IO.Console`, the return `Cap(IO.Network)` is not. -/
 def retCapUncovered : Module := {
   decls := [Decl.dneeds ["IO.Console"],
-    Decl.dfn "get_net"
+    Decl.dfn .pub "get_net"
       [("cap", Lin.unrestricted, some (Ty.con "Cap" [Ty.con "IO.Console" []]))]
       (some (Ty.con "Cap" [Ty.con "IO.Network" []]))
       (Term.lit (Lit.int 0) (Ty.con "Int" []))],
@@ -2064,7 +2167,7 @@ returned `Cap(IO.Network)` (the param here is a plain `Int`, isolating the
 return path). -/
 def retCapCovered : Module := {
   decls := [Decl.dneeds ["IO"],
-    Decl.dfn "get_net"
+    Decl.dfn .pub "get_net"
       [("port", Lin.unrestricted, some (Ty.con "Int" []))]
       (some (Ty.con "Cap" [Ty.con "IO.Network" []]))
       (Term.lit (Lit.int 0) (Ty.con "Int" []))],
@@ -2077,7 +2180,7 @@ and a `Cap(IO)` param — one of the three excluded roots — is a violation. -/
 def rtExcluded : Module := {
   decls := [Decl.dmod "RT" [
     Decl.dneeds ["IO"],
-    Decl.dfn "step"
+    Decl.dfn .pub "step"
       [("_d", Lin.unrestricted, some (Ty.con "Tagged" [Ty.con "Int" [], Ty.con "Realtime" []])),
        ("_c", Lin.unrestricted, some (Ty.con "Cap" [Ty.con "IO" []]))]
       none (Term.lit (Lit.int 1) (Ty.con "Int" []))]],
@@ -2091,7 +2194,7 @@ flagged. -/
 def rtSafe : Module := {
   decls := [Decl.dmod "RT" [
     Decl.dneeds ["IO"],
-    Decl.dfn "step"
+    Decl.dfn .pub "step"
       [("_d", Lin.unrestricted, some (Ty.con "Tagged" [Ty.con "Int" [], Ty.con "Realtime" []])),
        ("_c", Lin.unrestricted, some (Ty.con "Cap" [Ty.con "IO.Network" []]))]
       none (Term.lit (Lit.int 1) (Ty.con "Int" []))]],
@@ -2104,7 +2207,7 @@ NOT be flagged (this is just an ordinary Check-1-covered `Cap(IO)` use). -/
 def noRt : Module := {
   decls := [Decl.dmod "RT" [
     Decl.dneeds ["IO"],
-    Decl.dfn "step"
+    Decl.dfn .pub "step"
       [("_c", Lin.unrestricted, some (Ty.con "Cap" [Ty.con "IO" []]))]
       none (Term.lit (Lit.int 1) (Ty.con "Int" []))]],
   schemes := [], insts := [], moduleCaps := [] }
@@ -2124,7 +2227,7 @@ this checker cannot actually judge. -/
 def retCapDeferredByOtherUnsupported : Module := {
   decls := [Decl.unsupported,   -- e.g. an actor/interface decl
             Decl.dneeds ["IO"],
-    Decl.dfn "get_widget"
+    Decl.dfn .pub "get_widget"
       [("cap", Lin.unrestricted, some (Ty.con "Cap" [Ty.con "IO" []]))]
       (some (Ty.con "Cap" [Ty.con "Vendor.Widget" []]))
       (Term.lit (Lit.int 0) (Ty.con "Int" []))],
@@ -2143,7 +2246,7 @@ even though `Db` declares no `needs Db.Migrated` (verified directly against
 populating it from the envelope's `module.name`. -/
 def selfDeclaredParamOk : Module := {
   decls := [Decl.dproofcap "Migrated",
-    Decl.dfn "consume"
+    Decl.dfn .pub "consume"
       [("m", Lin.unrestricted, some (Ty.con "Cap" [Ty.con "Db.Migrated" []]))]
       none
       (Term.lit (Lit.int 1) (Ty.con "Int" []))],
@@ -2160,7 +2263,7 @@ UNRELATED reason and would no longer even apply here — `Decl.dproofcap` is
 in-fragment). -/
 def selfDeclaredReturnOk : Module := {
   decls := [Decl.dproofcap "Migrated", Decl.dneeds ["IO"],
-    Decl.dfn "run_migrations"
+    Decl.dfn .pub "run_migrations"
       [("cap", Lin.unrestricted, some (Ty.con "Cap" [Ty.con "IO" []]))]
       (some (Ty.con "Cap" [Ty.con "Db.Migrated" []]))
       (Term.lit (Lit.int 0) (Ty.con "Int" []))],
@@ -2182,7 +2285,7 @@ def selfDeclaredNestedRejects : Module := {
   decls := [Decl.dmod "Top" [
     Decl.dmod "Db" [
       Decl.dproofcap "Migrated",
-      Decl.dfn "consume"
+      Decl.dfn .pub "consume"
         [("m", Lin.unrestricted, some (Ty.con "Cap" [Ty.con "Db.Migrated" []]))]
         none
         (Term.lit (Lit.int 1) (Ty.con "Int" []))]]],
@@ -2195,7 +2298,7 @@ example : (checkCaps selfDeclaredNestedRejects).isViolation = true := by native_
 def migrateDoesIO : Module := {
   decls := [Decl.dmod "Counter" [
     Decl.dneeds ["IO.Console"],
-    Decl.dfn "counter_migrate_state" [("old", Lin.unrestricted, some (Ty.con "Int" []))] none
+    Decl.dfn .pub "counter_migrate_state" [("old", Lin.unrestricted, some (Ty.con "Int" []))] none
       (Term.app (Term.var "println" ⟨"f",0,0,0,0⟩ (Ty.con "Unit" []))
                 [Term.lit (Lit.str "x") (Ty.con "String" [])] (Ty.con "Unit" []))]],
   schemes := [], insts := [], moduleCaps := [] }
@@ -2206,7 +2309,7 @@ example : (checkCaps migrateDoesIO).isViolation = true := by native_decide
 def migratePure : Module := {
   decls := [Decl.dmod "Counter" [
     Decl.dneeds ["IO.Console"],
-    Decl.dfn "counter_migrate_state" [("old", Lin.unrestricted, some (Ty.con "Int" []))] none
+    Decl.dfn .pub "counter_migrate_state" [("old", Lin.unrestricted, some (Ty.con "Int" []))] none
       (Term.var "old" ⟨"f",0,0,0,0⟩ (Ty.con "Int" []))]],
   schemes := [], insts := [], moduleCaps := [] }
 #eval checkCaps migratePure   -- expect: ok
@@ -2217,7 +2320,7 @@ suffix — Check 8 must not fire on ordinary functions). -/
 def plainDoesIO : Module := {
   decls := [Decl.dmod "Counter" [
     Decl.dneeds ["IO.Console"],
-    Decl.dfn "helper" [("old", Lin.unrestricted, some (Ty.con "Int" []))] none
+    Decl.dfn .pub "helper" [("old", Lin.unrestricted, some (Ty.con "Int" []))] none
       (Term.app (Term.var "println" ⟨"f",0,0,0,0⟩ (Ty.con "Unit" []))
                 [Term.lit (Lit.str "x") (Ty.con "String" [])] (Ty.con "Unit" []))]],
   schemes := [], insts := [], moduleCaps := [] }
@@ -2234,7 +2337,7 @@ is rejected. Mirrors the false-accept demonstrated end-to-end:
 def migrateSigCapUncalled : Module := {
   decls := [Decl.dmod "Counter" [
     Decl.dneeds ["IO.Console"],
-    Decl.dfn "counter_migrate_state"
+    Decl.dfn .pub "counter_migrate_state"
       [("c", Lin.unrestricted, some (Ty.con "Cap" [Ty.con "IO.Console" []])),
        ("old", Lin.unrestricted, some (Ty.con "Int" []))]
       none
@@ -2249,7 +2352,7 @@ example : (checkCaps migrateSigCapUncalled).isViolation = true := by native_deci
 def migrateRetCapUncalled : Module := {
   decls := [Decl.dmod "Counter" [
     Decl.dneeds ["IO.Console"],
-    Decl.dfn "counter_migrate_state"
+    Decl.dfn .pub "counter_migrate_state"
       [("old", Lin.unrestricted, some (Ty.con "Int" []))]
       (some (Ty.con "Cap" [Ty.con "IO.Console" []]))
       (Term.var "old" ⟨"f",0,0,0,0⟩ (Ty.con "Int" []))]],
@@ -2268,7 +2371,7 @@ violation; see the accompanying teeth-check (temporarily stubbing the
 def migrateDoesIONested : Module := {
   decls := [Decl.dmod "Counter" [
     Decl.dneeds ["IO.Console"],
-    Decl.dfn "counter_migrate_state" [("old", Lin.unrestricted, some (Ty.con "Int" []))] none
+    Decl.dfn .pub "counter_migrate_state" [("old", Lin.unrestricted, some (Ty.con "Int" []))] none
       (Term.let_ "x" Lin.unrestricted none
         (Term.match_ (Term.var "old" ⟨"f",0,0,0,0⟩ (Ty.con "Int" []))
           [(Pattern.wild, none,
@@ -2351,7 +2454,7 @@ under a module defining `type Realtime(a) = R(a)`. -/
 def rtTagNonNullarySafe : Module := {
   decls := [Decl.dmod "RT" [
     Decl.dneeds ["IO"],
-    Decl.dfn "step"
+    Decl.dfn .pub "step"
       [("_d", Lin.unrestricted,
         some (Ty.con "Tagged" [Ty.con "Int" [], Ty.con "Realtime" [Ty.con "Int" []]])),
        ("_c", Lin.unrestricted, some (Ty.con "Cap" [Ty.con "IO" []]))]
@@ -2373,7 +2476,7 @@ reproducer (accepted by march: `type Realtime = RT` / `type IO(a) = IOBox(a)`
 def excludedCapNonNullarySafe : Module := {
   decls := [Decl.dmod "RT" [
     Decl.dneeds ["IO"],
-    Decl.dfn "step"
+    Decl.dfn .pub "step"
       [("_d", Lin.unrestricted, some (Ty.con "Tagged" [Ty.con "Int" [], Ty.con "Realtime" []])),
        ("_c", Lin.unrestricted, some (Ty.con "Cap" [Ty.con "IO" [Ty.con "Int" []]]))]
       none (Term.lit (Lit.int 1) (Ty.con "Int" []))]],
@@ -2420,7 +2523,7 @@ module with no `needs` at all — so the nested `IO.Network` capability, if
 and must surface as a Check 1 violation, not silently vanish. -/
 def capArityTwoViolation : Module := {
   decls := [Decl.dmod "M" [
-    Decl.dfn "f"
+    Decl.dfn .pub "f"
       [("_c", Lin.unrestricted,
         some (Ty.con "Cap" [Ty.con "Cap" [Ty.con "IO.Network" []], Ty.con "Int" []]))]
       none (Term.lit (Lit.int 1) (Ty.con "Int" []))]],
@@ -2445,7 +2548,7 @@ again, this fixture's `Cap(IO.Network)` would surface as an uncovered Check 1
 violation (there is no `needs` to cover it) and this guard would fail. -/
 def tagPayloadCapIgnored : Module := {
   decls := [Decl.dmod "M" [
-    Decl.dfn "f"
+    Decl.dfn .pub "f"
       [("_x", Lin.unrestricted,
         some (Ty.con "Tagged" [Ty.con "Cap" [Ty.con "IO.Network" []], Ty.con "Realtime" []]))]
       none (Term.lit (Lit.int 1) (Ty.con "Int" []))]],
@@ -2488,7 +2591,7 @@ one of the four extra pure-only bans) is a violation. -/
 def purePrintln : Module := {
   decls := [Decl.dmod "P" [
     Decl.dopts ["pure"],
-    Decl.dfn "f" []
+    Decl.dfn .pub "f" []
       none
       (Term.app (Term.var "println" ⟨"f",0,0,0,0⟩ (Ty.con "Unit" []))
                 [Term.lit (Lit.str "x") (Ty.con "String" [])] (Ty.con "Unit" []))]],
@@ -2501,7 +2604,7 @@ ok. -/
 def pureArithmetic : Module := {
   decls := [Decl.dmod "P" [
     Decl.dopts ["pure"],
-    Decl.dfn "f" []
+    Decl.dfn .pub "f" []
       none
       (Term.app (Term.var "int_abs" ⟨"f",0,0,0,0⟩ (Ty.con "Int" []))
                 [Term.lit (Lit.int (-1)) (Ty.con "Int" [])] (Ty.con "Int" []))]],
@@ -2513,7 +2616,7 @@ example : (checkCaps pureArithmetic).isViolation = false := by native_decide
 def deterministicUnixTimeMs : Module := {
   decls := [Decl.dmod "D" [
     Decl.dopts ["deterministic"],
-    Decl.dfn "f" []
+    Decl.dfn .pub "f" []
       none
       (Term.app (Term.var "unix_time_ms" ⟨"f",0,0,0,0⟩ (Ty.con "Int" []))
                 [] (Ty.con "Int" []))]],
@@ -2527,7 +2630,7 @@ Clock/Random subset, not the whole `builtinCaps` table). -/
 def deterministicIntAbs : Module := {
   decls := [Decl.dmod "D" [
     Decl.dopts ["deterministic"],
-    Decl.dfn "f" []
+    Decl.dfn .pub "f" []
       none
       (Term.app (Term.var "int_abs" ⟨"f",0,0,0,0⟩ (Ty.con "Int" []))
                 [Term.lit (Lit.int (-1)) (Ty.con "Int" [])] (Ty.con "Int" []))]],
@@ -2550,7 +2653,7 @@ ok. -/
 def noExternWithoutExtern : Module := {
   decls := [Decl.dmod "E" [
     Decl.dopts ["no_extern"],
-    Decl.dfn "f" [] none (Term.lit (Lit.int 1) (Ty.con "Int" []))]],
+    Decl.dfn .pub "f" [] none (Term.lit (Lit.int 1) (Ty.con "Int" []))]],
   schemes := [], insts := [], moduleCaps := [] }
 #eval checkCaps noExternWithoutExtern   -- expect: ok
 example : (checkCaps noExternWithoutExtern).isViolation = false := by native_decide
@@ -2566,7 +2669,7 @@ def noExternWithForeignNeed : Module := {
   decls := [Decl.dmod "NoFFI" [
     Decl.dopts ["no_extern"],
     Decl.dneeds ["IO.Foreign"],
-    Decl.dfn "ping" [("host", Lin.unrestricted, some (Ty.con "String" []))] none
+    Decl.dfn .pub "ping" [("host", Lin.unrestricted, some (Ty.con "String" []))] none
       (Term.lit (Lit.int 1) (Ty.con "Int" []))]],
   schemes := [], insts := [], moduleCaps := [] }
 #eval checkCaps noExternWithForeignNeed   -- expect: violation naming `no_extern`
@@ -2580,7 +2683,7 @@ def noExternWithForeignBlockingNeed : Module := {
   decls := [Decl.dmod "NoFFI" [
     Decl.dopts ["no_extern"],
     Decl.dneeds ["IO.Foreign.Blocking"],
-    Decl.dfn "f" [] none (Term.lit (Lit.int 1) (Ty.con "Int" []))]],
+    Decl.dfn .pub "f" [] none (Term.lit (Lit.int 1) (Ty.con "Int" []))]],
   schemes := [], insts := [], moduleCaps := [] }
 #eval checkCaps noExternWithForeignBlockingNeed   -- expect: violation naming `no_extern`
 example : (checkCaps noExternWithForeignBlockingNeed).isViolation = true := by native_decide
@@ -2592,7 +2695,7 @@ def noExternWithNonForeignIONeed : Module := {
   decls := [Decl.dmod "NoFFIService" [
     Decl.dopts ["no_extern"],
     Decl.dneeds ["IO.Network"],
-    Decl.dfn "ping"
+    Decl.dfn .pub "ping"
       [("_cap", Lin.unrestricted, some (Ty.con "Cap" [Ty.con "IO.Network" []])),
        ("host", Lin.unrestricted, some (Ty.con "String" []))]
       none (Term.lit (Lit.int 1) (Ty.con "Int" []))]],
@@ -2618,11 +2721,11 @@ def pureInheritedIntoNestedModule : Module := {
     Decl.dneeds ["IO.Console"],
     Decl.dmod "Inner" [
       Decl.dneeds ["IO.Console"],
-      Decl.dfn "g" [("c", Lin.unrestricted, some (Ty.con "Cap" [Ty.con "IO.Console" []]))]
+      Decl.dfn .pub "g" [("c", Lin.unrestricted, some (Ty.con "Cap" [Ty.con "IO.Console" []]))]
         none
         (Term.app (Term.var "println" ⟨"f",0,0,0,0⟩ (Ty.con "Unit" []))
                   [Term.lit (Lit.str "io") (Ty.con "String" [])] (Ty.con "Unit" []))],
-    Decl.dfn "f" [] none (Term.lit (Lit.int 1) (Ty.con "Int" []))]],
+    Decl.dfn .pub "f" [] none (Term.lit (Lit.int 1) (Ty.con "Int" []))]],
   schemes := [], insts := [], moduleCaps := [] }
 #eval checkCaps pureInheritedIntoNestedModule   -- expect: violation naming `pure`
 example : (checkCaps pureInheritedIntoNestedModule).isViolation = true := by native_decide
@@ -2656,12 +2759,12 @@ def pureAfterNestedModuleNotInherited : Module := {
     Decl.dneeds ["IO.Console"],
     Decl.dmod "Inner" [
       Decl.dneeds ["IO.Console"],
-      Decl.dfn "g" [("c", Lin.unrestricted, some (Ty.con "Cap" [Ty.con "IO.Console" []]))]
+      Decl.dfn .pub "g" [("c", Lin.unrestricted, some (Ty.con "Cap" [Ty.con "IO.Console" []]))]
         none
         (Term.app (Term.var "println" ⟨"f",0,0,0,0⟩ (Ty.con "Unit" []))
                   [Term.lit (Lit.str "io") (Ty.con "String" [])] (Ty.con "Unit" []))],
     Decl.dopts ["pure"],
-    Decl.dfn "f" [] none (Term.lit (Lit.int 1) (Ty.con "Int" []))]],
+    Decl.dfn .pub "f" [] none (Term.lit (Lit.int 1) (Ty.con "Int" []))]],
   schemes := [], insts := [], moduleCaps := [] }
 #eval checkCaps pureAfterNestedModuleNotInherited   -- expect: ok
 example : (checkCaps pureAfterNestedModuleNotInherited).isViolation = false := by native_decide
@@ -2676,11 +2779,11 @@ def pureBeforeNestedModuleInherited : Module := {
     Decl.dopts ["pure"],
     Decl.dmod "Inner" [
       Decl.dneeds ["IO.Console"],
-      Decl.dfn "g" [("c", Lin.unrestricted, some (Ty.con "Cap" [Ty.con "IO.Console" []]))]
+      Decl.dfn .pub "g" [("c", Lin.unrestricted, some (Ty.con "Cap" [Ty.con "IO.Console" []]))]
         none
         (Term.app (Term.var "println" ⟨"f",0,0,0,0⟩ (Ty.con "Unit" []))
                   [Term.lit (Lit.str "io") (Ty.con "String" [])] (Ty.con "Unit" []))],
-    Decl.dfn "f" [] none (Term.lit (Lit.int 1) (Ty.con "Int" []))]],
+    Decl.dfn .pub "f" [] none (Term.lit (Lit.int 1) (Ty.con "Int" []))]],
   schemes := [], insts := [], moduleCaps := [] }
 #eval checkCaps pureBeforeNestedModuleInherited   -- expect: violation naming `pure`
 example : (checkCaps pureBeforeNestedModuleInherited).isViolation = true := by native_decide
@@ -2693,7 +2796,7 @@ own decls (env included) before running that module's own
 `check_pure_module`. -/
 def pureOwnFnOrderInsensitive : Module := {
   decls := [Decl.dmod "P" [
-    Decl.dfn "f" [] none
+    Decl.dfn .pub "f" [] none
       (Term.app (Term.var "println" ⟨"f",0,0,0,0⟩ (Ty.con "Unit" []))
                 [Term.lit (Lit.str "x") (Ty.con "String" [])] (Ty.con "Unit" [])),
     Decl.dopts ["pure"]]],
@@ -2709,7 +2812,7 @@ def noAllocNotInheritedIntoNestedModule : Module := {
   decls := [Decl.dmod "Outer" [
     Decl.dopts ["no_alloc"],
     Decl.dmod "Inner" [
-      Decl.dfn "f" [] none
+      Decl.dfn .pub "f" [] none
         (Term.tuple [Term.lit (Lit.int 1) (Ty.con "Int" []), Term.lit (Lit.int 2) (Ty.con "Int" [])]
                     (Ty.con "Unit" []))]]],
   schemes := [], insts := [], moduleCaps := [] }
@@ -2723,7 +2826,7 @@ example : (checkCaps noAllocNotInheritedIntoNestedModule).isViolation = false :=
 def noAllocTuple : Module := {
   decls := [Decl.dmod "A" [
     Decl.dopts ["no_alloc"],
-    Decl.dfn "f" [] none
+    Decl.dfn .pub "f" [] none
       (Term.tuple [Term.lit (Lit.int 1) (Ty.con "Int" []), Term.lit (Lit.int 2) (Ty.con "Int" [])]
                   (Ty.con "Unit" []))]],
   schemes := [], insts := [], moduleCaps := [] }
@@ -2739,7 +2842,7 @@ end` (march accepts, march-lean-check rejected). -/
 def noAllocEmptyTupleOk : Module := {
   decls := [Decl.dmod "A" [
     Decl.dopts ["no_alloc"],
-    Decl.dfn "f" [] none (Term.tuple [] (Ty.con "Unit" []))]],
+    Decl.dfn .pub "f" [] none (Term.tuple [] (Ty.con "Unit" []))]],
   schemes := [], insts := [], moduleCaps := [] }
 #eval checkCaps noAllocEmptyTupleOk   -- expect: ok
 example : (checkCaps noAllocEmptyTupleOk).isViolation = false := by native_decide
@@ -2748,7 +2851,7 @@ example : (checkCaps noAllocEmptyTupleOk).isViolation = false := by native_decid
 def noAllocArithmetic : Module := {
   decls := [Decl.dmod "A" [
     Decl.dopts ["no_alloc"],
-    Decl.dfn "f" [] none (Term.lit (Lit.int 1) (Ty.con "Int" []))]],
+    Decl.dfn .pub "f" [] none (Term.lit (Lit.int 1) (Ty.con "Int" []))]],
   schemes := [], insts := [], moduleCaps := [] }
 #eval checkCaps noAllocArithmetic   -- expect: ok
 example : (checkCaps noAllocArithmetic).isViolation = false := by native_decide
@@ -2757,7 +2860,7 @@ example : (checkCaps noAllocArithmetic).isViolation = false := by native_decide
 def noPanicExplicitPanic : Module := {
   decls := [Decl.dmod "NP" [
     Decl.dopts ["no_panic"],
-    Decl.dfn "f" []
+    Decl.dfn .pub "f" []
       none
       (Term.app (Term.var "panic" ⟨"f",0,0,0,0⟩ (Ty.con "Unit" []))
                 [Term.lit (Lit.str "boom") (Ty.con "String" [])] (Ty.con "Unit" []))]],
@@ -2771,7 +2874,7 @@ here). -/
 def noPanicSafe : Module := {
   decls := [Decl.dmod "NP" [
     Decl.dopts ["no_panic"],
-    Decl.dfn "f" [] none (Term.lit (Lit.int 1) (Ty.con "Int" []))]],
+    Decl.dfn .pub "f" [] none (Term.lit (Lit.int 1) (Ty.con "Int" []))]],
   schemes := [], insts := [], moduleCaps := [] }
 #eval checkCaps noPanicSafe   -- expect: ok
 example : (checkCaps noPanicSafe).isViolation = false := by native_decide
@@ -2799,7 +2902,7 @@ def noPanicDivisionNotInheritedIntoNestedModule : Module := {
   decls := [Decl.dmod "Outer" [
     Decl.dopts ["no_panic"],
     Decl.dmod "Inner" [
-      Decl.dfn "f" [] none
+      Decl.dfn .pub "f" [] none
         (divTerm (Term.lit (Lit.int 10) divIntTy) (Term.lit (Lit.int 0) divIntTy))]]],
   schemes := [], insts := [], moduleCaps := [] }
 #eval checkCaps noPanicDivisionNotInheritedIntoNestedModule   -- expect: ok
@@ -2809,7 +2912,7 @@ example : (checkCaps noPanicDivisionNotInheritedIntoNestedModule).isViolation = 
 def noPanicDivLiteralZero : Module := {
   decls := [Decl.dmod "NP" [
     Decl.dopts ["no_panic"],
-    Decl.dfn "f" [] none
+    Decl.dfn .pub "f" [] none
       (divTerm (Term.lit (Lit.int 10) divIntTy) (Term.lit (Lit.int 0) divIntTy))]],
   schemes := [], insts := [], moduleCaps := [] }
 #eval checkCaps noPanicDivLiteralZero   -- expect: violation
@@ -2819,7 +2922,7 @@ example : (checkCaps noPanicDivLiteralZero).isViolation = true := by native_deci
 def noPanicDivLetZero : Module := {
   decls := [Decl.dmod "NP" [
     Decl.dopts ["no_panic"],
-    Decl.dfn "f" [] none
+    Decl.dfn .pub "f" [] none
       (Term.let_ "d" Lin.unrestricted none (Term.lit (Lit.int 0) divIntTy)
         (divTerm (Term.lit (Lit.int 10) divIntTy) (Term.var "d" divSp divIntTy))
         divIntTy)]],
@@ -2840,7 +2943,7 @@ discards a fact about a name that no longer refers to the same value. -/
 def noPanicShadowedGuard : Module := {
   decls := [Decl.dmod "ShadowedGuard" [
     Decl.dopts ["no_panic"],
-    Decl.dfn "f" [("d", Lin.unrestricted, some divIntTy)] none
+    Decl.dfn .pub "f" [("d", Lin.unrestricted, some divIntTy)] none
       (Term.ite
         (Term.app (Term.var "==" divSp divIntTy)
           [Term.var "d" divSp divIntTy, Term.lit (Lit.int 0) divIntTy] divIntTy)
@@ -2866,7 +2969,7 @@ example : (checkCaps noPanicShadowedGuard).isViolation = true := by native_decid
 def noPanicGuardedNotEqualSafe : Module := {
   decls := [Decl.dmod "Z" [
     Decl.dopts ["no_panic"],
-    Decl.dfn "f" [] none
+    Decl.dfn .pub "f" [] none
       (Term.let_ "d" Lin.unrestricted none (Term.lit (Lit.int 0) divIntTy)
         (Term.ite
           (Term.app (Term.var "!=" divSp divIntTy)
@@ -2884,7 +2987,7 @@ to `!=` on the else-branch). -/
 def noPanicGuardedNegatedEqualSafe : Module := {
   decls := [Decl.dmod "Z" [
     Decl.dopts ["no_panic"],
-    Decl.dfn "f" [] none
+    Decl.dfn .pub "f" [] none
       (Term.let_ "d" Lin.unrestricted none (Term.lit (Lit.int 0) divIntTy)
         (Term.ite
           (Term.app (Term.var "==" divSp divIntTy)
@@ -2902,7 +3005,7 @@ implies non-zero). -/
 def noPanicGuardedGreaterThanSafe : Module := {
   decls := [Decl.dmod "Z" [
     Decl.dopts ["no_panic"],
-    Decl.dfn "f" [] none
+    Decl.dfn .pub "f" [] none
       (Term.let_ "d" Lin.unrestricted none (Term.lit (Lit.int 0) divIntTy)
         (Term.ite
           (Term.app (Term.var ">" divSp divIntTy)
@@ -2933,7 +3036,7 @@ then-branch. march ACCEPTS this file. -/
 def noPanicMatchGuardProvesNonzero : Module := {
   decls := [Decl.dmod "MG" [
     Decl.dopts ["no_panic"],
-    Decl.dfn "f" [("x", Lin.unrestricted, none)] none
+    Decl.dfn .pub "f" [("x", Lin.unrestricted, none)] none
       (Term.let_ "d" Lin.unrestricted none (Term.lit (Lit.int 0) divIntTy)
         (Term.match_ (Term.var "x" divSp (Ty.con "Option" [divIntTy]))
           [(Pattern.con "Some" [Pattern.wild],
@@ -2954,7 +3057,7 @@ license the arm body wholesale. march REJECTS this file. -/
 def noPanicMatchGuardDoesNotProve : Module := {
   decls := [Decl.dmod "MG" [
     Decl.dopts ["no_panic"],
-    Decl.dfn "f" [("x", Lin.unrestricted, none)] none
+    Decl.dfn .pub "f" [("x", Lin.unrestricted, none)] none
       (Term.let_ "d" Lin.unrestricted none (Term.lit (Lit.int 0) divIntTy)
         (Term.match_ (Term.var "x" divSp (Ty.con "Option" [divIntTy]))
           [(Pattern.con "Some" [Pattern.wild],
@@ -2977,7 +3080,7 @@ its own divisor non-zero. -/
 def noPanicMatchGuardSelfAssumption : Module := {
   decls := [Decl.dmod "MG" [
     Decl.dopts ["no_panic"],
-    Decl.dfn "f" [("x", Lin.unrestricted, none)] none
+    Decl.dfn .pub "f" [("x", Lin.unrestricted, none)] none
       (Term.let_ "d" Lin.unrestricted none (Term.lit (Lit.int 0) divIntTy)
         (Term.match_ (Term.var "x" divSp (Ty.con "Option" [divIntTy]))
           [(Pattern.con "Some" [Pattern.wild],
@@ -2996,7 +3099,7 @@ example : (checkCaps noPanicMatchGuardSelfAssumption).isViolation = true := by n
 def noPanicDivLetNonZero : Module := {
   decls := [Decl.dmod "NP" [
     Decl.dopts ["no_panic"],
-    Decl.dfn "f" [] none
+    Decl.dfn .pub "f" [] none
       (Term.let_ "d" Lin.unrestricted none (Term.lit (Lit.int 5) divIntTy)
         (divTerm (Term.lit (Lit.int 10) divIntTy) (Term.var "d" divSp divIntTy))
         divIntTy)]],
@@ -3022,7 +3125,7 @@ the binary). So it declines to judge. Asserted with `isSkip`, not merely
 def noPanicDivUnresolvedParam : Module := {
   decls := [Decl.dmod "NP" [
     Decl.dopts ["no_panic"],
-    Decl.dfn "f" [("d", Lin.unrestricted, some divIntTy)] none
+    Decl.dfn .pub "f" [("d", Lin.unrestricted, some divIntTy)] none
       (divTerm (Term.lit (Lit.int 10) divIntTy) (Term.var "d" divSp divIntTy))]],
   schemes := [], insts := [], moduleCaps := [] }
 #eval checkCaps noPanicDivUnresolvedParam   -- expect: skip
@@ -3042,7 +3145,7 @@ VIOLATION. An `app` divisor is march's arm 4. (march binary: exit 1.) -/
 def noPanicDivComplexExpr : Module := {
   decls := [Decl.dmod "NP" [
     Decl.dopts ["no_panic"],
-    Decl.dfn "f" [("a", Lin.unrestricted, some divIntTy),
+    Decl.dfn .pub "f" [("a", Lin.unrestricted, some divIntTy),
                   ("b", Lin.unrestricted, some divIntTy)] none
       (divTerm (Term.lit (Lit.int 10) divIntTy)
         (Term.app (Term.var "+" divSp divIntTy)
@@ -3056,7 +3159,7 @@ through a non-operator callee. (march binary: exit 1.) -/
 def noPanicDivCallResult : Module := {
   decls := [Decl.dmod "NP" [
     Decl.dopts ["no_panic"],
-    Decl.dfn "f" [("x", Lin.unrestricted, some divIntTy)] none
+    Decl.dfn .pub "f" [("x", Lin.unrestricted, some divIntTy)] none
       (divTerm (Term.lit (Lit.int 10) divIntTy)
         (Term.app (Term.var "g" divSp divIntTy)
           [Term.var "x" divSp divIntTy] divIntTy))]],
@@ -3068,7 +3171,7 @@ example : (checkCaps noPanicDivCallResult).isViolation = true := by native_decid
 def noPanicDivNestedArith : Module := {
   decls := [Decl.dmod "NP" [
     Decl.dopts ["no_panic"],
-    Decl.dfn "f" [("a", Lin.unrestricted, some divIntTy),
+    Decl.dfn .pub "f" [("a", Lin.unrestricted, some divIntTy),
                   ("b", Lin.unrestricted, some divIntTy)] none
       (divTerm (Term.lit (Lit.int 100) divIntTy)
         (Term.app (Term.var "*" divSp divIntTy)
@@ -3090,7 +3193,7 @@ correspondence argument in two fixtures. -/
 def noPanicDivGuardedRecordField : Module := {
   decls := [Decl.dmod "NP" [
     Decl.dopts ["no_panic"],
-    Decl.dfn "f" [("r", Lin.unrestricted, none)] none
+    Decl.dfn .pub "f" [("r", Lin.unrestricted, none)] none
       (Term.ite
         (Term.app (Term.var "!=" divSp divIntTy)
           [Term.field (Term.var "r" divSp divIntTy) "d" divSp divIntTy,
@@ -3116,7 +3219,7 @@ finding a false reject. -/
 def noPanicDivGuardedQualifiedVar : Module := {
   decls := [Decl.dmod "NP" [
     Decl.dopts ["no_panic"],
-    Decl.dfn "f" [] none
+    Decl.dfn .pub "f" [] none
       (Term.ite
         (Term.app (Term.var "!=" divSp divIntTy)
           [Term.var "Consts.k" divSp divIntTy, Term.lit (Lit.int 0) divIntTy] divIntTy)
@@ -3136,7 +3239,7 @@ what this pins is that `checkCaps` does not pre-empt that with a violation. -/
 def noPanicDivUnsupportedDivisorSkips : Module := {
   decls := [Decl.dmod "NP" [
     Decl.dopts ["no_panic"],
-    Decl.dfn "f" [] none
+    Decl.dfn .pub "f" [] none
       (divTerm (Term.lit (Lit.int 10) divIntTy) (Term.unsupported divIntTy))]],
   schemes := [], insts := [], moduleCaps := [] }
 #eval checkCaps noPanicDivUnsupportedDivisorSkips   -- expect: skip
@@ -3149,7 +3252,7 @@ complex second argument here would now false-reject. -/
 def noPanicDivOpWrongArityIsNotADivSite : Module := {
   decls := [Decl.dmod "NP" [
     Decl.dopts ["no_panic"],
-    Decl.dfn "f" [("a", Lin.unrestricted, some divIntTy),
+    Decl.dfn .pub "f" [("a", Lin.unrestricted, some divIntTy),
                   ("b", Lin.unrestricted, some divIntTy)] none
       (Term.app (Term.var "int_div" divSp divIntTy)
         [Term.lit (Lit.int 10) divIntTy,
@@ -3167,7 +3270,7 @@ discharged. No solver here, so no verdict. -/
 def noPanicDivLetNonLiteral : Module := {
   decls := [Decl.dmod "NP" [
     Decl.dopts ["no_panic"],
-    Decl.dfn "f" [("a", Lin.unrestricted, some divIntTy),
+    Decl.dfn .pub "f" [("a", Lin.unrestricted, some divIntTy),
                   ("b", Lin.unrestricted, some divIntTy)] none
       (Term.let_ "d" Lin.unrestricted none
         (Term.app (Term.var "+" divSp divIntTy)
@@ -3185,9 +3288,9 @@ definite verdict must win (`checkOneModule`'s two-pass `divVerdicts` scan). -/
 def noPanicDivProvableBeatsUnknown : Module := {
   decls := [Decl.dmod "NP" [
     Decl.dopts ["no_panic"],
-    Decl.dfn "g" [("d", Lin.unrestricted, some divIntTy)] none
+    Decl.dfn .pub "g" [("d", Lin.unrestricted, some divIntTy)] none
       (divTerm (Term.lit (Lit.int 10) divIntTy) (Term.var "d" divSp divIntTy)),
-    Decl.dfn "f" [] none
+    Decl.dfn .pub "f" [] none
       (divTerm (Term.lit (Lit.int 10) divIntTy) (Term.lit (Lit.int 0) divIntTy))]],
   schemes := [], insts := [], moduleCaps := [] }
 #eval checkCaps noPanicDivProvableBeatsUnknown   -- expect: violation
@@ -3201,11 +3304,11 @@ def noPanicDivSkipDoesNotMaskSibling : Module := {
   decls := [
     Decl.dmod "A" [
       Decl.dopts ["no_panic"],
-      Decl.dfn "f" [("d", Lin.unrestricted, some divIntTy)] none
+      Decl.dfn .pub "f" [("d", Lin.unrestricted, some divIntTy)] none
         (divTerm (Term.lit (Lit.int 10) divIntTy) (Term.var "d" divSp divIntTy))],
     Decl.dmod "B" [
       Decl.dopts ["no_panic"],
-      Decl.dfn "g" [] none
+      Decl.dfn .pub "g" [] none
         (divTerm (Term.lit (Lit.int 10) divIntTy) (Term.lit (Lit.int 0) divIntTy))]],
   schemes := [], insts := [], moduleCaps := [] }
 #eval checkCaps noPanicDivSkipDoesNotMaskSibling   -- expect: violation
@@ -3217,11 +3320,11 @@ def noPanicDivSkipSurvivesCleanSibling : Module := {
   decls := [
     Decl.dmod "A" [
       Decl.dopts ["no_panic"],
-      Decl.dfn "f" [("d", Lin.unrestricted, some divIntTy)] none
+      Decl.dfn .pub "f" [("d", Lin.unrestricted, some divIntTy)] none
         (divTerm (Term.lit (Lit.int 10) divIntTy) (Term.var "d" divSp divIntTy))],
     Decl.dmod "B" [
       Decl.dopts ["no_panic"],
-      Decl.dfn "g" [] none
+      Decl.dfn .pub "g" [] none
         (divTerm (Term.lit (Lit.int 10) divIntTy) (Term.lit (Lit.int 2) divIntTy))]],
   schemes := [], insts := [], moduleCaps := [] }
 #eval checkCaps noPanicDivSkipSurvivesCleanSibling   -- expect: skip
@@ -3232,7 +3335,7 @@ three-way boundary must not drag the literal fast-path into `unknown`. -/
 def noPanicDivLiteralNonZero : Module := {
   decls := [Decl.dmod "NP" [
     Decl.dopts ["no_panic"],
-    Decl.dfn "f" [] none
+    Decl.dfn .pub "f" [] none
       (divTerm (Term.lit (Lit.int 10) divIntTy) (Term.lit (Lit.int 2) divIntTy))]],
   schemes := [], insts := [], moduleCaps := [] }
 #eval checkCaps noPanicDivLiteralNonZero   -- expect: ok
@@ -3247,7 +3350,7 @@ three-way boundary could regress into skipping every parameter divisor. -/
 def noPanicDivGuardedParam : Module := {
   decls := [Decl.dmod "NP" [
     Decl.dopts ["no_panic"],
-    Decl.dfn "f" [("d", Lin.unrestricted, some divIntTy)] none
+    Decl.dfn .pub "f" [("d", Lin.unrestricted, some divIntTy)] none
       (Term.ite
         (Term.app (Term.var "!=" divSp divIntTy)
           [Term.var "d" divSp divIntTy, Term.lit (Lit.int 0) divIntTy] divIntTy)
@@ -3263,7 +3366,7 @@ example : (checkCaps noPanicDivGuardedParam).isSkip = false := by native_decide
 check is gated on the cap, same as every other behavioral cap above). -/
 def divUngatedWithoutCap : Module := {
   decls := [Decl.dmod "Plain" [
-    Decl.dfn "f" [] none
+    Decl.dfn .pub "f" [] none
       (divTerm (Term.lit (Lit.int 10) divIntTy) (Term.lit (Lit.int 0) divIntTy))]],
   schemes := [], insts := [], moduleCaps := [] }
 #eval checkCaps divUngatedWithoutCap   -- expect: ok (no `no_panic` opt)
@@ -3275,7 +3378,7 @@ merged or left to leak through. -/
 def noPanicShadowRetiresZero : Module := {
   decls := [Decl.dmod "NP" [
     Decl.dopts ["no_panic"],
-    Decl.dfn "f" [] none
+    Decl.dfn .pub "f" [] none
       (Term.let_ "d" Lin.unrestricted none (Term.lit (Lit.int 0) divIntTy)
         (Term.let_ "d" Lin.unrestricted none (Term.lit (Lit.int 5) divIntTy)
           (divTerm (Term.lit (Lit.int 10) divIntTy) (Term.var "d" divSp divIntTy))
@@ -3291,7 +3394,7 @@ earlier non-zero one. -/
 def noPanicShadowInstallsZero : Module := {
   decls := [Decl.dmod "NP" [
     Decl.dopts ["no_panic"],
-    Decl.dfn "f" [] none
+    Decl.dfn .pub "f" [] none
       (Term.let_ "d" Lin.unrestricted none (Term.lit (Lit.int 5) divIntTy)
         (Term.let_ "d" Lin.unrestricted none (Term.lit (Lit.int 0) divIntTy)
           (divTerm (Term.lit (Lit.int 10) divIntTy) (Term.var "d" divSp divIntTy))
@@ -3320,7 +3423,7 @@ wildcard — is non-exhaustive → violation. -/
 def npNonExhaustive : Module := {
   decls := [Decl.dmod "G" [
   Decl.dopts ["no_panic"],
-  Decl.dfn "get" [("o", Lin.unrestricted, none)] none
+  Decl.dfn .pub "get" [("o", Lin.unrestricted, none)] none
     (Term.match_ (Term.var "o" npSpan optionIntTy)
       [(Pattern.con "Some" [Pattern.var "x" Lin.unrestricted], none,
         Term.var "x" npSpan (Ty.con "Int" []))]
@@ -3336,7 +3439,7 @@ guard field is load-bearing (see the report's teeth-check). -/
 def npGuardedNonExh : Module := {
   decls := [Decl.dmod "G" [
   Decl.dopts ["no_panic"],
-  Decl.dfn "classify" [("o", Lin.unrestricted, none)] none
+  Decl.dfn .pub "classify" [("o", Lin.unrestricted, none)] none
     (Term.match_ (Term.var "o" npSpan optionIntTy)
       [(Pattern.con "Some" [Pattern.var "v" Lin.unrestricted],
         some (Term.lit (Lit.bool true) (Ty.con "Bool" [])),
@@ -3353,7 +3456,7 @@ ctor set → exhaustive → ok. -/
 def npGuardless : Module := {
   decls := [Decl.dmod "G" [
   Decl.dopts ["no_panic"],
-  Decl.dfn "classify" [("o", Lin.unrestricted, none)] none
+  Decl.dfn .pub "classify" [("o", Lin.unrestricted, none)] none
     (Term.match_ (Term.var "o" npSpan optionIntTy)
       [(Pattern.con "Some" [Pattern.var "v" Lin.unrestricted],
         some (Term.lit (Lit.bool true) (Ty.con "Bool" [])),
@@ -3371,7 +3474,7 @@ of any other arm or the scrutinee type → ok. -/
 def npWildcard : Module := {
   decls := [Decl.dmod "G" [
   Decl.dopts ["no_panic"],
-  Decl.dfn "get" [("o", Lin.unrestricted, none)] none
+  Decl.dfn .pub "get" [("o", Lin.unrestricted, none)] none
     (Term.match_ (Term.var "o" npSpan optionIntTy)
       [(Pattern.con "Some" [Pattern.var "x" Lin.unrestricted], none,
         Term.var "x" npSpan (Ty.con "Int" [])),
@@ -3386,7 +3489,7 @@ wildcard needed) → ok — ctor-set coverage alone is sufficient. -/
 def npFullyCoveredOption : Module := {
   decls := [Decl.dmod "G" [
   Decl.dopts ["no_panic"],
-  Decl.dfn "get" [("o", Lin.unrestricted, none)] none
+  Decl.dfn .pub "get" [("o", Lin.unrestricted, none)] none
     (Term.match_ (Term.var "o" npSpan optionIntTy)
       [(Pattern.con "Some" [Pattern.var "x" Lin.unrestricted], none,
         Term.var "x" npSpan (Ty.con "Int" [])),
@@ -3415,7 +3518,7 @@ def npUserAdtNonExhaustive : Module := {
   colorDType,
   Decl.dmod "G" [
     Decl.dopts ["no_panic"],
-    Decl.dfn "describe" [("c", Lin.unrestricted, none)] none
+    Decl.dfn .pub "describe" [("c", Lin.unrestricted, none)] none
       (Term.match_ (Term.var "c" npSpan colorTy)
         [(Pattern.con "Red" [], none, Term.lit (Lit.int 0) (Ty.con "Int" [])),
          (Pattern.con "Green" [], none, Term.lit (Lit.int 1) (Ty.con "Int" []))]
@@ -3431,7 +3534,7 @@ def npUserAdtFullyCovered : Module := {
   colorDType,
   Decl.dmod "G" [
     Decl.dopts ["no_panic"],
-    Decl.dfn "describe" [("c", Lin.unrestricted, none)] none
+    Decl.dfn .pub "describe" [("c", Lin.unrestricted, none)] none
       (Term.match_ (Term.var "c" npSpan colorTy)
         [(Pattern.con "Red" [], none, Term.lit (Lit.int 0) (Ty.con "Int" [])),
          (Pattern.con "Green" [], none, Term.lit (Lit.int 1) (Ty.con "Int" [])),
@@ -3450,7 +3553,7 @@ checker cannot actually judge. -/
 def npUnknownScrutineeOk : Module := {
   decls := [Decl.dmod "G" [
   Decl.dopts ["no_panic"],
-  Decl.dfn "get" [("w", Lin.unrestricted, none)] none
+  Decl.dfn .pub "get" [("w", Lin.unrestricted, none)] none
     (Term.match_ (Term.var "w" npSpan (Ty.con "Widget" []))
       [(Pattern.con "Sprocket" [], none, Term.lit (Lit.int 0) (Ty.con "Int" []))]
       (Ty.con "Int" []))]],
@@ -3464,7 +3567,7 @@ arm, not a wildcard) → ok regardless of the guarded arm's coverage. -/
 def npGuardedPlusGuardlessCatchAll : Module := {
   decls := [Decl.dmod "G" [
   Decl.dopts ["no_panic"],
-  Decl.dfn "classify" [("o", Lin.unrestricted, none)] none
+  Decl.dfn .pub "classify" [("o", Lin.unrestricted, none)] none
     (Term.match_ (Term.var "o" npSpan optionIntTy)
       [(Pattern.con "Some" [Pattern.var "v" Lin.unrestricted],
         some (Term.lit (Lit.bool true) (Ty.con "Bool" [])),
@@ -3482,7 +3585,7 @@ walk is total over every `Term` constructor, matching `bodyCalls`/
 def npNestedMatchNonExhaustive : Module := {
   decls := [Decl.dmod "G" [
   Decl.dopts ["no_panic"],
-  Decl.dfn "get" [("o", Lin.unrestricted, none)] none
+  Decl.dfn .pub "get" [("o", Lin.unrestricted, none)] none
     (Term.let_ "_" Lin.unrestricted none
       (Term.match_ (Term.var "o" npSpan optionIntTy)
         [(Pattern.con "Some" [Pattern.var "x" Lin.unrestricted], none,
@@ -3498,7 +3601,7 @@ example : (checkCaps npNestedMatchNonExhaustive).isViolation = true := by native
 at all, must NOT be flagged — mirrors `divUngatedWithoutCap`. -/
 def npNonExhaustiveUngated : Module := {
   decls := [Decl.dmod "Plain" [
-  Decl.dfn "get" [("o", Lin.unrestricted, none)] none
+  Decl.dfn .pub "get" [("o", Lin.unrestricted, none)] none
     (Term.match_ (Term.var "o" npSpan optionIntTy)
       [(Pattern.con "Some" [Pattern.var "x" Lin.unrestricted], none,
         Term.var "x" npSpan (Ty.con "Int" []))]
@@ -3516,7 +3619,7 @@ def npNonExhaustiveInheritedIntoNestedModule : Module := {
   decls := [Decl.dmod "Outer" [
   Decl.dopts ["no_panic"],
   Decl.dmod "Inner" [
-    Decl.dfn "get" [("o", Lin.unrestricted, none)] none
+    Decl.dfn .pub "get" [("o", Lin.unrestricted, none)] none
       (Term.match_ (Term.var "o" npSpan optionIntTy)
         [(Pattern.con "Some" [Pattern.var "x" Lin.unrestricted], none,
           Term.var "x" npSpan (Ty.con "Int" []))]
@@ -3541,7 +3644,7 @@ def npOrPatternCoversAlternatives : Module := {
   colorDType,
   Decl.dmod "G" [
     Decl.dopts ["no_panic"],
-    Decl.dfn "describe" [("c", Lin.unrestricted, none)] none
+    Decl.dfn .pub "describe" [("c", Lin.unrestricted, none)] none
       (Term.match_ (Term.var "c" npSpan colorTy)
         [(Pattern.or_ [Pattern.con "Red" [], Pattern.con "Green" []], none,
           Term.lit (Lit.int 0) (Ty.con "Int" [])),
@@ -3560,7 +3663,7 @@ def npOrPatternStillNonExhaustive : Module := {
   colorDType,
   Decl.dmod "G" [
     Decl.dopts ["no_panic"],
-    Decl.dfn "describe" [("c", Lin.unrestricted, none)] none
+    Decl.dfn .pub "describe" [("c", Lin.unrestricted, none)] none
       (Term.match_ (Term.var "c" npSpan colorTy)
         [(Pattern.or_ [Pattern.con "Red" [], Pattern.con "Green" []], none,
           Term.lit (Lit.int 0) (Ty.con "Int" []))]
@@ -3581,7 +3684,7 @@ def npAsPatternPeels : Module := {
   colorDType,
   Decl.dmod "G" [
     Decl.dopts ["no_panic"],
-    Decl.dfn "describe" [("c", Lin.unrestricted, none)] none
+    Decl.dfn .pub "describe" [("c", Lin.unrestricted, none)] none
       (Term.match_ (Term.var "c" npSpan colorTy)
         [(Pattern.as "r" (Pattern.con "Red" []), none, Term.lit (Lit.int 0) (Ty.con "Int" [])),
          (Pattern.con "Green" [], none, Term.lit (Lit.int 1) (Ty.con "Int" [])),
@@ -3597,7 +3700,7 @@ exhaustive → ok, exactly as a plain `x -> ..` arm would be. -/
 def npAsPatternCatchAll : Module := {
   decls := [Decl.dmod "G" [
   Decl.dopts ["no_panic"],
-  Decl.dfn "get" [("o", Lin.unrestricted, none)] none
+  Decl.dfn .pub "get" [("o", Lin.unrestricted, none)] none
     (Term.match_ (Term.var "o" npSpan optionIntTy)
       [(Pattern.as "y" (Pattern.var "x" Lin.unrestricted), none,
         Term.lit (Lit.int 0) (Ty.con "Int" []))]
@@ -3624,7 +3727,7 @@ def npUserResultShadowsBuiltin : Module := {
   userResultDType,
   Decl.dmod "G" [
     Decl.dopts ["no_panic"],
-    Decl.dfn "describe" [("r", Lin.unrestricted, none)] none
+    Decl.dfn .pub "describe" [("r", Lin.unrestricted, none)] none
       (Term.match_ (Term.var "r" npSpan userResultTy)
         [(Pattern.con "Success" [Pattern.var "n" Lin.unrestricted], none,
           Term.var "n" npSpan (Ty.con "Int" [])),
@@ -3656,7 +3759,7 @@ def npOrPatternWildAltCatchAll : Module := {
   colorDType,
   Decl.dmod "G" [
     Decl.dopts ["no_panic"],
-    Decl.dfn "describe" [("c", Lin.unrestricted, none)] none
+    Decl.dfn .pub "describe" [("c", Lin.unrestricted, none)] none
       (Term.match_ (Term.var "c" npSpan colorTy)
         [(Pattern.or_ [Pattern.con "Red" [], Pattern.wild], none,
           Term.lit (Lit.int 0) (Ty.con "Int" []))]
@@ -3673,7 +3776,7 @@ def npOrPatternWildAltCatchAllLeading : Module := {
   colorDType,
   Decl.dmod "G" [
     Decl.dopts ["no_panic"],
-    Decl.dfn "describe" [("c", Lin.unrestricted, none)] none
+    Decl.dfn .pub "describe" [("c", Lin.unrestricted, none)] none
       (Term.match_ (Term.var "c" npSpan colorTy)
         [(Pattern.or_ [Pattern.wild, Pattern.con "Red" []], none,
           Term.lit (Lit.int 0) (Ty.con "Int" []))]
@@ -3691,7 +3794,7 @@ def npOrPatternWildAltAfterConstructorArm : Module := {
   colorDType,
   Decl.dmod "G" [
     Decl.dopts ["no_panic"],
-    Decl.dfn "describe" [("c", Lin.unrestricted, none)] none
+    Decl.dfn .pub "describe" [("c", Lin.unrestricted, none)] none
       (Term.match_ (Term.var "c" npSpan colorTy)
         [(Pattern.con "Red" [], none, Term.lit (Lit.int 1) (Ty.con "Int" [])),
          (Pattern.or_ [Pattern.con "Green" [], Pattern.wild], none,
@@ -3723,7 +3826,7 @@ def npOrPatternGuardedDoesNotCover : Module := {
   colorDType,
   Decl.dmod "G" [
     Decl.dopts ["no_panic"],
-    Decl.dfn "describe" [("c", Lin.unrestricted, none), ("b", Lin.unrestricted, none)] none
+    Decl.dfn .pub "describe" [("c", Lin.unrestricted, none), ("b", Lin.unrestricted, none)] none
       (Term.match_ (Term.var "c" npSpan colorTy)
         [(Pattern.or_ [Pattern.con "Red" [], Pattern.con "Green" []],
           some (Term.var "b" npSpan (Ty.con "Bool" [])),
@@ -3743,7 +3846,7 @@ reject" discipline already applied to unknown scrutinee TYPES. -/
 def npUnmodelledPatternSafetyNet : Module := {
   decls := [Decl.dmod "G" [
   Decl.dopts ["no_panic"],
-  Decl.dfn "get" [("o", Lin.unrestricted, none)] none
+  Decl.dfn .pub "get" [("o", Lin.unrestricted, none)] none
     (Term.match_ (Term.var "o" npSpan optionIntTy)
       [(Pattern.tuple [Pattern.wild, Pattern.wild], none, Term.lit (Lit.int 0) (Ty.con "Int" []))]
       (Ty.con "Int" []))]],
@@ -3782,7 +3885,7 @@ def npAmbiguousTypeNameAcrossSiblingModules : Module := {
   Decl.dmod "G" [
     Decl.dopts ["no_panic"],
     colorDTypeAmbiguous,
-    Decl.dfn "describe" [("c", Lin.unrestricted, none)] none
+    Decl.dfn .pub "describe" [("c", Lin.unrestricted, none)] none
       (Term.match_ (Term.var "c" npSpan colorTy)
         [(Pattern.con "Cyan" [], none, Term.lit (Lit.int 0) (Ty.con "Int" [])),
          (Pattern.con "Magenta" [], none, Term.lit (Lit.int 1) (Ty.con "Int" []))]
@@ -3800,7 +3903,7 @@ def npAmbiguousTypeNameAcrossSiblingModulesSwapped : Module := {
   Decl.dmod "G" [
     Decl.dopts ["no_panic"],
     colorDTypeAmbiguous,
-    Decl.dfn "describe" [("c", Lin.unrestricted, none)] none
+    Decl.dfn .pub "describe" [("c", Lin.unrestricted, none)] none
       (Term.match_ (Term.var "c" npSpan colorTy)
         [(Pattern.con "Cyan" [], none, Term.lit (Lit.int 0) (Ty.con "Int" [])),
          (Pattern.con "Magenta" [], none, Term.lit (Lit.int 1) (Ty.con "Int" []))]
@@ -3820,7 +3923,7 @@ def npAmbiguousTypeNameEnclosingLevel : Module := {
   Decl.dmod "G" [
     Decl.dopts ["no_panic"],
     colorDTypeAmbiguous,
-    Decl.dfn "describe" [("c", Lin.unrestricted, none)] none
+    Decl.dfn .pub "describe" [("c", Lin.unrestricted, none)] none
       (Term.match_ (Term.var "c" npSpan colorTy)
         [(Pattern.con "Cyan" [], none, Term.lit (Lit.int 0) (Ty.con "Int" [])),
          (Pattern.con "Magenta" [], none, Term.lit (Lit.int 1) (Ty.con "Int" []))]
@@ -3873,7 +3976,7 @@ def npOrPatternOverCapCatchAll : Module := {
   colorDType,
   Decl.dmod "G" [
     Decl.dopts ["no_panic"],
-    Decl.dfn "describe" [("c", Lin.unrestricted, none)] none
+    Decl.dfn .pub "describe" [("c", Lin.unrestricted, none)] none
       (Term.match_ (Term.var "c" npSpan colorTy)
         [(Pattern.or_ (manyRedAlts 300), none, Term.lit (Lit.int 0) (Ty.con "Int" []))]
         (Ty.con "Int" []))]],
@@ -3893,7 +3996,7 @@ def npOrPatternUnderCapStillNonExhaustive : Module := {
   colorDType,
   Decl.dmod "G" [
     Decl.dopts ["no_panic"],
-    Decl.dfn "describe" [("c", Lin.unrestricted, none)] none
+    Decl.dfn .pub "describe" [("c", Lin.unrestricted, none)] none
       (Term.match_ (Term.var "c" npSpan colorTy)
         [(Pattern.or_ (manyRedAlts 200), none, Term.lit (Lit.int 0) (Ty.con "Int" []))]
         (Ty.con "Int" []))]],
@@ -3936,7 +4039,7 @@ def opqInert : Term := Term.lit (Lit.int 1) opqIntTy
 
 /-- `mod P do cap pure ... fn f() do <body> end end`. -/
 def opqPureMod (body : Term) : Module := {
-  decls := [Decl.dmod "P" [Decl.dopts ["pure"], Decl.dfn "f" [] none body]],
+  decls := [Decl.dmod "P" [Decl.dopts ["pure"], Decl.dfn .pub "f" [] none body]],
   schemes := [], insts := [], moduleCaps := [] }
 
 /-- The invariant the whole design rests on: an `opaque_` node is out of
@@ -4068,7 +4171,7 @@ facts/path this arm recurses with cannot cost us the answer. -/
 def opqNoPanicDivZeroInChild : Module := {
   decls := [Decl.dmod "NP" [
     Decl.dopts ["no_panic"],
-    Decl.dfn "f" [] none
+    Decl.dfn .pub "f" [] none
       (Term.opaque_ [divTerm (Term.lit (Lit.int 10) divIntTy)
                              (Term.lit (Lit.int 0) divIntTy)] divIntTy)]],
   schemes := [], insts := [], moduleCaps := [] }
@@ -4079,7 +4182,7 @@ example : (checkCaps opqNoPanicDivZeroInChild).isViolation = true := by native_d
 def opqNoPanicDivNonZeroInChild : Module := {
   decls := [Decl.dmod "NP" [
     Decl.dopts ["no_panic"],
-    Decl.dfn "f" [] none
+    Decl.dfn .pub "f" [] none
       (Term.opaque_ [divTerm (Term.lit (Lit.int 10) divIntTy)
                              (Term.lit (Lit.int 2) divIntTy)] divIntTy)]],
   schemes := [], insts := [], moduleCaps := [] }
@@ -4095,7 +4198,7 @@ undischarged variable — `DivVerdict.unknown`, i.e. a SKIP, never a reject. -/
 def opqNoPanicStaleFactNotCarried : Module := {
   decls := [Decl.dmod "NP" [
     Decl.dopts ["no_panic"],
-    Decl.dfn "f" [] none
+    Decl.dfn .pub "f" [] none
       (Term.let_ "d" Lin.unrestricted none (Term.lit (Lit.int 0) divIntTy)
         (Term.opaque_ [divTerm (Term.lit (Lit.int 10) divIntTy)
                                (Term.var "d" divSp divIntTy)] divIntTy)
@@ -4110,7 +4213,7 @@ found (march's `no_alloc.ml` recurses into all nine kinds)... -/
 def opqNoAllocTupleInChild : Module := {
   decls := [Decl.dmod "NA" [
     Decl.dopts ["no_alloc"],
-    Decl.dfn "f" [] none
+    Decl.dfn .pub "f" [] none
       (Term.opaque_ [Term.tuple [opqInert, opqInert] (Ty.tuple [opqIntTy, opqIntTy])]
         opqIntTy)]],
   schemes := [], insts := [], moduleCaps := [] }
@@ -4124,7 +4227,7 @@ example : (checkCaps opqNoAllocTupleInChild).isViolation = true := by native_dec
 def opqNoAllocNodeItselfIsNotAnAllocation : Module := {
   decls := [Decl.dmod "NA" [
     Decl.dopts ["no_alloc"],
-    Decl.dfn "f" [] none
+    Decl.dfn .pub "f" [] none
       (Term.opaque_ [Term.var "r" opqSp opqIntTy, opqInert] opqIntTy)]],
   schemes := [], insts := [], moduleCaps := [] }
 #eval checkCaps opqNoAllocNodeItselfIsNotAnAllocation   -- expect: ok
@@ -4138,7 +4241,7 @@ def opqNoPanicNonExhaustiveMatchInChild : Module := {
   colorDType,
   Decl.dmod "G" [
     Decl.dopts ["no_panic"],
-    Decl.dfn "describe" [("c", Lin.unrestricted, none)] none
+    Decl.dfn .pub "describe" [("c", Lin.unrestricted, none)] none
       (Term.opaque_
         [Term.match_ (Term.var "c" npSpan colorTy)
           [(Pattern.con "Red" [], none, Term.lit (Lit.int 0) opqIntTy)]
@@ -4217,7 +4320,7 @@ example : (checkCaps letTrailingBannedCall).isViolation = true := by native_deci
 def letTrailingAllocates : Module := {
   decls := [Decl.dmod "NA" [
     Decl.dopts ["no_alloc"],
-    Decl.dfn "f" [] none
+    Decl.dfn .pub "f" [] none
       (trailingLet (Term.tuple [opqInert, opqInert] opqIntTy) opqIntTy)]],
   schemes := [], insts := [], moduleCaps := [] }
 #eval checkCaps letTrailingAllocates   -- expect: violation naming no_alloc
@@ -4227,7 +4330,7 @@ example : (checkCaps letTrailingAllocates).isViolation = true := by native_decid
 def letTrailingDivZero : Module := {
   decls := [Decl.dmod "NP" [
     Decl.dopts ["no_panic"],
-    Decl.dfn "f" [] none
+    Decl.dfn .pub "f" [] none
       (trailingLet
         (Term.app (Term.var "/" opqSp opqIntTy)
           [Term.lit (Lit.int 10) opqIntTy, Term.lit (Lit.int 0) opqIntTy] opqIntTy)
@@ -4240,7 +4343,7 @@ example : (checkCaps letTrailingDivZero).isViolation = true := by native_decide
 def letTrailingDivNonZero : Module := {
   decls := [Decl.dmod "NP" [
     Decl.dopts ["no_panic"],
-    Decl.dfn "f" [] none
+    Decl.dfn .pub "f" [] none
       (trailingLet
         (Term.app (Term.var "/" opqSp opqIntTy)
           [Term.lit (Lit.int 10) opqIntTy, Term.lit (Lit.int 2) opqIntTy] opqIntTy)
@@ -4256,7 +4359,7 @@ def letTrailingNonExhaustiveMatch : Module := {
   colorDType,
   Decl.dmod "G" [
     Decl.dopts ["no_panic"],
-    Decl.dfn "describe" [("c", Lin.unrestricted, none)] none
+    Decl.dfn .pub "describe" [("c", Lin.unrestricted, none)] none
       (trailingLet
         (Term.match_ (Term.var "c" npSpan colorTy)
           [(Pattern.con "Red" [], none, Term.lit (Lit.int 0) opqIntTy)]
@@ -4305,7 +4408,7 @@ example : (checkCaps letDestructuringBinderClean).isViolation = false := by nati
 def npMatchMod (ty : Ty) (arms : List (Pattern × Option Term × Term)) : Module := {
   decls := [Decl.dmod "NE" [
     Decl.dopts ["no_panic"],
-    Decl.dfn "f" [("x", Lin.unrestricted, none)] none
+    Decl.dfn .pub "f" [("x", Lin.unrestricted, none)] none
       (Term.match_ (Term.var "x" opqSp ty) arms opqIntTy)]],
   schemes := [], insts := [], moduleCaps := [] }
 
@@ -4436,5 +4539,139 @@ def noAllocTopLevelLetTuple : Module :=
   divLetMod "no_alloc" (Term.tuple [opqInert, opqInert] dlIntTy)
 #eval checkCaps noAllocTopLevelLetTuple   -- expect: ok
 example : (checkCaps noAllocTopLevelLetTuple).isViolation = false := by native_decide
+
+
+/-! ## Check 6 — proof-cap production enforcement (decl-coverage audit)
+
+`typecheck.ml:8091-8140`. A proof capability may be minted only by a PUBLIC
+function of its own declaring module. march reads this off the SIGNATURE
+alone: a cap path in `fn_ret_ty` that is a registered proof cap and does NOT
+appear among the clause parameter types is an ERROR when the cap's declaring
+module differs from this module, OR the fn is `pfn`.
+
+Nothing in this file modelled that check at all, and it is reachable with a
+FULLY IN-FRAGMENT file, so it was a live FALSE ACCEPT — march exit 1, this
+checker exit 0. Three shapes were verified against the `march` binary:
+
+    mod Db4 do proof cap M  type Box(a) = Empty | Full(a)
+      pfn make() : Box(Cap(Db4.M)) do Empty end
+      fn main() do println("hi") end end
+      -- "private function `make` in `Db4` cannot mint `Cap(Db4.M)`."
+
+the same with `proof cap M` written AFTER `make` (still rejects — the entry
+module's check runs against `final_env`, so it is order-insensitive), and
+
+    mod Db do proof cap M  type Box(a) = Empty | Full(a)
+      mod Inner do needs Db.M
+        fn forge() : Box(Cap(Db.M)) do Empty end end
+      fn main() do println("hi") end end
+      -- "function `forge` returns `Cap(Db.M)` but `Cap(Db.M)` is a proof
+      --  capability declared in `Db`."
+
+— note the nested one is a PUBLIC `fn`: the `declaring_mod <> mod_name`
+branch ignores visibility entirely.
+
+The near-misses below pin the boundary in the false-reject direction, all
+verified as march exit 0: the public minting surface, a `pfn` PASS-THROUGH
+(the cap is in the params, so nothing is minted), and a nested module
+relaying a cap it received. -/
+
+private def c6Sp : Span := ⟨"c6", 0, 0, 0, 0⟩
+private def c6Unit : Term := Term.lit Lit.unit (Ty.con "Unit" [])
+/-- `Box(Cap(Db.M))` — the cap in a NON-argument-position of a user ADT, the
+shape that made this reachable in fragment at all (a bare `Cap(Db.M)` return
+needs a `mint_cap` body, which is out of fragment and honestly skips). -/
+private def c6BoxCap : Ty := Ty.con "Box" [Ty.con "Cap" [Ty.con "Db.M" []]]
+private def c6Cap : Ty := Ty.con "Cap" [Ty.con "Db.M" []]
+
+/-- A PRIVATE fn of the declaring module returning its own proof cap, with no
+matching param — march REJECTS ("private function … cannot mint"). -/
+def c6PrivMint : Module :=
+  { decls := [Decl.dproofcap "M", Decl.dfn .priv "make" [] (some c6BoxCap) c6Unit],
+    schemes := [], insts := [], moduleCaps := [], entryName := "Db" }
+#eval checkCaps c6PrivMint   -- expect: violation naming Check 6
+example : (checkCaps c6PrivMint).isViolation = true := by native_decide
+
+/-- Near-miss: the identical shape as a PUBLIC `fn`. Public functions of the
+declaring module ARE the minting surface — march ACCEPTS. -/
+def c6PubMint : Module :=
+  { decls := [Decl.dproofcap "M", Decl.dfn .pub "make" [] (some c6BoxCap) c6Unit],
+    schemes := [], insts := [], moduleCaps := [], entryName := "Db" }
+#eval checkCaps c6PubMint   -- expect: ok
+example : (checkCaps c6PubMint).isViolation = false := by native_decide
+
+/-- Near-miss: a PRIVATE fn that PASSES THROUGH a cap it received. The cap is
+in `param_tys`, so march's `List.mem cap_path param_caps` guard fires and
+march ACCEPTS. This is the cell a signature scan that ignored params would
+false-reject. -/
+def c6PrivPassthru : Module :=
+  { decls := [Decl.dproofcap "M",
+              Decl.dfn .priv "passthru" [("c", Lin.unrestricted, some c6Cap)]
+                (some c6BoxCap) c6Unit],
+    schemes := [], insts := [], moduleCaps := [], entryName := "Db" }
+#eval checkCaps c6PrivPassthru   -- expect: ok
+example : (checkCaps c6PrivPassthru).isViolation = false := by native_decide
+
+/-- The `declaring_mod <> mod_name` branch: a nested module's PUBLIC fn
+returning the ENCLOSING module's proof cap. Visibility is irrelevant here —
+march REJECTS. The `proof cap` sits BEFORE the nested `mod`, which is what
+makes it visible: `checkDecls`'s fold is positional, mirroring march's. -/
+def c6ForeignMint : Module :=
+  { decls := [Decl.dproofcap "M",
+              Decl.dmod "Inner" [Decl.dneeds ["Db.M"],
+                Decl.dfn .pub "forge" [] (some c6BoxCap) c6Unit]],
+    schemes := [], insts := [], moduleCaps := [], entryName := "Db" }
+#eval checkCaps c6ForeignMint   -- expect: violation naming Check 6
+example : (checkCaps c6ForeignMint).isViolation = true := by native_decide
+
+/-- Near-miss: the same nested fn RELAYING a cap it received as a param.
+march ACCEPTS. -/
+def c6ForeignRelay : Module :=
+  { decls := [Decl.dproofcap "M",
+              Decl.dmod "Inner" [Decl.dneeds ["Db.M"],
+                Decl.dfn .pub "relay" [("c", Lin.unrestricted, some c6Cap)]
+                  (some c6BoxCap) c6Unit]],
+    schemes := [], insts := [], moduleCaps := [], entryName := "Db" }
+#eval checkCaps c6ForeignRelay   -- expect: ok
+example : (checkCaps c6ForeignRelay).isViolation = false := by native_decide
+
+/-- Positional fold, negative direction: the same nested minting fn, but with
+the `proof cap` declared AFTER the nested `mod`. march's `check_decl` fold has
+not registered the cap when it typechecks `Inner`, so `env.proof_caps` does
+not carry it and Check 6 cannot fire — this checker must not fire either. -/
+def c6ForeignMintLate : Module :=
+  { decls := [Decl.dmod "Inner" [Decl.dneeds ["Db.M"],
+                Decl.dfn .pub "forge" [] (some c6BoxCap) c6Unit],
+              Decl.dproofcap "M"],
+    schemes := [], insts := [], moduleCaps := [], entryName := "Db" }
+#eval checkCaps c6ForeignMintLate   -- expect: ok
+example : (checkCaps c6ForeignMintLate).isViolation = false := by native_decide
+
+/-- Finding I1's asymmetry, for Check 6: a NESTED module declaring its OWN
+proof cap and minting it from a `pfn`. march's `check_module_needs` for a
+nested module runs on the env captured BEFORE that module's decls were
+folded, so the cap is not in `env.proof_caps` at all and march reports
+**Check 1** ("`Inner.M` is not declared in `needs`"), never Check 6 —
+verified against the binary. This checker must reach the same verdict for the
+same reason: `selfDeclaredCaps` is `[]` for a nested `dmod`. -/
+def c6NestedSelfDeclare : Module :=
+  { decls := [Decl.dmod "Inner" [Decl.dproofcap "M",
+                Decl.dfn .priv "forge" []
+                  (some (Ty.con "Box" [Ty.con "Cap" [Ty.con "Inner.M" []]])) c6Unit]],
+    schemes := [], insts := [], moduleCaps := [], entryName := "Top" }
+#eval checkCaps c6NestedSelfDeclare   -- expect: violation naming Check 1
+example : (checkCaps c6NestedSelfDeclare).isViolation = true := by native_decide
+
+/-- The out-of-fragment gate: the SAME violating shape as `c6PrivMint` plus an
+out-of-fragment sibling declaration. Check 6's verdict depends on the
+PARAMETER cap list being complete, and a param whose surface type failed to
+decode contributes nothing to it — so the check declines to fire rather than
+risk a false reject. The file skips (exit 2) downstream regardless. -/
+def c6GatedByUnsupported : Module :=
+  { decls := [Decl.dproofcap "M", Decl.unsupported,
+              Decl.dfn .priv "make" [] (some c6BoxCap) c6Unit],
+    schemes := [], insts := [], moduleCaps := [], entryName := "Db" }
+#eval checkCaps c6GatedByUnsupported   -- expect: ok (deferred to the skip gate)
+example : (checkCaps c6GatedByUnsupported).isViolation = false := by native_decide
 
 end MarchLean.CapCheck

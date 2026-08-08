@@ -216,6 +216,28 @@ partial def Term.hasUnsupported : Term → Bool
          arms.any (fun (p, g, e) => p.hasUnsupported || (g.map Term.hasUnsupported).getD false || e.hasUnsupported)
      | _ => false)
 
+/-- A declaration's visibility — march's `Ast.visibility`, the `fn` vs `pfn`
+distinction. Emitted on every `DFn` as `fn.vis`
+(`{"kind":"Public"}` / `{"kind":"Private"}` — `lib/dump/ast_json.ml`'s
+`visibility_to_json`, threaded from `fn_def_to_json`).
+
+Carried because march's **Check 6** (proof-cap production enforcement,
+`typecheck.ml:8091-8140`) branches on it: a PRIVATE function of a proof cap's
+own declaring module may not mint that cap, while a PUBLIC one may — public
+functions of the declaring module ARE the minting surface. Without this field
+the two are indistinguishable and Check 6's same-module branch cannot be
+modelled at all (it was a confirmed false accept; see
+`CapCheck.checkOneModule`'s Check 6 block).
+
+Named `pub`/`priv` rather than `public`/`private` because both of those are
+Lean keywords. The decoder defaults to `pub` on ANY unrecognised or missing
+`vis` payload — `pub` is the verdict-free value (Check 6's same-module branch
+fires only on `priv`), so a decode failure degrades to no-reject, never to a
+false reject. -/
+inductive Vis where
+  | pub | priv
+  deriving DecidableEq, Repr, Inhabited
+
 /-- Datatype constructor signature (from a `DType` decl). -/
 structure CtorSig where
   name : String
@@ -247,8 +269,12 @@ inductive Decl where
   `Infer.inferModule'`'s `dfn` arm unifies the inferred BODY type against it,
   exactly as it already does for each param annotation — march checks a
   clause's body against its declared return type, and leaving this
-  unconstrained was a live false-accept class (see that arm's comment). -/
-  | dfn (name : String) (params : List (String × Lin × Option Ty)) (retAnnot : Option Ty) (body : Term)
+  unconstrained was a live false-accept class (see that arm's comment).
+
+  `vis` is the `fn`/`pfn` marker (see `Vis`), read ONLY by Check 6. It is the
+  FIRST field purely so the many hand-built fixtures below and in `CapCheck`
+  read `Decl.dfn .pub "name" …`; nothing about the position is semantic. -/
+  | dfn (vis : Vis) (name : String) (params : List (String × Lin × Option Ty)) (retAnnot : Option Ty) (body : Term)
   | dlet (name : String) (rhs : Term)
   | dtype (name : String) (params : List String) (ctors : List CtorSig)
   /-- A nested module, `mod Name do … end`. Carried as a TREE because `needs`
@@ -303,7 +329,7 @@ through `List Decl` inside `dmod` isn't structurally recognized by the
 kernel, matching how `Term.hasUnsupported` handles its own nesting. -/
 partial def Decl.hasUnsupported : Decl → Bool
   | .unsupported => true
-  | .dfn _ params retAnnot body =>
+  | .dfn _ _ params retAnnot body =>
       params.any (fun (_, _, a) => optTyHasUnsupported a)
         || optTyHasUnsupported retAnnot || body.hasUnsupported
   | .dlet _ body => body.hasUnsupported
