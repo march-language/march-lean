@@ -161,7 +161,6 @@ reject/t53_nested_distinct_tvar_launder.march                      # out-of-frag
 reject/t54_entry_self_qualified_launder.march                      # out-of-fragment construct in a declaration
 reject/t55_cap_narrow_forges_proof_cap.march                       # out of modeled fragment: SKIP: unbound variable `App.consume`
 reject/t56_mint_cap_external_module.march                          # out of modeled fragment: SKIP: unbound variable `mint_cap`
-reject/t57_mint_cap_pfn_declaring.march                            # out of modeled fragment: SKIP: unbound variable `mint_cap`
 reject/t62_linear_closure_capture.march                            # linear/affine binder 'r' captured in a closure; escape analysis not modeled
 reject/t63_linear_field_double_let.march                           # out-of-fragment construct in a declaration
 reject/t65_always_linear_drop.march                                # out-of-fragment construct in a declaration
