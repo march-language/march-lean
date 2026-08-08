@@ -643,6 +643,31 @@ partial def decodeDecl (j : Json) : Except String Decl := do
       let retUnsupported := match retTy with
         | some t => t.hasUnsupported
         | none => false
+      -- `fn.bounds` — the BRACKET-syntax explicit type-variable bound list
+      -- (`fn f[a : SomeADT](…)`, `parser.mly:386/414`, `Ast.fn_bounds`
+      -- `ast.ml:231`), emitted as `[{name, ty}]` (`ast_json.ml:830`). This
+      -- decoder models NO part of it, and march does NOT merely record it:
+      -- `typecheck.ml:6926-6959` VALIDATES every bound and raises a hard error
+      -- when it is neither a known ADT, a known interface, nor `Nat` —
+      -- "Bound `X` is not a known ADT or interface name." /
+      -- "Bound `X` on type variable `a` must be an ADT name, interface name,
+      -- or `Nat`." Both were verified directly as live march rejects
+      -- (`fn f[a : NoSuchThing](x : Int) : Int do x end` and
+      -- `fn f[a : Int -> Int](…)`), and both were FALSE ACCEPTS here while
+      -- this field went unread. A bound also pre-registers its type variable
+      -- so param annotations can reference it, which the A1 fragment (whose
+      -- `decodeSurfaceTy` maps every `TyVar` to `Ty.unsupported`) cannot
+      -- represent at all. So a bounded `fn` is out of fragment, exactly like a
+      -- guarded clause below: `Decl.unsupported` ⇒ honest whole-file skip.
+      -- Costs nothing in coverage — zero of the 490 emittable corpus files
+      -- under `specs/`, `examples/`, `stdlib/` carry a non-empty `bounds`.
+      let hasBounds : Bool :=
+        match fn.getObjVal? "bounds" with
+        | .error _ => false
+        | .ok v => match v.getArr? with
+          | .error _ => false
+          | .ok arr => !arr.isEmpty
+      if hasBounds then .ok Decl.unsupported else do
       let clausesJ ← (← field fn "clauses").getArr?.mapError (fun _ => "clauses")
       match clausesJ.toList with
       | [clause] => do
@@ -1126,5 +1151,28 @@ private def collisionEnvelope (nestedName : String) : String :=
       | .error e => IO.println s!"decode failed: {e}"
       | .ok t => IO.println s!"decoded={repr t}, hasUnsupported={t.hasUnsupported}"
   -- expect: Term.opaque_ [Term.var "println" ..] (Ty.con "Unit" []); hasUnsupported=true
+
+-- `fn.bounds` regression. A non-empty bracket-syntax bound list
+-- (`fn f[a : NoSuchThing]() do 0 end`) must force `Decl.unsupported`: march
+-- VALIDATES each bound (`typecheck.ml:6926-6959`) and rejects one that names
+-- neither a known ADT, a known interface, nor `Nat`, so leaving this field
+-- unread was a live FALSE ACCEPT (march exit 1, this checker exit 0 —
+-- verified directly for both `[a : NoSuchThing]` and `[a : Int -> Int]`).
+-- The two envelopes below differ ONLY in `bounds`.
+private def dfnBoundsEmpty : String :=
+  r#"{"kind":"DFn","fn":{"name":{"txt":"f","span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}},"ret_ty":null,"bounds":[],"clauses":[{"guard":null,"params":[],"body":{"kind":"ELit","literal":{"kind":"LitInt","value":0},"resolved_ty":{"kind":"TCon","name":"Int","args":[]}}}]}}"#
+private def dfnBoundsNonEmpty : String :=
+  r#"{"kind":"DFn","fn":{"name":{"txt":"f","span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}},"ret_ty":null,"bounds":[{"name":{"txt":"a","span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}},"ty":{"kind":"TyCon","name":{"txt":"NoSuchThing","span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}},"args":[]}}],"clauses":[{"guard":null,"params":[],"body":{"kind":"ELit","literal":{"kind":"LitInt","value":0},"resolved_ty":{"kind":"TCon","name":"Int","args":[]}}}]}}"#
+
+#eval show IO Unit from do
+  for (label, src) in [("empty-bounds", dfnBoundsEmpty), ("nonempty-bounds", dfnBoundsNonEmpty)] do
+    match Json.parse src with
+    | .error e => IO.println s!"{label}: parse failed: {e}"
+    | .ok j =>
+        match decodeDecl j with
+        | .error e => IO.println s!"{label}: decode failed: {e}"
+        | .ok d => IO.println s!"{label}: unsupported={d.hasUnsupported}"
+  -- expected: empty-bounds: unsupported=false
+  -- expected: nonempty-bounds: unsupported=true
 
 end MarchLean.Elab.Test
