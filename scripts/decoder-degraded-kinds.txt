@@ -1,0 +1,128 @@
+# Decoder degraded-kind allowlist.
+#
+# Every march `"kind"` tag that `MarchLean/Elab.lean` does NOT decode into a
+# real modelled constructor, and the exact way it degrades. Read (and
+# enforced, both directions) by scripts/decoder-coverage.sh.
+#
+# WHY THIS FILE EXISTS. Two of the worst defects in this project were the
+# same mechanical oversight: march emits a node kind, the decoder has no arm
+# for it, and the node silently degrades.
+#
+#   ELet    no arm -> a `do` block whose sole statement is a `let` DISCARDED
+#           the binding's right-hand side, blinding all four CapCheck
+#           capability walks at once.
+#   EAnnot  no arm -> `Desugar` synthesizes one for every `app` block
+#           (desugar.ml:929), so a `cap` violation in an app body was
+#           invisible.
+#
+# Both were rationalised from march's grammar ("no parser production reaches
+# this kind"). That reasoning is unsound: `Desugar` runs between the parser
+# and the emitter and manufactures nodes with no surface syntax. Degrading is
+# often the right answer — but it must be a DECLARED answer, so that a NEW
+# kind arriving in the same bucket trips the check instead of joining a crowd.
+#
+# FORMAT
+#
+#   KIND   CATEGORY   # why degrading is the right answer here
+#
+# CATEGORY is what `march-lean-check --kind-coverage` reports for the kind,
+# derived by probing the live match arms in MarchLean/Elab.lean (see
+# MarchLean/KindCoverage.lean — it is NOT a second hand-maintained list, which
+# is the whole point: deleting an arm changes the probe's answer immediately):
+#
+#   opaque       an arm exists and yields `Term.opaque_`. Shape unmodelled,
+#                but the child EXPRESSIONS survive, so CapCheck's four
+#                capability walks still see anything hiding inside.
+#   unsupported  an arm exists and yields an `.unsupported` sentinel.
+#                Children are DISCARDED.
+#   fell-through no arm at all: the decoder cannot tell this kind from one
+#                that does not exist.
+#
+# The three are kept distinct deliberately. Collapsing them into one
+# "degraded" bucket would let the EAnnot deletion pass unnoticed, because
+# dropping that arm merely moves EAnnot from `opaque` to `fell-through`.
+#
+# ENFORCEMENT is both directions, like scripts/expected-skips.txt:
+#   - an emitted kind that degrades and is NOT listed here is a GAP and fails
+#     the run;
+#   - a listed kind whose observed category differs from the declared one
+#     fails the run — whether it improved (now `modeled`: stale entry, delete
+#     it) or regressed (`opaque` -> `fell-through`: an arm was lost).
+# Category validation is corpus-independent (it probes the decoder, not the
+# corpus), so an entry stays valid even if no corpus file currently emits it;
+# decoder-coverage.sh reports those separately as informational.
+#
+# TWO KINDS OF `fell-through`, AND ONLY ONE IS CHEAP.
+#
+# Most entries below fall through to a sentinel — `Decl.unsupported`,
+# `Pattern.unsupported`, `Ty.unsupported`, `none` — which sets
+# `hasUnsupported` and forces the whole file through march-lean-check's skip
+# gate. Those are safe by construction: the checker renders no verdict at all.
+#
+# A few fall through to a DEFAULT that is an ordinary, checkable value
+# (`Unrestricted`, `UseSingle`, `UseAll`). Nothing is marked out of fragment,
+# so the file is judged as if the tag had been understood. Those entries are
+# the load-bearing ones: a new sibling tag arriving at such a site would be
+# silently misread rather than skipped. They are marked DEFAULTING below.
+
+# ── Expression tags with a deliberate `opaque_` arm ──────────────────────────
+# Shape unmodelled, children kept in march's own `calls_in_expr` order
+# (typecheck.ml:7704-7752) so the capability walks can still reach a
+# violation nested inside. `Term.opaque_` reports hasUnsupported = true, so
+# Infer/Linearity never judge these nodes. Field-by-field emitter
+# correspondence is tabulated in decodeTerm's docstring.
+EAnnot          opaque         # `(e : T)` ascription. No parser production builds one; `Desugar` synthesizes it for every `app` block (desugar.ml:929) and the resulting `DFn __app_init__` IS emitted. Historical false-skip: a `cap no_panic` module whose app body calls `panic`.
+EAssert         opaque         # `assert e`. Child `expr` kept. Not emitted by the current corpora.
+EAtom           opaque         # actor-protocol atom application. `args` kept; `atom` is a bare string.
+ECond           opaque         # multi-arm `cond`. Both halves of every arm kept, in march's fold order.
+EDbg            opaque         # `dbg(e)` / bare `dbg()` (nullable child). Not emitted by the current corpora.
+ELetFn          opaque         # local `fn` binding. Only `body` kept: `params` are param records, and march's own arm walks only `body`.
+ELetQ           opaque         # `let?` / query binding. `value` then `cont` kept.
+ERecordUpdate   opaque         # `{ base | f = v }`. `base` then each field `value` kept.
+ESend           opaque         # `send`. `cap` then `msg` kept.
+ESpawn          opaque         # `spawn`. `actor` kept.
+
+# ── Explicit arm producing an `.unsupported` sentinel ────────────────────────
+UseNames        unsupported    # selective `use Array.{lst_rev}`. Deliberately out of fragment: march's import-name privacy rule (reject/t27) is not modelled, so the whole decl is forced unsupported rather than treated as a plain import.
+
+# ── Declaration tags with no arm ─────────────────────────────────────────────
+# All reach decodeDecl's catch-all -> `Decl.unsupported` -> hasUnsupported ->
+# the whole file skips. Safe by construction: no verdict is rendered.
+DActor              fell-through   # `actor` declaration. Actors are out of the modelled fragment.
+DAlwaysLinearType   fell-through   # `always linear type`. Out of the modelled fragment.
+DImpl               fell-through   # interface implementation block. Out of the modelled fragment.
+DInterface          fell-through   # `interface` declaration. Out of the modelled fragment.
+DProtocol           fell-through   # session-type `protocol` declaration. Out of the modelled fragment.
+DSig                fell-through   # standalone signature declaration. Out of the modelled fragment.
+DTransitions        fell-through   # actor state-machine `transitions` block. Out of the modelled fragment.
+
+# ── Sub-node tags with no arm, reached only inside an already-skipping decl ──
+OneForOne       fell-through   # supervisor restart strategy, under `actor.supervise.strategy`. Only reachable inside a DActor, which is already unsupported.
+ProtoChoice     fell-through   # session-protocol node. Only reachable inside a DProtocol, which is already unsupported.
+ProtoLoop       fell-through   # session-protocol node. Only reachable inside a DProtocol, which is already unsupported.
+ProtoMsg        fell-through   # session-protocol node. Only reachable inside a DProtocol, which is already unsupported.
+ProtoStop       fell-through   # session-protocol node. Only reachable inside a DProtocol, which is already unsupported.
+
+# ── Other tags with no arm, each degrading to an explicit sentinel ───────────
+FPPat           fell-through   # pattern-destructuring fn param. decodeFnParam -> `none`, which decodeFnParams propagates to `Decl.unsupported` for the whole clause: a bare pattern param cannot be curried into Term's plain-named-param shape.
+PatAtom         fell-through   # actor-protocol atom pattern. decodePattern -> `Pattern.unsupported`.
+TDRecord        fell-through   # `type T = { .. }` record definition. Not the ADT-with-constructors shape Decl.dtype models -> `Decl.unsupported`.
+TyRefine        fell-through   # refinement type `{Int | p}`. decodeSurfaceTy -> `Ty.unsupported`, which propagates through hasUnsupported and forces the file to skip rather than checking a program march judged against a constraint we cannot see.
+unsupported     fell-through   # NOT a march AST tag: the emitter's own placeholder for a resolved session type, `{"kind":"unsupported","what":"session"}` (ast_json.ml:169-172, `T.TChan`). decodeTy's catch-all maps it to `Ty.unsupported`, which is exactly the intended reading.
+
+# ── Visibility tags: read by nobody ──────────────────────────────────────────
+# `vis` is emitted on every decl. The decoder never looks at the key, so both
+# tags fall through everywhere. Module-privacy enforcement is out of the A3
+# fragment; the one privacy rule that IS policed (import-name privacy,
+# reject/t27) is caught at the `UseNames` arm above instead.
+Private         fell-through   # decl visibility. Never read. A `Private` binding referenced across a module boundary is a march reject this checker does not model.
+Public          fell-through   # decl visibility. Never read.
+
+# ── DEFAULTING fall-throughs: no sentinel, no skip ───────────────────────────
+# These sites have no "unsupported" outcome to fall into. The catch-all
+# produces an ordinary value and the file is judged as if the tag had been
+# understood. A new sibling tag arriving here is silently MISREAD, not
+# skipped, which is why each one is called out.
+Unrestricted    fell-through   # DEFAULTING. decodeLin's catch-all is `_ => Lin.unrestricted`, which is the correct reading for this tag — but a hypothetical fourth linearity would be read as unrestricted too, weakening the linearity pass with no signal.
+UseSingle       fell-through   # DEFAULTING. decodeDecl's DUse arm tests only for `UseNames`; every other selector takes the plain whole-module path, which is the correct reading for this tag.
+UseAll          fell-through   # DEFAULTING, and safe only by accident. `use List.*` takes the same plain whole-module path as UseSingle, so glob-import name privacy is not modelled the way `UseNames` is. Its single corpus file (accept/t37_use_all_stdlib_module.march) already skips for an unrelated reason (unbound `length`), so no divergence is observable today — if that file ever stops skipping, this becomes a live false-accept source.

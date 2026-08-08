@@ -7,3 +7,4 @@ import MarchLean.Infer
 import MarchLean.Compare
 import MarchLean.CapLattice
 import MarchLean.CapCheck
+import MarchLean.KindCoverage
