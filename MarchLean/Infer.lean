@@ -1150,13 +1150,29 @@ because the bad unification fires while the CALLER is being inferred,
 long before the callee's declaration is reached. Skipping is the only
 conservative answer available without reconstructing item (2).
 
-Note how narrow the skipping class actually is: an unannotated parameter
-is emitted as `FPPat`/`PatVar` and a type-variable annotation decodes to
-`Ty.unsupported`, and either one forces the whole declaration — hence the
-whole file — out of fragment (`Elab.decodeFnParam`, `Elab.decodeDecl`). So
-every `dfn` reaching this function already has fully ground parameter
-types, and the only thing separating it from the pre-bound class is a
-missing return annotation.
+Two common routes into the skipping class, both benign:
+
+- A *hand-written* unannotated parameter (`fn f(x) do … end`) is emitted as
+  `FPPat`/`PatVar`, and a type-variable annotation decodes to
+  `Ty.unsupported`; either forces the whole declaration — hence the whole
+  file — out of fragment (`Elab.decodeFnParam`, `Elab.decodeDecl`), so it
+  never reaches here at all.
+- A `fn` with annotated parameters but **no return annotation** does reach
+  here, and is simply not pre-bound.
+
+An earlier draft of this comment claimed the first bullet implied every
+`dfn` reaching inference has ground parameter types. **That is false**, and
+it is worth recording why, because it is the kind of plausible unchecked
+assertion that hides real defects. A *desugared multi-head* `fn` — march
+merges `fn fib(0)` / `fn fib(1)` / `fn fib(n)` into one clause — emits a
+synthetic parameter as `FPNamed` with a NULL type
+(`{"name":{"txt":"__arg0"},"ty":null}`, verified against
+`specs/lang/grammar/parse/p15_multi_head_fn_merge.march`), which decodes to
+`FPNamed` with `annot = none` and stays perfectly in fragment. Nothing about
+the pre-pass's soundness depends on the false claim — `dfnGroundArrow`
+independently requires every parameter annotation to be present AND ground,
+so `__arg0` simply fails the test and `fib` is not pre-bound — but the
+docstring should not have asserted it.
 
 **Who may SEE a pending pre-pass binding.** Only the body of another
 ground-signature `dfn`. A `dlet` right-hand side, and the body of a `dfn`
