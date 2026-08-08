@@ -15,7 +15,11 @@ name: Conformance
 # independently checks a modeled fragment. Two ledgers keep that honest,
 # and both are enforced in BOTH directions (a new skip and a stale entry
 # each fail the run):
-#   - scripts/expected-skips.txt: the accept- AND reject-side skip sets.
+#   - scripts/expected-skips.txt: the accept- AND reject-side skip sets,
+#     across all FOUR swept corpora — specs/lang/types/{accept,reject}
+#     (--corpus-dir) plus specs/lang/grammar/{parse,reject} and
+#     specs/lang/golden (--lang-dir). The latter three are directory-
+#     qualified in the ledger; see that file's PATH FORMAT note.
 #   - scripts/known-limitations.txt: the handful of march=reject files
 #     whose rejection reason is erased before --emit-core-ast (so it is
 #     structurally invisible to a Core-AST checker) and which A2 therefore
@@ -97,11 +101,17 @@ jobs:
         with:
           march-version: 7c1d701cf561c13ad094845f52175f449e1c1892
 
-      # Only the static-semantics corpus is needed from march's own repo
-      # (the binary itself came from setup-march above); pinned to the
-      # exact commit setup-march resolved and built so corpus and binary
-      # never drift apart.
-      - name: Checkout march corpus (specs/lang/types)
+      # Only the conformance corpora are needed from march's own repo (the
+      # binary itself came from setup-march above); pinned to the exact
+      # commit setup-march resolved and built so corpus and binary never
+      # drift apart.
+      #
+      # FOUR corpora are swept now, so all four must be fetched:
+      # specs/lang/types/{accept,reject} (via --corpus-dir) plus
+      # specs/lang/grammar/{parse,reject} and specs/lang/golden (via
+      # --lang-dir). If a --lang-dir subdirectory were missing the harness
+      # exits 1 with an explicit error rather than silently scanning less.
+      - name: Checkout march corpora (specs/lang)
         uses: actions/checkout@v4
         with:
           repository: march-language/march
@@ -109,6 +119,8 @@ jobs:
           path: march-checkout
           sparse-checkout: |
             specs/lang/types
+            specs/lang/grammar
+            specs/lang/golden
           sparse-checkout-cone-mode: false
 
       # z3: the refinement-type conformance corpus (@types-check, i.e.
@@ -127,6 +139,7 @@ jobs:
           scripts/conformance-harness.sh \
             --march-bin "$(command -v march)" \
             --corpus-dir "$GITHUB_WORKSPACE/march-checkout/specs/lang/types" \
+            --lang-dir "$GITHUB_WORKSPACE/march-checkout/specs/lang" \
             --march-lean-check-bin "$GITHUB_WORKSPACE/.lake/build/bin/march-lean-check"
 
       # Best-effort: publish the built checker as a release asset on tag

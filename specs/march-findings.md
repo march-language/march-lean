@@ -147,8 +147,67 @@ march accepts) were traced to this second `calls_in_expr` copy by reading
 `typecheck.ml` end to end and confirming empirically with the reproducers
 above (2026-07-31).
 
-**Status.** reported upstream: NOT YET — same underlying defect class as
-march#82 but a distinct source location (second copy, three different call
-sites); should be reported as its own issue or as an amendment to #82 since
-the fix (adding `ETuple`/`ERecord`/`EList` arms to *this* `calls_in_expr`,
-not just the first one) is a separate code change.
+**Status.** FIXED UPSTREAM — https://github.com/march-language/march/pull/136
+(`fix(typecheck): calls_in_expr is now total over Ast.expr`), merged as
+`9a373001`. The fix went further than this finding asked: it added an explicit
+arm for EVERY `Ast.expr` constructor to BOTH copies of `calls_in_expr` and
+removed the `| _ -> acc` catch-all entirely, so a future constructor fails to
+compile here rather than silently falling through the scan again.
+
+Confirmed converged: `(println("hi"), 1)` under `cap pure` is now rejected by
+march AND by `march-lean-check`. The deliberate `bodyCalls` over-detection that
+this finding documented is no longer a divergence.
+
+Note the fix INVERTED the coverage relationship for a while — march's total
+walk reached constructs our decoder mapped to `Term.unsupported`, so we skipped
+where march rejected. Closed separately by `Term.opaque_` (nine AST kinds) and
+by the `ELet` decode fix.
+
+---
+
+## Behavior we DEPEND ON (not a bug): march drops inferred `CInterface` constraints
+
+**What.** `MarchLean/Infer.lean` registers `println : ∀a. a → ()` — fully
+unconstrained. That is deliberately *more permissive* than it looks, and it is
+correct only because of a specific march behavior.
+
+march's builtin `("println", Mono (TArrow (t_string, t_unit)))`
+(`typecheck.ml:1951`) is **dead code**. `stdlib/prelude.march:243` defines an
+ordinary `fn println(x) do print(show(x)); print("\n") end`, and
+`bin/main.ml:214-217` unwraps prelude.march's `mod` body into the entry
+module's own top-level scope — it is the head of `stdlib_file_list`
+(`bin/main.ml:236`) and the only stdlib file so unwrapped. The prelude binding
+therefore shadows the builtin at every call site.
+
+That prelude scheme is unconstrained. march attaches only *declared*
+constraints — `bound_constraints` (`typecheck.ml:6926`) and `when`-clause
+`class_constraints` (`typecheck.ml:7051`), spliced at `:7139-7165`. The
+`CInterface("Show", _)` raised by the body's `show(x)` lands in
+`env.pending_constraints` and is discharged at the declaration boundary while
+still a `TVar`, hitting `| TVar _ -> ()  (* Still polymorphic — cannot check
+yet *)` at `typecheck.ml:7530-7531`, and is dropped.
+
+**Verified** (`march --check`, all exit 0): `println(1)`, `println(true)`,
+`println((1,"a"))`, `println({x:1,y:2})`, `println(some_fn_name)`, and
+`println(Red)` for a `type Color = Red | Green` with **no `impl Show`**.
+
+**Why we match it rather than model `Show`.** A `Show`-constrained scheme would
+be a NEW false-reject source here: this checker models no `impl` declarations
+at all, so no `Show` constraint could ever discharge. Modelling march's actual
+(constraint-dropping) behavior is the faithful choice.
+
+**The fragility.** This is a bug-for-bug match against an *implementation
+accident*, not a specified rule. If march ever propagates inferred
+`CInterface` constraints into schemes, `println` becomes genuinely
+`Show`-constrained and our unconstrained version starts **false-accepting** —
+and no corpus file would catch the flip, because every corpus use of `println`
+is on a Show-able type. Re-check this at every CI re-pin: if
+`typecheck.ml:7530-7531` stops dropping `TVar` constraints, revisit
+`Infer.lean`'s `println` registration.
+
+**Contrast.** `print` is NOT prelude-shadowed (prelude defines no `fn print`),
+so it keeps `Mono (String → ())` and march rejects `print(1)`. We match. The
+`print`/`println` split is the discriminating pair — pinned by fixture.
+
+**Status.** not a march bug; no upstream report. Recorded because our
+correctness depends on it and the dependency is invisible from our source alone.

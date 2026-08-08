@@ -87,7 +87,19 @@ partial def uses (name : String) : Term → Nat
       uses name s + (arms.map (fun (p, g, e) =>
         if (Pattern.boundNames p).contains name then 0
         else uses name e + (g.map (uses name)).getD 0)).foldl Nat.max 0
-  | .lit _ _ | .unsupported _ => 0
+  -- `.opaque_` is grouped with `.unsupported`, NOT recursed into, and the
+  -- reason is the same for all three linearity walks below: a `Term.opaque_`
+  -- reports `hasUnsupported = true`, so `Compare.inferModule`'s skip gate
+  -- returns `.skip` and `MarchLeanCheck.run` exits 2 BEFORE `checkLinearity`
+  -- is ever called. This walk is unreachable on any module containing one, so
+  -- the only correct choice is the one that changes nothing — and counting 0
+  -- is additionally the SAFE half of the unreachable pair: `opaque_`'s
+  -- children are an unordered bag with no modelled binder or
+  -- mutual-exclusivity structure (an `ECond`'s arms are mutually exclusive
+  -- like a `match_`'s, but nothing here records that), so summing their uses
+  -- would over-count a linear binder used once per arm into a bogus "used N
+  -- times" reject.
+  | .lit _ _ | .opaque_ _ _ | .unsupported _ => 0
 
 /-- The outermost linearity qualifier a type carries (`Ty.lin l _`), else
 `unrestricted`. march writes a value's linearity either as a binder keyword
@@ -142,7 +154,11 @@ partial def capturedInLam (name : String) : Term → Bool
       capturedInLam name s || arms.any (fun (p, g, e) =>
         if (Pattern.boundNames p).contains name then false
         else capturedInLam name e || (g.map (capturedInLam name)).getD false)
-  | .lit _ _ | .var _ _ _ | .unsupported _ => false
+  -- `.opaque_` with `.unsupported`: unreachable behind the skip gate (see
+  -- `uses`), and `false` keeps this predicate consistent with `uses`'s 0 —
+  -- reporting a capture whose use count is not being tracked would flip an
+  -- unreachable file from its old answer to a `.skip` for no gain.
+  | .lit _ _ | .var _ _ _ | .opaque_ _ _ | .unsupported _ => false
 
 /-- Enforce a binder's linearity given its use count. -/
 def enforce (name : String) (l : Lin) (n : Nat) : CheckResult :=
@@ -199,7 +215,10 @@ partial def checkTerm : Term → CheckResult
               | none => checkTerm e)
           | o => o) .ok
       | o => o
-  | .lit _ _ | .var _ _ _ | .unsupported _ => .ok
+  -- `.opaque_` with `.unsupported`: unreachable behind the skip gate (see
+  -- `uses`). `.ok` is the behavior-preserving answer and cannot mask
+  -- anything — the file exits 2 before this pass runs either way.
+  | .lit _ _ | .var _ _ _ | .opaque_ _ _ | .unsupported _ => .ok
 
 def checkDecl : Decl → CheckResult
   | .dfn _ ps _ body =>
