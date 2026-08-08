@@ -67,4 +67,48 @@ theorem tierOf_andThen_comm (a b : CapResult) :
     tierOf (a.andThen b) = tierOf (b.andThen a) := by
   rw [tierOf_andThen, tierOf_andThen, Tier.max_comm]
 
+/-! ## `DivVerdict.join`: a bounded join-semilattice
+
+`safe` is the identity, `divZero` absorbs, and the operator is commutative,
+associative, and idempotent — so `joinAll` over a body's division sites is a
+pure set operation: `joinAll_perm` below shows traversal order can never
+change a division verdict. -/
+
+theorem join_comm (a b : DivVerdict) : a.join b = b.join a := by
+  cases a <;> cases b <;> rfl
+theorem join_assoc (a b c : DivVerdict) : (a.join b).join c = a.join (b.join c) := by
+  cases a <;> cases b <;> cases c <;> rfl
+theorem join_idem (a : DivVerdict) : a.join a = a := by
+  cases a <;> rfl
+theorem safe_join (a : DivVerdict) : DivVerdict.safe.join a = a := by
+  cases a <;> rfl
+theorem join_safe (a : DivVerdict) : a.join .safe = a := by
+  cases a <;> rfl
+theorem divZero_join (a : DivVerdict) : DivVerdict.divZero.join a = .divZero := rfl
+
+/-- Fold with any accumulator = accumulator joined onto the fold from `safe`.
+The bridge that lets `joinAll` be reasoned about pointwise. -/
+theorem foldl_join_shift (l : List DivVerdict) (a : DivVerdict) :
+    l.foldl DivVerdict.join a = a.join (DivVerdict.joinAll l) := by
+  induction l generalizing a with
+  | nil => simp [DivVerdict.joinAll, List.foldl_nil, join_safe]
+  | cons x xs ih =>
+      simp only [DivVerdict.joinAll, List.foldl_cons]
+      rw [ih (a.join x), ih (DivVerdict.safe.join x), safe_join, join_assoc]
+
+/-- `joinAll` is permutation-invariant: division-site verdict joins do not
+depend on traversal order. P2's order-independence theorem consumes this. -/
+theorem joinAll_perm {l₁ l₂ : List DivVerdict} (h : l₁.Perm l₂) :
+    DivVerdict.joinAll l₁ = DivVerdict.joinAll l₂ := by
+  induction h with
+  | nil => rfl
+  | cons x _ ih =>
+      simp only [DivVerdict.joinAll, List.foldl_cons]
+      rw [foldl_join_shift, foldl_join_shift, ih]
+  | swap x y l =>
+      simp only [DivVerdict.joinAll, List.foldl_cons]
+      congr 1
+      cases x <;> cases y <;> rfl
+  | trans _ _ ih₁ ih₂ => exact ih₁.trans ih₂
+
 end MarchLean.Calculus
