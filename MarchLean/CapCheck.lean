@@ -1793,9 +1793,40 @@ def checkOneModule (modName : String) (decls : List Decl)
   -- errors on the definite one regardless of what it later decides about the
   -- other); only when no fn is definitely unsafe does an unresolvable divisor
   -- downgrade the module to `skip`.
+  --
+  -- **Scope is `dfn` bodies PLUS `dlet` bodies, unlike every other gate
+  -- above.** Division safety is a SEPARATE march pass
+  -- (`refinecheck/division_safety.ml`), and its declaration walk is
+  -- deliberately exhaustive with no wildcard (`:542-601`): alongside
+  -- `A.DFn` it names `A.DLet (_, b, _) -> expr b.bind_expr`, checking a
+  -- top-level binding's right-hand side with an EMPTY param list — exactly
+  -- `divisionVerdict [] []`. That arm exists because it was a live march bug
+  -- (`specs/lang/types/reject/t120`'s header: the walk "descended only into
+  -- `DFn` and `DMod` and ended in a `| _ -> ()`", so a division in a
+  -- top-level `let` "passed `--check` with exit 0 and then died at run
+  -- time"). Scanning only `dfns` here reproduced march's OLD bug, not its
+  -- current behavior, and was a verified FALSE ACCEPT: `mod M do cap
+  -- no_panic  let bad = 10 / 0  … end` is march exit 1 ("division by zero
+  -- literal in `cap no_panic` module.") and was exit 0 here.
+  --
+  -- The other behavioral gates correctly stay `dfn`-only: `check_pure_module`
+  -- / `check_deterministic_module` / `check_no_panic_module`
+  -- (`typecheck.ml:9127`) each `List.filter_map` over `Ast.DFn` alone, and
+  -- `refinecheck/no_alloc.ml` likewise — verified directly, march ACCEPTS a
+  -- `cap pure` module with `let bad = println("leak")` and a `cap no_alloc`
+  -- module with `let bad = (1, 2)`. Do NOT widen those to `dlet` to "match"
+  -- this one; that would be a false-reject source.
+  --
+  -- march's walk also covers `DImpl`/`DActor`/`DTest`/`DApp`/`DDescribe`/
+  -- `DSetup`/`DSetupAll` bodies, but every one of those decodes to
+  -- `Decl.unsupported` here, carrying no term at all — a residual false-SKIP
+  -- gap (march rejects, this checker exits 2), never a false accept.
   let divVerdicts :=
     if opts.contains "no_panic" then
-      dfns.map (fun (name, body) => (name, divisionVerdict [] [] body))
+      (dfns ++ decls.filterMap (fun d => match d with
+         | .dlet name rhs => some (name, rhs)
+         | _ => none)).map
+        (fun (name, body) => (name, divisionVerdict [] [] body))
     else []
   match divVerdicts.find? (fun (_, v) => v == DivVerdict.divZero) with
   | some (name, _) =>
@@ -4345,5 +4376,65 @@ unknown-type carve-out. -/
 def neUnknownScrut : Module := npMatchMod (Ty.var 0) [npArm (.int 0)]
 #eval checkCaps neUnknownScrut   -- expect: ok
 example : (checkCaps neUnknownScrut).isViolation = false := by native_decide
+
+/-! ### Division safety reaches a top-level `let` (`Decl.dlet`)
+
+march's `division_safety.ml` walk is exhaustive over `A.decl` with NO
+wildcard and names `A.DLet (_, b, _) -> expr b.bind_expr` (`:574`) — that arm
+exists precisely because omitting it was a march bug that shipped
+(`specs/lang/types/reject/t120`'s header). Scanning `dfn` bodies only
+reproduced march's OLD behavior and was a verified FALSE ACCEPT:
+
+    mod M do  cap no_panic  let bad = 10 / 0  … end
+
+is march exit 1 ("division by zero literal in `cap no_panic` module.") and
+was exit 0 here.
+
+The near-misses below pin the boundary: every OTHER behavioral gate stays
+`dfn`-only, because march's own `check_pure_module` /
+`check_deterministic_module` / `check_no_panic_module` / `no_alloc.ml` each
+scan `Ast.DFn` alone — verified directly, march ACCEPTS a `cap pure` module
+with `let bad = println("leak")` and a `cap no_alloc` module with
+`let bad = (1, 2)`. Widening those to `dlet` would be a false-reject source.
+-/
+
+private def dlSp : Span := ⟨"d", 0, 0, 0, 0⟩
+private def dlIntTy : Ty := Ty.con "Int" []
+private def divBy (n : Int) : Term :=
+  Term.app (Term.var "/" dlSp (Ty.arrow dlIntTy (Ty.arrow dlIntTy dlIntTy)))
+    [Term.lit (Lit.int 10) dlIntTy, Term.lit (Lit.int n) dlIntTy] dlIntTy
+private def divLetMod (opt : String) (rhs : Term) : Module :=
+  { decls := [Decl.dopts [opt], Decl.dlet "bad" rhs], schemes := [], insts := [], moduleCaps := [] }
+
+/-- `cap no_panic` + `let bad = 10 / 0` — march REJECTS. -/
+def divTopLevelLetZero : Module := divLetMod "no_panic" (divBy 0)
+#eval checkCaps divTopLevelLetZero   -- expect: violation naming no_panic
+example : (checkCaps divTopLevelLetZero).isViolation = true := by native_decide
+
+/-- Near-miss: same shape, non-zero literal divisor. march ACCEPTS. -/
+def divTopLevelLetNonZero : Module := divLetMod "no_panic" (divBy 2)
+#eval checkCaps divTopLevelLetNonZero   -- expect: ok
+example : (checkCaps divTopLevelLetNonZero).isViolation = false := by native_decide
+
+/-- Near-miss: the same `10 / 0` in a top-level `let` WITHOUT `cap no_panic`.
+No cap is declared, so nothing is promised and march ACCEPTS. -/
+def divTopLevelLetNoCap : Module :=
+  { decls := [Decl.dlet "bad" (divBy 0)], schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps divTopLevelLetNoCap   -- expect: ok
+example : (checkCaps divTopLevelLetNoCap).isViolation = false := by native_decide
+
+/-- Near-miss pinning that the OTHER gates stay `dfn`-only: a `cap pure`
+module whose only side effect is in a top-level `let` RHS. march ACCEPTS
+(`check_pure_module` filters `Ast.DFn`), so this must NOT become a violation. -/
+def pureTopLevelLetSideEffect : Module := divLetMod "pure" opqBanned
+#eval checkCaps pureTopLevelLetSideEffect   -- expect: ok
+example : (checkCaps pureTopLevelLetSideEffect).isViolation = false := by native_decide
+
+/-- Same, for `no_alloc`: a tuple allocation in a top-level `let` RHS.
+march ACCEPTS. -/
+def noAllocTopLevelLetTuple : Module :=
+  divLetMod "no_alloc" (Term.tuple [opqInert, opqInert] dlIntTy)
+#eval checkCaps noAllocTopLevelLetTuple   -- expect: ok
+example : (checkCaps noAllocTopLevelLetTuple).isViolation = false := by native_decide
 
 end MarchLean.CapCheck
