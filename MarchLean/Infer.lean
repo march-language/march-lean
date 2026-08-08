@@ -996,16 +996,203 @@ def builtins (s : Supply) : InferM (List (String × EnvEntry)) := do
 -- declarations at all, so every user ADT would look Show-less) — strictly
 -- worse than the unconstrained scheme, which can only over-accept.
 
+/-- Is `t` a fully GROUND declared type — no type variable, no `TError`, no
+out-of-fragment node anywhere? Exactly the condition under which
+`tyToMTy s [] t` provably succeeds and yields an `MTy` containing no
+metavariable at all. Used by `dfnGroundArrow` below. -/
+partial def tyIsGround : Ty → Bool
+  | .var _ | .err | .unsupported => false
+  | .con _ args => args.all tyIsGround
+  | .arrow a b => tyIsGround a && tyIsGround b
+  | .tuple ts => ts.all tyIsGround
+  | .record fs => fs.all (fun (_, t) => tyIsGround t)
+  | .lin _ t => tyIsGround t
+  | .natOp _ a b => tyIsGround a && tyIsGround b
+  | .nat _ => true
+
+/-- The declared arrow type of a `dfn` whose signature is COMPLETE and
+GROUND — every parameter annotated with a ground type, and a ground return
+annotation — as `some (p₁ → ⋯ → pₙ → ret)`; `none` for any other `dfn`.
+
+A `dfn` with such a signature has a type that is fixed by the signature
+alone: `inferModule'`'s `.dfn` arm unifies each parameter's metavariable
+with its annotation, unifies the body against the return annotation, and
+sets `recTy = p₁ → ⋯ → pₙ → ret`, so the generalized scheme is that exact
+ground type with NO quantified variables. That is what makes it safe to
+publish before the body has been checked — see `inferModule'`'s docstring. -/
+def dfnGroundArrow (params : List (String × Lin × Option Ty)) (retAnnot : Option Ty) :
+    Option Ty := do
+  let ret ← retAnnot
+  guard (tyIsGround ret)
+  let ps ← params.mapM (fun (_, _, a) => do
+    let t ← a
+    guard (tyIsGround t)
+    pure t)
+  pure (ps.foldr Ty.arrow ret)
+
+/-- `ctx` with every still-pending pass-1 pre-pass binding (`names`) removed
+from the term environment. Only the pre-pass can have bound such a name at
+the point this is called — the pre-pass skips names that were already bound,
+and a pending name's own declaration has not run yet — so this removes
+exactly the pre-pass entries and nothing else, restoring the pre-change
+"forward reference ⇒ `SKIP: unbound variable`" behaviour for readers that
+are not allowed to see them (see `inferModule'`'s docstring). -/
+def hidePending (names : List String) (c : Ctx) : Ctx :=
+  if names.isEmpty then c
+  else { c with term := c.term.filter (fun p => !(names.contains p.1)) }
+
 /-- Infer every declaration of a module, returning the `(span, MTy)` record
 for each `var`/`field` node (Task 6 diffs these against march's computed
 types). Constructors from all `DType` decls are gathered first (so ctor
 references resolve regardless of decl order); the built-in env seeds the
-term environment; then `dfn`/`dlet` decls are folded in order, each binding
-its generalized scheme for later decls. A `dfn` binds its own name
-recursively (self-recursion); a `dlet` value binds non-recursively (march
-value bindings aren't self-referential). At the end, pending class
-constraints are discharged (`requireClass`) and residual `Num` mvars are
-defaulted before zonking the recorded types. -/
+term environment; a **pass-1 pre-pass** then binds every top-level `dfn`
+name to a fresh monomorphic placeholder metavariable (see below); then
+`dfn`/`dlet` decls are folded in order, each binding its generalized scheme
+for later decls. A `dfn` binds its own name recursively (self-recursion); a
+`dlet` value binds non-recursively (march value bindings aren't
+self-referential). At the end, pending class constraints are discharged
+(`requireClass`) and residual `Num` mvars are defaulted before zonking the
+recorded types.
+
+## Pass-1 forward-reference placeholders (mutual recursion / forward refs)
+
+Folding declarations strictly in order made every forward reference —
+`fn a` calling a `fn b` declared BELOW it, and hence every mutually
+recursive `fn` pair — throw `SKIP: unbound variable`, taking the whole
+file to exit 2. march does not work that way, and the shape is entirely
+ordinary, so a large class of real programs (including at least one live
+wrong-return-type reject) was invisible to this oracle.
+
+**What march actually does** (`typecheck.ml`, all line refs in
+`/Users/80197052/code/march/lib/typecheck/typecheck.ml`):
+
+1. **Pass 1** (`check_module_core`, `typecheck.ml:11210-11235`): every
+   top-level `DFn` name is bound to `Mono (fresh_var 1)` — a single
+   *monomorphic* placeholder type variable — *unless the name is already
+   bound* (`if StrMap.mem def.fn_name.txt env.vars then env`), so a `fn`
+   that shadows a builtin keeps the builtin's scheme instead. This is the
+   metavariable pre-pass, and it is what makes a forward reference resolve
+   at all.
+2. **Dependency reordering** (`reorder_decls`, `typecheck.ml:8988-9008`,
+   calling `dependency_order_dfn_run`, `typecheck.ml:8533-8587`): each
+   *maximal contiguous run* of top-level `DFn` declarations is permuted by
+   a DFS post-order over the sibling call graph so a callee is checked
+   BEFORE its callers. Cycles (mutual recursion) are tolerated — the DFS
+   simply keeps SCC members grouped "and relies on the pass-1 placeholder
+   for the cyclic edges" (`typecheck.ml:8531-8532`). A run containing
+   duplicate `fn` names is left unpermuted entirely.
+3. **`check_fn`** (`typecheck.ml:6837-6900`): a fresh *monomorphic*
+   self-reference variable shadows the placeholder for the body, so a
+   recursive call is monomorphic — **polymorphic recursion is rejected**,
+   verified directly (`fn sz(x : a) : Int do if true do 0 else sz((x, x))
+   end end` ⇒ march exit 1, "expected `c3` but got `(c3, c3)`").
+4. **Placeholder reconciliation** (`typecheck.ml:7175-7192`): after
+   generalizing, march unifies the pass-1 placeholder with the inferred
+   type **only when that type is `Mono`**; a `Poly` result deliberately
+   leaves the placeholder alone so each caller keeps its own
+   instantiation.
+
+**Where march differs from textbook HM.** Textbook HM puts a mutually
+recursive group in ONE monomorphic recursive binding and generalizes the
+whole group afterwards. march instead reorders, so a *non-cyclic* forward
+reference sees the callee's fully generalized scheme (let-polymorphic
+across the forward reference — `fn main` calling a later `fn pick(x) do x
+end` at both `Int` and `String` is ACCEPTED, verified), while only the
+genuinely cyclic edges fall back to the shared monomorphic placeholder.
+The ordering is therefore load-bearing and observable: inserting a
+top-level `let` between the caller and the callee splits the contiguous
+`DFn` run, blocks the reordering, and march then REJECTS the very same
+program ("expected `Int` but got `String`", verified). One shared
+placeholder per name also means several forward callers of the same
+polymorphic function are pinned to whatever the first call site chose.
+
+**What is implemented here: the GROUND-SIGNATURE pre-pass.** Item (2), the
+dependency reordering, is not reconstructed — it depends on march's
+shadowing-aware `free_vars_expr` and on run-contiguity details that are
+easy to get subtly wrong, and the governing rule for this oracle is that a
+march decision we would have to reconstruct rather than model must fail
+toward SKIP. But the reordering is *unobservable* for one large, easily
+identified class of functions, and that is the class this pre-pass binds:
+
+> A `dfn` whose signature is COMPLETE and GROUND — every parameter
+> annotated with a type containing no type variable, plus a ground return
+> annotation (`dfnGroundArrow`) — has a type that is fixed by the
+> signature alone. Its generalized scheme is provably `Mono` and provably
+> equal to `p₁ → ⋯ → pₙ → ret`, whatever its body turns out to be.
+
+For such a function all three of march's paths converge on that one type:
+reordered, the caller instantiates the `Mono` scheme and gets it; not
+reordered, the caller constrains the shared placeholder and march's
+`Mono`-only reconciliation (item 4) then unifies the placeholder with the
+same type, so the caller ends up with the same constraint set and march
+ends up with the same verdict. So the pre-pass publishes that declared
+arrow type directly, as a zero-variable `Scheme`, before any body is
+inferred. Mutual recursion, three-way cycles, and plain forward references
+among fully-annotated functions are therefore judged exactly, with no
+reconstruction of the ordering.
+
+**What deliberately still skips.** A `dfn` whose signature is NOT complete
+and ground — in practice, one with no return annotation, since an
+unannotated PARAMETER already takes the file out of fragment (see below) —
+is NOT pre-bound. A forward reference to it therefore still throws
+`SKIP: unbound variable` and the file still exits 2, exactly as before
+this change. That is deliberate: such a function's scheme can be
+POLYMORPHIC, and a polymorphic callee is precisely where march's answer
+depends on the reordering (reordered ⇒ each caller gets a fresh
+instantiation and march accepts; reordering blocked by an intervening
+non-`DFn` declaration ⇒ every caller is pinned to the one shared
+placeholder and march rejects — both verified directly against march on
+the same program). Binding a bare placeholder for these was tried and
+produced a live FALSE REJECT (`fn main` calling a later
+`fn mk(u : Int) do fn(y) -> y end` at two result types: march accepts, the
+placeholder version rejected), and no after-the-fact guard can repair it,
+because the bad unification fires while the CALLER is being inferred,
+long before the callee's declaration is reached. Skipping is the only
+conservative answer available without reconstructing item (2).
+
+Note how narrow the skipping class actually is: an unannotated parameter
+is emitted as `FPPat`/`PatVar` and a type-variable annotation decodes to
+`Ty.unsupported`, and either one forces the whole declaration — hence the
+whole file — out of fragment (`Elab.decodeFnParam`, `Elab.decodeDecl`). So
+every `dfn` reaching this function already has fully ground parameter
+types, and the only thing separating it from the pre-bound class is a
+missing return annotation.
+
+**Who may SEE a pending pre-pass binding.** Only the body of another
+ground-signature `dfn`. A `dlet` right-hand side, and the body of a `dfn`
+that is not itself ground-signature, have every *pending* pre-pass name
+(one whose own declaration has not been reached yet) hidden from them, so
+a forward reference from there still raises `SKIP: unbound variable`,
+exactly as before this change.
+
+That restriction is not caution for its own sake — the unrestricted
+version is a live FALSE REJECT, verified against march:
+
+```march
+mod M do
+  let h = b
+  fn b(y : Int) : Int do y end
+  fn main() do println(int_to_string(h(2))) ; println(h("s")) end
+end
+```
+
+march ACCEPTS this. Its pass-1 placeholder for `b` is `fresh_var 1` — at
+level 1, while a top-level declaration generalizes at level 0 — so `let
+h = b` generalizes the placeholder itself and `h` becomes `∀p. p`, usable
+at `Int → Int` and `String → …` alike. (`generalize` then copies the type
+with fresh refs, `typecheck.ml:1506-1516`, so the later `Mono`
+reconciliation of `b`'s placeholder cannot reach back into `h`'s scheme;
+`reorder_decls` cannot help either, since it only permutes `DFn`s among
+themselves and never moves one across a `DLet`.) Publishing `b`'s real
+`Int → Int` type to that `let` is strictly MORE precise than march, and
+being more precise than the system under test is exactly how a false
+reject is manufactured. Hiding the binding restores the old, safe skip.
+
+By contrast a ground-signature `dfn` cannot diverge no matter what its
+body saw: its scheme is pinned by its own annotations, so there is no
+place for a leaked placeholder to be quantified into. This is why the
+visibility rule is stated in terms of the READER's signature, not the
+callee's. -/
 def inferModule' (s : Supply) (m : Module) : InferM (List (Span × MTy)) := do
   let acc ← IO.mkRef ([] : List (Span × MTy))
   let pending ← IO.mkRef ([] : List (Class × MTy))
@@ -1015,6 +1202,32 @@ def inferModule' (s : Supply) (m : Module) : InferM (List (Span × MTy)) := do
     | _ => cs) []
   let bs ← builtins s
   let mut ctx : Ctx := { term := bs, ctors, level := 0, acc, pending }
+  -- Pass 1 (march `check_module_core`, `typecheck.ml:11221-11233`), restricted
+  -- to the ground-signature class: publish each such `dfn`'s DECLARED arrow
+  -- type as a zero-variable scheme so a forward reference to it resolves. As
+  -- march does, a name that is ALREADY bound (a builtin/prelude entry in `bs`)
+  -- is left alone rather than shadowed. A `dfn` outside the class is not bound
+  -- here at all, so a forward reference to it still raises the `SKIP:` marker
+  -- and the file honestly skips — see the docstring for why that is the only
+  -- conservative option there. `pendingPre` tracks the pre-bound names whose
+  -- OWN declaration has not been reached yet — exactly the names a forward
+  -- reference can reach, and the ones `hidePending` withholds from every reader
+  -- except a ground-signature `dfn` body (docstring: "Who may SEE a pending
+  -- pre-pass binding").
+  let mut pendingPre : List String := []
+  for d in m.decls do
+    match d with
+    | .dfn _ name params retAnnot _ =>
+        match dfnGroundArrow params retAnnot with
+        | some declTy =>
+            if (ctx.lookup name).isNone then
+              -- `tyIsGround declTy` holds by construction, so `tyToMTy` cannot
+              -- throw and the result contains no metavariable.
+              let mt ← tyToMTy s [] declTy
+              ctx := ctx.addScheme name { vars := [], classes := [], body := mt }
+              pendingPre := name :: pendingPre
+        | none => pure ()
+    | _ => pure ()
   for d in m.decls do
     match d with
     | .dtype .. => pure ()
@@ -1025,11 +1238,20 @@ def inferModule' (s : Supply) (m : Module) : InferM (List (Span × MTy)) := do
     -- any other not-yet-spliced-in scope.
     | .dmod .. | .dneeds .. | .duse .. | .dextern .. | .dproofcap .. | .dopts .. => pure ()
     | .dlet name rhs => do
-        let t ← infer s { ctx with level := ctx.level + 1 } rhs
+        -- A `dlet` never sees a pending pre-pass binding: march generalizes its
+        -- level-1 placeholder into the `let`'s own scheme, which this checker
+        -- does not (and must not) reproduce. See the docstring.
+        let ctxLet := hidePending pendingPre ctx
+        let t ← infer s { ctxLet with level := ctxLet.level + 1 } rhs
         let sch ← generalize s ctx.level t
         ctx := ctx.addScheme name sch
     | .dfn _ name params retAnnot body => do
         let lvl := ctx.level + 1
+        -- Only a ground-signature `dfn` — one whose own scheme is pinned by its
+        -- annotations and so cannot carry a leaked placeholder — may resolve a
+        -- forward reference. Everything else keeps the old `SKIP`.
+        let isGroundSig := (dfnGroundArrow params retAnnot).isSome
+        let ctxVis := if isGroundSig then ctx else hidePending pendingPre ctx
         let recTy ← freshMVar s lvl
         let paramMTys ← params.mapM (fun _ => freshMVar s lvl)
         -- Honor surface param annotations (see the `lam` arm): fix each
@@ -1039,7 +1261,7 @@ def inferModule' (s : Supply) (m : Module) : InferM (List (Span × MTy)) := do
           | some t => unify s m (← tyToMTy s [] t)
           | none => pure ()
         let ctxIn := (params.zip paramMTys).foldl
-          (fun c ((n, _, _), mt) => c.addMono n mt) (ctx.addMono name recTy)
+          (fun c ((n, _, _), mt) => c.addMono n mt) (ctxVis.addMono name recTy)
         let bodyTy ← infer s { ctxIn with level := lvl } body
         -- Honor the surface RETURN annotation, exactly as the param
         -- annotations above are honored. march checks a clause's body against
@@ -1068,7 +1290,15 @@ def inferModule' (s : Supply) (m : Module) : InferM (List (Span × MTy)) := do
         | none => pure ()
         unify s recTy (paramMTys.foldr MTy.arrow bodyTy)
         let sch ← generalize s ctx.level recTy
+        -- Rebind the name to the scheme just derived from its own body. For a
+        -- ground-signature `dfn` this is the same type the pre-pass already
+        -- published (that is exactly the pre-pass's soundness argument), so the
+        -- rebind is a no-op for it; for every other `dfn` this is its first and
+        -- only binding. Its pre-pass entry (if any) is no longer PENDING once
+        -- its own declaration has been checked, so later declarations of every
+        -- kind may see it.
         ctx := ctx.addScheme name sch
+        pendingPre := pendingPre.filter (· != name)
     | .unsupported => throw "infer: unsupported declaration (should have been skip-gated)"
   -- Discharge pending class constraints against their now-solved mvars.
   let pend ← pending.get
@@ -1461,6 +1691,203 @@ so a body of any type still infers. `fn f(n : Int) do n end`. -/
   | .ok _ => IO.println "retannot-absent-accepted: true"
   | .error e => IO.println s!"retannot-absent-FAIL: {e}"
 -- expected: retannot-absent-accepted: true
+
+/-! ### Pass-1 ground-signature pre-pass (mutual recursion / forward references)
+
+Fixtures for the pre-pass documented on `inferModule'`. Every one of these
+shapes was ALSO run end-to-end against the real march binary
+(`main.exe --check` vs `--emit-core-ast | march-lean-check`); the march
+verdict quoted in each comment is the observed one, with its diagnostic
+checked to be a genuine type error rather than a parse/unbound-name error.
+
+`tI`/`tB` below are the two ground annotations these fixtures use. -/
+
+private def tI : Ty := Ty.con "Int" []
+private def tB : Ty := Ty.con "Bool" []
+
+/-- `if c then t else e`, spelled with the `Term.ite` node these fixtures need. -/
+private def mkIte (c t e : Term) : Term := Term.ite c t e dTy
+
+/-- `n == 0` — a `Bool`-valued guard built from the built-in `==`. -/
+private def eqZero : Term :=
+  Term.app (Term.var "==" dSpan dTy) [Term.var "n" dSpan dTy, Term.lit (.int 0) dTy] dTy
+
+/-- `f(n)` for a one-argument `f`. -/
+private def callN (f : String) : Term :=
+  Term.app (Term.var f dSpan dTy) [Term.var "n" dSpan dTy] dTy
+
+/- MUTUAL RECURSION, WELL TYPED. Two fully-annotated `fn`s that call each
+other. `is_even` refers to `is_odd` BEFORE it is declared, which used to
+throw `SKIP: unbound variable` and take the whole file to exit 2; the
+ground-signature pre-pass now resolves it. march accepts the corresponding
+program. -/
+#eval show IO Unit from do
+  let s ← Supply.new
+  let isEven : Decl := .dfn .pub "is_even" [("n", .unrestricted, some tI)] (some tB)
+    (mkIte eqZero (Term.lit (.bool true) dTy) (callN "is_odd"))
+  let isOdd : Decl := .dfn .pub "is_odd" [("n", .unrestricted, some tI)] (some tB)
+    (mkIte eqZero (Term.lit (.bool false) dTy) (callN "is_even"))
+  match ← (inferModule' s { decls := [isEven, isOdd], schemes := [], insts := [] }).run with
+  | .ok _ => IO.println "mutrec-ok-accepted: true"
+  | .error e => IO.println s!"mutrec-ok-FAIL: {e}"
+-- expected: mutrec-ok-accepted: true
+
+/- MUTUAL RECURSION, GENUINE TYPE ERROR. Same pair, but `is_even` calls
+`is_odd` on a `String`. march rejects ("expected `Int` but got `String`").
+This is the coverage win: before the pre-pass the file skipped, so the
+error was invisible. The throw is UNMARKED (no `SKIP:`), so
+`Compare.inferModule` reports `.reject`. -/
+#eval show IO Unit from do
+  let s ← Supply.new
+  let isEven : Decl := .dfn .pub "is_even" [("n", .unrestricted, some tI)] (some tB)
+    (mkIte eqZero (Term.lit (.bool true) dTy)
+      (Term.app (Term.var "is_odd" dSpan dTy) [Term.lit (.str "x") dTy] dTy))
+  let isOdd : Decl := .dfn .pub "is_odd" [("n", .unrestricted, some tI)] (some tB)
+    (mkIte eqZero (Term.lit (.bool false) dTy) (callN "is_even"))
+  match ← (inferModule' s { decls := [isEven, isOdd], schemes := [], insts := [] }).run with
+  | .ok _ => IO.println "mutrec-badarg-FAIL: accepted"
+  | .error e =>
+      if e.startsWith "SKIP: " then IO.println s!"mutrec-badarg-FAIL: skipped ({e})"
+      else IO.println "mutrec-badarg-rejected: true"
+-- expected: mutrec-badarg-rejected: true
+
+/- MUTUAL RECURSION, WRONG RETURN ANNOTATION — the case a prior audit
+flagged as hidden behind the skip. `is_even : String` but its branches are
+`Bool`. march rejects ("expected `String` but got `Bool`"). Requires BOTH
+the return-annotation check (commit `033d330`) and this pre-pass to be
+visible at all. -/
+#eval show IO Unit from do
+  let s ← Supply.new
+  let isEven : Decl := .dfn .pub "is_even" [("n", .unrestricted, some tI)]
+    (some (Ty.con "String" []))
+    (mkIte eqZero (Term.lit (.bool true) dTy) (callN "is_odd"))
+  let isOdd : Decl := .dfn .pub "is_odd" [("n", .unrestricted, some tI)] (some tB)
+    (mkIte eqZero (Term.lit (.bool false) dTy) (callN "is_even"))
+  match ← (inferModule' s { decls := [isEven, isOdd], schemes := [], insts := [] }).run with
+  | .ok _ => IO.println "mutrec-wrongret-FAIL: accepted"
+  | .error e =>
+      if e.startsWith "SKIP: " then IO.println s!"mutrec-wrongret-FAIL: skipped ({e})"
+      else IO.println "mutrec-wrongret-rejected: true"
+-- expected: mutrec-wrongret-rejected: true
+
+/- PLAIN FORWARD REFERENCE, NO RECURSION. `fn a` calls `fn b` declared
+below it. march accepts (its `reorder_decls` checks `b` first); the
+pre-pass gets the same answer without reconstructing the reordering. -/
+#eval show IO Unit from do
+  let s ← Supply.new
+  let a : Decl := .dfn .pub "a" [("n", .unrestricted, some tI)] (some tI) (callN "b")
+  let b : Decl := .dfn .pub "b" [("n", .unrestricted, some tI)] (some tI)
+    (Term.var "n" dSpan dTy)
+  match ← (inferModule' s { decls := [a, b], schemes := [], insts := [] }).run with
+  | .ok _ => IO.println "fwdref-accepted: true"
+  | .error e => IO.println s!"fwdref-FAIL: {e}"
+-- expected: fwdref-accepted: true
+
+/- THREE-WAY MUTUAL RECURSION (a → b → c → a), well typed. march accepts. -/
+#eval show IO Unit from do
+  let s ← Supply.new
+  let mk (nm nxt : String) (k : Nat) : Decl :=
+    .dfn .pub nm [("n", .unrestricted, some tI)] (some tI)
+      (mkIte eqZero (Term.lit (.int (Int.ofNat k)) dTy) (callN nxt))
+  let m : Module := { decls := [mk "f" "g" 0, mk "g" "h" 1, mk "h" "f" 2],
+                      schemes := [], insts := [] }
+  match ← (inferModule' s m).run with
+  | .ok _ => IO.println "threeway-accepted: true"
+  | .error e => IO.println s!"threeway-FAIL: {e}"
+-- expected: threeway-accepted: true
+
+/- THE DELIBERATE SKIP, side 1: a forward reference to a `dfn` with NO
+return annotation is NOT pre-bound, because that function's scheme can be
+polymorphic and march's verdict then depends on the declaration reordering
+this checker does not reconstruct. It must still raise the `SKIP:` marker
+(⇒ `Compare.inferModule` returns `.skip`), never a reject. -/
+#eval show IO Unit from do
+  let s ← Supply.new
+  let isEven : Decl := .dfn .pub "is_even" [("n", .unrestricted, some tI)] (some tB)
+    (mkIte eqZero (Term.lit (.bool true) dTy) (callN "is_odd"))
+  let isOdd : Decl := .dfn .pub "is_odd" [("n", .unrestricted, some tI)] none
+    (mkIte eqZero (Term.lit (.bool false) dTy) (callN "is_even"))
+  match ← (inferModule' s { decls := [isEven, isOdd], schemes := [], insts := [] }).run with
+  | .ok _ => IO.println "fwd-unannotated-FAIL: accepted"
+  | .error e =>
+      if e.startsWith "SKIP: " then IO.println "fwd-unannotated-skipped: true"
+      else IO.println s!"fwd-unannotated-FAIL: rejected ({e})"
+-- expected: fwd-unannotated-skipped: true
+
+/- THE DELIBERATE SKIP, side 2 (the false-reject guard). A `dlet` may NOT
+see a pending pre-pass binding. march ACCEPTS
+
+    let h = b ; fn b(y : Int) : Int do y end ; ... h(2) ... h("s") ...
+
+because its level-1 placeholder is generalized into `h`'s own scheme,
+giving `h : ∀p. p`. Publishing `b`'s real `Int → Int` type to that `let`
+would be MORE precise than march and would reject the program — a false
+reject, observed before this guard was added. The `dlet` must therefore
+still see `b` as unbound. -/
+#eval show IO Unit from do
+  let s ← Supply.new
+  let h : Decl := .dlet "h" (Term.var "b" dSpan dTy)
+  let b : Decl := .dfn .pub "b" [("y", .unrestricted, some tI)] (some tI)
+    (Term.var "y" dSpan dTy)
+  match ← (inferModule' s { decls := [h, b], schemes := [], insts := [] }).run with
+  | .ok _ => IO.println "dlet-fwd-FAIL: accepted"
+  | .error e =>
+      if e.startsWith "SKIP: " then IO.println "dlet-fwd-skipped: true"
+      else IO.println s!"dlet-fwd-FAIL: rejected ({e})"
+-- expected: dlet-fwd-skipped: true
+
+/- A `dlet` that references an ALREADY-declared `dfn` is unaffected by the
+guard above — only PENDING pre-pass names are hidden. -/
+#eval show IO Unit from do
+  let s ← Supply.new
+  let b : Decl := .dfn .pub "b" [("y", .unrestricted, some tI)] (some tI)
+    (Term.var "y" dSpan dTy)
+  let h : Decl := .dlet "h" (Term.var "b" dSpan dTy)
+  match ← (inferModule' s { decls := [b, h], schemes := [], insts := [] }).run with
+  | .ok _ => IO.println "dlet-backref-accepted: true"
+  | .error e => IO.println s!"dlet-backref-FAIL: {e}"
+-- expected: dlet-backref-accepted: true
+
+/- SELF-RECURSION is unchanged by the pre-pass: it was already handled by
+the `ctx.addMono name recTy` self-binding, and still is. Well-typed side. -/
+#eval show IO Unit from do
+  let s ← Supply.new
+  let fact : Decl := .dfn .pub "fact" [("n", .unrestricted, some tI)] (some tI)
+    (mkIte eqZero (Term.lit (.int 1) dTy) (callN "fact"))
+  match ← (inferModule' s { decls := [fact], schemes := [], insts := [] }).run with
+  | .ok _ => IO.println "selfrec-ok-accepted: true"
+  | .error e => IO.println s!"selfrec-ok-FAIL: {e}"
+-- expected: selfrec-ok-accepted: true
+
+/- Self-recursion, ill-typed side: the self-reference is MONOMORPHIC (march
+uses a fresh monomorphic self var, `typecheck.ml:6860-6866`, which is also
+why march REJECTS polymorphic recursion — verified). Calling `fact` on a
+`String` must therefore be rejected, not skipped. -/
+#eval show IO Unit from do
+  let s ← Supply.new
+  let fact : Decl := .dfn .pub "fact" [("n", .unrestricted, some tI)] (some tI)
+    (mkIte eqZero (Term.lit (.int 1) dTy)
+      (Term.app (Term.var "fact" dSpan dTy) [Term.lit (.str "x") dTy] dTy))
+  match ← (inferModule' s { decls := [fact], schemes := [], insts := [] }).run with
+  | .ok _ => IO.println "selfrec-bad-FAIL: accepted"
+  | .error e =>
+      if e.startsWith "SKIP: " then IO.println s!"selfrec-bad-FAIL: skipped ({e})"
+      else IO.println "selfrec-bad-rejected: true"
+-- expected: selfrec-bad-rejected: true
+
+/- `dfnGroundArrow` is the gate for the whole pre-pass, so pin its shape
+directly: a complete ground signature yields the curried arrow, a missing
+return annotation yields `none`, and a type-variable annotation (which the
+decoder would have turned into `Ty.unsupported`, but be defensive) yields
+`none` too. -/
+#eval show IO Unit from do
+  let full := dfnGroundArrow [("n", .unrestricted, some tI)] (some tB)
+  let noRet := dfnGroundArrow [("n", .unrestricted, some tI)] none
+  let tyvar := dfnGroundArrow [("n", .unrestricted, some (Ty.var 0))] (some tB)
+  let unsup := dfnGroundArrow [("n", .unrestricted, some tI)] (some Ty.unsupported)
+  let zeroAry := dfnGroundArrow [] (some tI)
+  IO.println s!"groundarrow: {full == some (Ty.arrow tI tB)} {noRet.isNone} {tyvar.isNone} {unsup.isNone} {zeroAry == some tI}"
+-- expected: groundarrow: true true true true true
 
 /- VALUE RESTRICTION — the discriminating test for `demoteToLevel0`.
 
