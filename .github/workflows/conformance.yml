@@ -48,17 +48,36 @@ jobs:
         uses: actions/checkout@v4
 
       # Installs elan + the toolchain pinned in lean-toolchain, then runs
-      # `lake build march-lean-check`. This repo's lakefile.toml has no
-      # defaultTargets, so a bare `lake build` (lean-action's default)
+      # `lake build MarchLean march-lean-check`. This repo's lakefile.toml has
+      # no defaultTargets, so a bare `lake build` (lean-action's default)
       # reports "0 jobs" and silently builds nothing — build-args names the
-      # target explicitly. use-mathlib-cache: false skips the (inapplicable)
+      # targets explicitly. use-mathlib-cache: false skips the (inapplicable)
       # cache-restore step rather than silently no-op'ing through
       # auto-detection (this repo has no Mathlib dependency).
-      - name: Install Lean toolchain and build march-lean-check
+      #
+      # BOTH targets are named on purpose. `MarchLeanCheck.lean` imports the
+      # individual modules it needs, NOT the `MarchLean` library root, so
+      # building only the executable leaves every module outside the exe's
+      # import closure unbuilt — which since P0 includes the proof layer
+      # (`MarchLean/Calculus/Verdicts.lean`, `Concrete.lean`). Those files are
+      # kernel-checked ONLY if `MarchLean` is built, so dropping it here would
+      # let every theorem rot undetected while CI stayed green.
+      - name: Install Lean toolchain and build the library and checker
         uses: leanprover/lean-action@v1
         with:
-          build-args: march-lean-check
+          build-args: MarchLean march-lean-check
           use-mathlib-cache: false
+
+      # Lean treats `sorry` as a WARNING, not an error, so the build above
+      # would pass with unproven theorems. The Calculus/ proof layer (P0,
+      # specs/plans/2026-08-08-calculus-proof-capabilities-design.md) is only
+      # evidence if this gate holds. Source-level grep rather than build-log
+      # parsing, so a failure names the offending file:line.
+      - name: Forbid sorry/admit in Lean sources
+        run: |
+          if grep -rnE '\b(sorry|admit)\b' --include='*.lean' MarchLean/ MarchLean.lean MarchLeanCheck.lean; then
+            echo "::error::sorry/admit found in Lean sources (see matches above)"; exit 1
+          fi
 
       # Pinned to a march main SHA (not a branch) for reproducibility. This
       # pin (7c1d701c) is march main HEAD as of the post-slice-(c)
