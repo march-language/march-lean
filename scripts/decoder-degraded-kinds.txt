@@ -110,13 +110,30 @@ TDRecord        fell-through   # `type T = { .. }` record definition. Not the AD
 TyRefine        fell-through   # refinement type `{Int | p}`. decodeSurfaceTy -> `Ty.unsupported`, which propagates through hasUnsupported and forces the file to skip rather than checking a program march judged against a constraint we cannot see.
 unsupported     fell-through   # NOT a march AST tag: the emitter's own placeholder for a resolved session type, `{"kind":"unsupported","what":"session"}` (ast_json.ml:169-172, `T.TChan`). decodeTy's catch-all maps it to `Ty.unsupported`, which is exactly the intended reading.
 
-# ── Visibility tags: read by nobody ──────────────────────────────────────────
-# `vis` is emitted on every decl. The decoder never looks at the key, so both
-# tags fall through everywhere. Module-privacy enforcement is out of the A3
-# fragment; the one privacy rule that IS policed (import-name privacy,
-# reject/t27) is caught at the `UseNames` arm above instead.
-Private         fell-through   # decl visibility. Never read. A `Private` binding referenced across a module boundary is a march reject this checker does not model.
-Public          fell-through   # decl visibility. Never read.
+# ── Visibility tags: read by a direct field read, NOT via kindOf ─────────────
+# `vis` is emitted on every decl. These two tags still fall through the *kind*
+# dispatch, which is what this gate probes — but they ARE consumed:
+# `Elab.decodeTerm`'s `dfn` arm reads `fn.vis.kind` directly
+# (`MarchLean/Elab.lean:664-666`, matching the literal string "Private") to
+# build `Syntax.Vis`, which Check 6 (proof-capability production) depends on.
+#
+# GATE BLIND SPOT — worth knowing when reading a PASS from this script: the
+# probe only observes kinds routed through a `kindOf` dispatch site. A kind
+# consumed by a direct `getObjVal?` field read, as `vis` is, is invisible to
+# it and will report `fell-through` however thoroughly it is used. Do not
+# read `fell-through` here as "nothing depends on this".
+#
+# Module-privacy enforcement generally is still out of the A3 fragment; the
+# one privacy rule that IS policed (import-name privacy, reject/t27) is caught
+# at the `UseNames` arm above.
+#
+# NOTE the decode defaults to `Vis.pub` on anything that is not the literal
+# "Private" (`Elab.lean:666`). If march ever renames the tag or stops emitting
+# `vis`, Check 6 silently stops reporting private-mint violations — a FALSE
+# ACCEPT, not a skip. That default is invisible to this gate too. Re-check at
+# each march re-pin.
+Private         fell-through   # decl visibility. Read at Elab.lean:664-666 for Check 6, via a direct field read the kind-probe cannot see.
+Public          fell-through   # decl visibility. Not matched explicitly — it is the `_ => Vis.pub` default at Elab.lean:666.
 
 # ── DEFAULTING fall-throughs: no sentinel, no skip ───────────────────────────
 # These sites have no "unsupported" outcome to fall into. The catch-all
