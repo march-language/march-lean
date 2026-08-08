@@ -1028,10 +1028,7 @@ def inferModule' (s : Supply) (m : Module) : InferM (List (Span × MTy)) := do
         let t ← infer s { ctx with level := ctx.level + 1 } rhs
         let sch ← generalize s ctx.level t
         ctx := ctx.addScheme name sch
-    | .dfn name params _ body => do
-        -- `retAnnot` (the surface return type) is ignored: inference derives
-        -- the body's type and cross-checks `resolved_ty`, rather than trusting
-        -- the annotation. It exists only for `CapCheck`'s Check 1 return scan.
+    | .dfn name params retAnnot body => do
         let lvl := ctx.level + 1
         let recTy ← freshMVar s lvl
         let paramMTys ← params.mapM (fun _ => freshMVar s lvl)
@@ -1044,6 +1041,31 @@ def inferModule' (s : Supply) (m : Module) : InferM (List (Span × MTy)) := do
         let ctxIn := (params.zip paramMTys).foldl
           (fun c ((n, _, _), mt) => c.addMono n mt) (ctx.addMono name recTy)
         let bodyTy ← infer s { ctxIn with level := lvl } body
+        -- Honor the surface RETURN annotation, exactly as the param
+        -- annotations above are honored. march checks a clause's body against
+        -- its declared return type (the `expected `X` but got `Y`` error a
+        -- `fn f(n : Int) : String do n end` raises); leaving `retAnnot`
+        -- unconstrained here was a live FALSE-ACCEPT class covering every
+        -- return-position mismatch — verified directly against march for
+        -- `: String` over an `Int` body, `: ()` over a non-unit body,
+        -- `: Float` over an integer literal, `: Int` over a `Float` literal,
+        -- a record field of the wrong type, a nominal type alias
+        -- (`type Age = Int` is NOT transparent to march — it rejects
+        -- `fn f(x : Int) : Age do x end`), and a call to a correctly-typed
+        -- function at the wrong return type.
+        --
+        -- This cannot manufacture a false reject from a mis-decoded
+        -- annotation: `Decl.dfn.retAnnot` is `some` only when the annotation
+        -- is fully IN fragment — `Elab.decodeDecl` forces the whole
+        -- declaration to `Decl.unsupported` (⇒ file skips) when the return
+        -- type contains a `Ty.unsupported`, and `decodeSurfaceTy` maps a
+        -- surface type VARIABLE not among the decl's own type params (a `fn`
+        -- has none) to exactly that `Ty.unsupported`. So the `tyToMTy` below
+        -- sees only ground, in-fragment types and cannot throw; the only
+        -- outcome it adds is a genuine body/annotation mismatch.
+        match retAnnot with
+        | some rt => unify s bodyTy (← tyToMTy s [] rt)
+        | none => pure ()
         unify s recTy (paramMTys.foldr MTy.arrow bodyTy)
         let sch ← generalize s ctx.level recTy
         ctx := ctx.addScheme name sch
@@ -1375,9 +1397,11 @@ with no unbound-variable throw for `cap_narrow`/`root_cap`. Modeled as a
 -- expected: cap-narrow-module-ok: true
 
 /- Same shape as above, but checking that `cap_narrow`'s polymorphic result
-actually unifies with the `Cap(IO.Network)` return annotation (`inferModule'`
-ignores `retAnnot`, so this unify is done explicitly here — see its doc
-comment above `.dfn`'s case). `λ(root : Cap(IO)). cap_narrow(root)` infers to
+actually unifies with the `Cap(IO.Network)` return annotation. This drives the
+unify through a bare `Term.lam` rather than through `inferModule'` (whose
+`.dfn` arm now performs exactly this unify itself), so it pins the underlying
+`cap_narrow`-result/annotation interaction independently of the decl-level
+plumbing. `λ(root : Cap(IO)). cap_narrow(root)` infers to
 `Cap(IO) → ?a`; unifying `?a` with `Cap(IO.Network)` and zonking must yield
 exactly `Cap(IO) → Cap(IO.Network)`. -/
 #eval show IO Unit from do
@@ -1398,6 +1422,45 @@ exactly `Cap(IO) → Cap(IO.Network)`. -/
   | .ok _ => IO.println "cap-narrow-unify-FAIL: wrong shape"
   | .error e => IO.println s!"cap-narrow-unify-ERROR: {e}"
 -- expected: cap-narrow-unify-ok: true
+
+/- RETURN ANNOTATION — `inferModule'`'s `.dfn` arm must check the inferred body
+type against the declared return type. `fn f(n : Int) : String do n end` is
+rejected by march ("expected `String` but got `Int`"), verified directly; before
+this check it ACCEPTED here, and did so for every return-position mismatch —
+`: ()` over a non-unit body, `: Float` over an integer literal, `: Int` over a
+`Float` literal, and a nominal alias (`type Age = Int`, which march does NOT
+treat transparently). This `#eval` has teeth: deleting the `retAnnot` unify
+makes it print `retannot-mismatch-FAIL: accepted`. -/
+#eval show IO Unit from do
+  let s ← Supply.new
+  let bad : Decl := .dfn "f" [("n", .unrestricted, some (Ty.con "Int" []))]
+    (some (Ty.con "String" [])) (Term.var "n" dSpan dTy)
+  match ← (inferModule' s { decls := [bad], schemes := [], insts := [] }).run with
+  | .ok _ => IO.println "retannot-mismatch-FAIL: accepted"
+  | .error _ => IO.println "retannot-mismatch-rejected: true"
+-- expected: retannot-mismatch-rejected: true
+
+/- The near-miss the check above must NOT break: a return annotation that
+AGREES with the body still infers cleanly. `fn f(n : Int) : Int do n end`. -/
+#eval show IO Unit from do
+  let s ← Supply.new
+  let ok : Decl := .dfn "f" [("n", .unrestricted, some (Ty.con "Int" []))]
+    (some (Ty.con "Int" [])) (Term.var "n" dSpan dTy)
+  match ← (inferModule' s { decls := [ok], schemes := [], insts := [] }).run with
+  | .ok _ => IO.println "retannot-match-accepted: true"
+  | .error e => IO.println s!"retannot-match-FAIL: {e}"
+-- expected: retannot-match-accepted: true
+
+/- And the other near-miss: an UNANNOTATED `fn` imposes no constraint at all,
+so a body of any type still infers. `fn f(n : Int) do n end`. -/
+#eval show IO Unit from do
+  let s ← Supply.new
+  let un : Decl := .dfn "f" [("n", .unrestricted, some (Ty.con "Int" []))]
+    none (Term.var "n" dSpan dTy)
+  match ← (inferModule' s { decls := [un], schemes := [], insts := [] }).run with
+  | .ok _ => IO.println "retannot-absent-accepted: true"
+  | .error e => IO.println s!"retannot-absent-FAIL: {e}"
+-- expected: retannot-absent-accepted: true
 
 /- VALUE RESTRICTION — the discriminating test for `demoteToLevel0`.
 
