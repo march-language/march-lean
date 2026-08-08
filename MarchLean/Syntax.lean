@@ -243,8 +243,11 @@ inductive Decl where
   — is always in fragment when present, because the decoder forces the whole
   declaration to `Decl.unsupported` when the return annotation is out of
   fragment. `CapCheck.capsInReturnSignature` scans it so Check 1 covers
-  `param_tys @ ret_tys` exactly as march's `check_module_needs` does; `Infer`
-  ignores it (it infers the body's type, not the annotation). -/
+  `param_tys @ ret_tys` exactly as march's `check_module_needs` does, and
+  `Infer.inferModule'`'s `dfn` arm unifies the inferred BODY type against it,
+  exactly as it already does for each param annotation — march checks a
+  clause's body against its declared return type, and leaving this
+  unconstrained was a live false-accept class (see that arm's comment). -/
   | dfn (name : String) (params : List (String × Lin × Option Ty)) (retAnnot : Option Ty) (body : Term)
   | dlet (name : String) (rhs : Term)
   | dtype (name : String) (params : List String) (ctors : List CtorSig)
