@@ -245,7 +245,58 @@ structure CtorSig where
   resultTy : Ty         -- e.g. Box(a)
   deriving Repr, Inhabited
 
-/-- Declaration (only what the fragment checks; others → `unsupported`). -/
+/-- Declaration (only what the fragment checks; others → `unsupported`).
+
+**There is deliberately no declaration-level analogue of `Term.opaque_`.**
+The idea — decode `DImpl`/`DActor`/`DTest`/`DDescribe`/`DSetup`/`DSetupAll`/
+`DInterface` to a node carrying their child terms, with `hasUnsupported`
+hard-coded `true` so inference never sees them, letting `CapCheck` walk them
+— was evaluated against the live march source and REJECTED. Four reasons,
+in descending order of weight:
+
+1. **It closes no false-accept class.** All seven forms already decode to
+   `Decl.unsupported`, which forces the whole-file skip gate before any
+   accept can be reached, so today's verdict on each is exit 2, not exit 0
+   — every cell was probed (see `CapCheck`'s module docstring). The change
+   would convert skips into rejects: more confirmations, but not a
+   correctness fix, and it would buy them at the cost of (2).
+
+2. **It would GENERATE false rejects — the worst class.** `Term.opaque_` is
+   safe because every cap-layer consumer of a term (`bodyCalls`,
+   `bodyAllocates`, `divisionVerdict`) is a "does X occur anywhere below"
+   scan that stays sound over an unordered bag of subterms. Declaration
+   walks are not like that. march's `division_safety.ml` calls
+   `check_body ~root errctx params body` with a DIFFERENT parameter
+   environment per form: an actor handler's parameters are in scope and may
+   carry REFINEMENTS that discharge a divisor (its own comment: "an actor
+   handler's parameters may be refined"). A children-only bag discards
+   them, so the walk would run at `divisionVerdict [] []` and reject a
+   divisor march proves safe. `DImpl` is worse still — march STRIPS a
+   method's param refinements unless the name is `adoptable`
+   (`Refine_check.adoptable_impl_methods`, a cross-declaration analysis
+   this checker does not model at all), so both including and omitting them
+   diverges.
+
+3. **The forms are not uniform in what walks them.** Division safety is the
+   ONLY error-level check that reaches any of the seven; `pure` /
+   `deterministic` / `no_alloc` / `no_panic` (both halves) / Checks 6/7/8
+   are all `DFn`-only, and Check 1 additionally scans `DActor` handler
+   SIGNATURES — types, which a `children : List Term` bag cannot carry at
+   all. `DDescribe` inherits `no_panic` from its enclosing module while
+   `DMod` re-derives it. So each gate would need its own "ignore this node"
+   arm plus per-form inheritance metadata: the same one-cell-at-a-time
+   discipline the idea was meant to replace, plus a node that silently
+   under-informs Check 1.
+
+4. **The coverage on offer is smaller than the form list suggests.** `DApp`
+   — the form with the most reachable bodies — is desugared to a real
+   `DFn __app_init__` before `--emit-core-ast`, so it is already covered as
+   an ordinary `dfn` and already agrees with march.
+
+The correct structural protection is the class-(a)/(b) invariant stated in
+`CapCheck`'s module docstring, enforced by keeping `Decl.hasUnsupported`'s
+match wildcard-free, so adding a `Decl` constructor is a compile error that
+forces an explicit decision. -/
 inductive Decl where
   /-- Function declaration, modeled N-ARILY to match march's `DFn` faithfully
   (`params : List`, a clause's full parameter list). No currying — the whole

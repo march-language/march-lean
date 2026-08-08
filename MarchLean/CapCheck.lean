@@ -19,6 +19,76 @@ undeclared capability. Check 8 is the one exception carved out of that cost:
 a `*_migrate_state` fn's body IS scanned (`bodyCallsIO`), because march's own
 Check 8 scans it too (via `env.own_cap_closures`) — see that check's
 docstring for the fidelity gaps that remain even there.
+
+## Declaration-form coverage, and the invariant that makes it safe
+
+Every gate below scans `Decl.dfn` and (division safety only) `Decl.dlet`.
+That is not an accident of march's checkers happening to be `DFn`-only today,
+and it does NOT turn into a false accept when march widens one of them. What
+protects it is:
+
+> **Invariant.** A march declaration form is either (a) covered here by every
+> ERROR-level check march applies to it, or (b) decoded to
+> `Decl.unsupported`, whose `Decl.hasUnsupported = true` forces
+> `Compare.inferModule`'s whole-file skip gate — which every path to exit 0
+> passes through (`MarchLeanCheck.run`).
+
+Class (b) is a *safe* answer, not a silent one: march rejects, this checker
+exits 2. Widening a march walk to a class-(b) form moves our verdict from
+skip to skip. The real fragility runs the other way — moving a form from (b)
+into (a), i.e. decoding it in fragment, WITHOUT auditing every check march
+applies to it. `Decl.hasUnsupported`'s match is wildcard-free for exactly
+this reason (march's own `division_safety.ml` keeps the same discipline: "a
+25th decl form is a COMPILE ERROR here rather than another silent hole").
+
+The table below was re-derived against the live march source and verified
+with hand-built probes against both binaries. `march` = the decl forms march
+scans; `here` = what this file scans; verdict = what a file placing the
+violation in a form we do not scan actually produces.
+
+| check | march scans | here | probe verdict |
+|---|---|---|---|
+| Check 1 (`needs` coverage) | `DFn` sig, `DActor` handler sigs, `DExtern` | `dfn` params+ret, `dextern` (via Check 5) | `DActor` → (march 1, here 2) skip |
+| Check 4 (`use` transitive) | `DUse` | `duse` | no gap |
+| Check 5 (extern cap) | `DExtern` | `dextern` | no gap |
+| Check 6 (proof-cap minting) | `DFn` | `dfn` | **was (1,0) FALSE ACCEPT — now modelled** |
+| Check 7 (realtime) | `DFn` | `dfn` | no gap |
+| Check 8 (migrate IO-free) | `DFn`, `DExtern` fns | `dfn`, `dextern` | no gap |
+| `cap pure` | `DFn` | `dfn` | no gap (march ACCEPTS `println` in `DLet`/`DTest`/`DImpl`) |
+| `cap deterministic` | `DFn` | `dfn` | no gap |
+| `cap no_extern` | `DExtern`, `DNeeds` | `dextern`, `declaredNeeds` | no gap |
+| `cap no_alloc` | `DFn` (+`DMod` recursion) | `dfn` (+`dmod`) | no gap (march ACCEPTS a tuple in `DLet`/`DTest`) |
+| `no_panic` explicit panic | `DFn` | `dfn` | no gap (march ACCEPTS `panic()` in a `DLet`) |
+| `no_panic` exhaustiveness | `DFn`, by span containment in `fn_span` | `dfn` | no gap (a non-exhaustive match in `DLet`/`DTest` is a march WARNING) |
+| `no_panic` division safety | `DFn`, `DLet`, `DMod`, `DDescribe`, `DImpl`, `DInterface` defaults, `DActor` init/handlers/invariant, `DApp`, `DTest`, `DSetup`, `DSetupAll` | `dfn`, `dlet`, `dmod` | every remaining form → (march 1, here 2) skip |
+
+Each class-(b) cell was probed individually and confirmed to give march exit
+1 with the intended diagnostic against this checker's exit 2: `DImpl`
+(`specs/lang/types/reject/t120`), `DTest`, `DDescribe`, `DSetup`,
+`DSetupAll`, `DActor` init, `DActor` handler, `DInterface` default body, and
+`DActor` handler signatures for Check 1.
+
+`DApp` is the one apparent exception, and it resolves the other way: an `app`
+block is DESUGARED into a real `DFn __app_init__` before `--emit-core-ast`
+runs, so a `10 / 0` in `on_start` under `cap no_panic` is already caught here
+as an ordinary `dfn` (verified: march 1, here 1; the guarded and no-`cap`
+variants accept on both sides). march's `DApp` arm in `division_safety.ml`
+never sees the shape we are handed.
+
+Multi-clause `fn`s are desugared the same way — to a SINGLE clause with an
+`EMatch` body — so the "0 or 2+ clauses" arm of `Elab.decodeDecl` is
+unreachable from real emitter output, and march's own cross-clause parameter
+concatenation in Checks 1/6/7 never has more than one clause to concatenate.
+Verified: `fn handle(0) … end / fn handle(c : Cap(IO.Network)) … end` with no
+`needs` at all is march exit 0, because the desugared clause drops that
+annotation for march too. Comments elsewhere in this file that describe a
+multi-clause fn as "escaping" a scan via `Decl.unsupported` describe a path
+that real emitter output never takes; the resulting verdict agrees with march
+either way.
+
+**A declaration-level `Term.opaque_` analogue was evaluated and rejected** —
+see `Syntax.Decl`'s docstring for why carrying an out-of-fragment decl's
+child terms would generate false REJECTS rather than close the class.
 -/
 namespace MarchLean.CapCheck
 open MarchLean.Syntax
@@ -364,14 +434,18 @@ change is needed here.
    attribution does — but Check 8 only ever tests `own_caps <> []` (ANY
    non-empty list), never which specific caps are in it, so that distinction
    is irrelevant to the verdict here.
-3. A multi-clause fn (0 or 2+ clauses) whose name ends in `_migrate_state`
-   decodes to `Decl.unsupported` (`Elab.lean`), never a `dfn` — it is
-   therefore never seen by this scan at all and escapes Check 8 entirely.
-   Safe in practice (the file is driven to skip downstream via the
-   out-of-fragment gate before this would matter), but worth recording
-   alongside the other two gaps above. march, by contrast, concatenates
-   parameters across all clauses of a multi-clause fn
-   (`typecheck.ml:7172-7178`, `:6853-6857`) and checks the merged signature. -/
+3. ~~A multi-clause fn escapes this scan via `Decl.unsupported`.~~ **NOT a
+   gap — this entry was stale and is retracted.** march DESUGARS a
+   multi-clause `fn` into a SINGLE clause with an `EMatch` body before
+   `--emit-core-ast` runs, so the "0 or 2+ clauses" arm of
+   `Elab.decodeDecl` is unreachable from real emitter output and a
+   multi-clause `*_migrate_state` arrives here as an ordinary `dfn`.
+   Verified end-to-end: a two-clause `counter_migrate_state` calling
+   `println` is march exit 1 and exit 1 here, agreeing. march's
+   cross-clause parameter concatenation (`typecheck.ml:7172-7178`,
+   `:6853-6857`) likewise never has more than one clause to concatenate,
+   because its capability checks also run post-desugar — see the
+   decl-form-coverage section of this module's docstring. -/
 partial def bodyCalls (banned : List String) : Term → Bool
   | .lit _ _ => false
   | .var _ _ _ => false
@@ -1606,12 +1680,16 @@ def checkOneModule (modName : String) (decls : List Decl)
   -- hold allocation-, IO-, or panic-capable capabilities. Signature-level
   -- only (`dfn` param annotations) — this checker does not scan bodies
   -- (that is Check 1b, warning-only in march and deliberately not modelled;
-  -- see the module docstring above). Also, as with Check 8 (see
-  -- `bodyCallsIO`'s docstring), a multi-clause fn (0 or 2+ clauses) whose
-  -- name would otherwise match decodes to `Decl.unsupported`, never a
-  -- `dfn` — it is never seen by this scan and escapes Check 7 entirely;
-  -- march instead concatenates params across all clauses
-  -- (`typecheck.ml:7172-7178`, `:6853-6857`) before checking.
+  -- see the module docstring above). A previous version of this comment
+  -- claimed a multi-clause fn escapes this scan via `Decl.unsupported`;
+  -- that was stale and is retracted — march desugars a multi-clause `fn`
+  -- to a SINGLE clause before `--emit-core-ast`, so one arrives here as an
+  -- ordinary `dfn`, and march's own cross-clause param concatenation
+  -- (`typecheck.ml:7172-7178`, `:6853-6857`) never sees more than one
+  -- clause either. Verified: `fn tick(t : Tagged(Int, Realtime), 0) … end /
+  -- fn tick(t2, c : Cap(IO)) … end` is march exit 0 and exit 0 here — the
+  -- desugared clause drops both annotations for march too. See the
+  -- decl-form-coverage section of this module's docstring.
   --
   -- Both predicates below require their inner constructor to be NULLARY,
   -- matching march's own patterns exactly:
