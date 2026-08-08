@@ -1146,6 +1146,42 @@ partial def patCoveredCtors : Pattern → List String
   | .con name _ => [bareCtorName name]
   | .wild | .var _ _ | .tuple _ | .lit _ | .record _ | .unsupported => []
 
+/-- The scrutinee type names for which march's `find_missing_mc` takes its
+INFINITE-DOMAIN branch — `| TCon (("Int" | "Float" | "String" | "Char" |
+"Atom"), _) -> …` (`typecheck.ml:4375`), transcribed verbatim. That branch
+runs only AFTER the `has_first_wild` test above it has already failed, and it
+then reports the column as missing unconditionally: there is no finite
+constructor set to enumerate, so nothing but a wildcard row can cover such a
+scrutinee. -/
+def infiniteDomainTyNames : List String :=
+  ["Int", "Float", "String", "Char", "Atom"]
+
+/-- The boolean literals `p` covers, peeling `as` and unioning an `or_`'s
+alternatives exactly as `patCoveredCtors` does (and for the same reason:
+`norm_pat_all` expands a `PatOr` into one row per alternative, so
+`true | false` yields both `SPLit` rows). Only `Bool` needs this — it is the
+one type whose `find_missing_mc` branch enumerates LITERALS rather than
+constructors. -/
+partial def patCoveredBoolLits : Pattern → List Bool
+  | .as _ p => patCoveredBoolLits p
+  | .or_ alts => alts.flatMap patCoveredBoolLits
+  | .lit (.bool b) => [b]
+  | .wild | .var _ _ | .con _ _ | .tuple _ | .lit _ | .record _ | .unsupported => []
+
+/-- Is `p` a shape the `Bool` coverage test below actually models — a boolean
+literal, through any depth of `as`/`or_`? This is the `Bool` analogue of
+`isModeledArmPattern`: anything else on a guardless arm means this checker
+cannot account for what the arm covers, and per the safety-net rule its
+presence must read as "cannot judge" (⇒ exhaustive), never as "does not
+cover". At a `Bool` scrutinee no other shape is well-typed, so this should be
+unreachable; it is here so that a decoder change which ever makes it
+reachable fails CONSERVATIVE instead of manufacturing a reject. -/
+partial def isBoolLitPattern : Pattern → Bool
+  | .as _ p => isBoolLitPattern p
+  | .or_ alts => alts.all isBoolLitPattern
+  | .lit (.bool _) => true
+  | .wild | .var _ _ | .con _ _ | .tuple _ | .lit _ | .record _ | .unsupported => false
+
 /-- Is a `match_`'s arm list exhaustive over `scrutTy`, per march's
 `check_exhaustiveness` restricted to the guardless-coverage fragment it falls
 back to whenever any arm carries a `when` guard (`typecheck.ml:4546-4581`:
@@ -1211,25 +1247,34 @@ become reachable for `Option`/tuple-headed scrutinees the moment the
 Task 3` fixtures below) is ever closed and such matches stop being screened
 out upstream.
 
-**Known false-accept class (Finding I2, documented not fixed):** a
-`Pattern.lit` arm list over a non-ADT scrutinee (`Int`/`String`/`Float`) has
-no built-in/user ctor set to test against at all — but that mismatch is never
-even reached: `Pattern.lit` is not one of `isModeledArmPattern`'s recognized
-forms, so the SAFETY NET above fires FIRST on the unmodelled `.lit` pattern
-and short-circuits to "exhaustive" before `headTypeName`/`scrutTy` are
-consulted at all — this checker EXITS 0 on it either way. march, by
-contrast, DOES exhaustiveness-check literal patterns against a scrutinee's
-structure (`check_exhaustiveness`
-handles `PatLit` rows) and rejects `match n do 0 -> 1; 1 -> 2 end` (no
-catch-all) as non-exhaustive. This is therefore a live false-accept class,
-not merely a "skip" as an earlier draft of this docstring implied — `Int`/
-`String`/`Float` matches are otherwise fully in-fragment (they reach this
-gate at all, rather than being screened out by `hasUnsupported` upstream),
-so the unknown-type carve-out's conservatism here produces a genuine
-divergence from march, not an out-of-fragment skip. Left unfixed
-deliberately: narrowing the unknown-type rule to close this gap risks
-reintroducing a false reject elsewhere (the exact failure mode C1/C2 already
-demonstrated), which this differential oracle must never manufacture.
+**Finding I2 — FIXED (see the two branches at the head of the body below).**
+A `Pattern.lit` arm list over a non-ADT scrutinee used to reach nothing at
+all: `Pattern.lit` is not one of `isModeledArmPattern`'s recognized forms, so
+the SAFETY NET fired FIRST on the unmodelled `.lit` and short-circuited to
+"exhaustive" before `headTypeName`/`scrutTy` were consulted, and `Bool` — not
+registered in `builtinCtors` — fell through the `find?` to the unknown-type
+carve-out and got the same answer. march rejects both
+(`match n do 0 -> 1; 1 -> 2 end` on an `Int`, `match b do true -> 1 end` on a
+`Bool`; verified directly), so this was a live false-accept class, not a
+skip: such matches are fully in-fragment and reach this gate rather than
+being screened out by `hasUnsupported` upstream.
+
+The reason it is now safe to close — and why doing so does NOT contradict the
+general-conservatism rule below — is that these two scrutinee types are ones
+march decides OUTRIGHT. `find_missing_mc` needs no `env`, no module-scoped
+ctor resolution and no row budget for them: it tests `has_first_wild`, and
+then either reports missing unconditionally (`Int`/`Float`/`String`/`Char`/
+`Atom` — an infinite domain) or checks for both boolean literals (`Bool`).
+Neither the ctor universe nor the or-expansion policy — the two RECONSTRUCTED
+inputs that rule is about — is an input to that decision. The one input that
+is, the wildcard test, is the one this checker genuinely models
+(`isCatchAllPattern` ↔ `norm_pat`'s `SPWild`, a correspondence worked through
+in that function's docstring).
+
+Still open, and still deliberately not fixed, is Finding I1 above: coverage
+is compared only at the TOP level, so a `(Bool, Bool)` tuple scrutinee
+matched by `(true, true)` alone is judged exhaustive here and rejected by
+march. That one really does need the full pattern matrix.
 
 ---
 
@@ -1304,6 +1349,58 @@ def matchExhaustive (scrutTy : Ty) (userCtors : List (String × List String))
   let isCatchAll : Pattern × Option Term × Term → Bool := fun (p, g, _) =>
     g.isNone && isCatchAllPattern p
   if arms.any isCatchAll then true
+  -- FINDING I2, now FIXED. A non-ADT scrutinee is not an unresolvable type
+  -- this checker must decline on — it is a type whose coverage rule march
+  -- states OUTRIGHT, with no `env` lookup, no module-scoped ctor resolution
+  -- and no row budget to reconstruct. `find_missing_mc` tests
+  -- `has_first_wild` FIRST (a row starting `SPWild`, i.e. exactly what
+  -- `isCatchAllPattern` computes: `norm_pat`/`norm_pat_all` emit `SPWild`
+  -- for `PatWild`/`PatVar` and for nothing else, peeling `PatAs` and either
+  -- distributing or widening `PatOr` — see `isCatchAllPattern`'s docstring,
+  -- which already mirrors that correspondence for the ADT case). Only when
+  -- that fails does it dispatch on the scrutinee type, and for
+  -- `Int`/`Float`/`String`/`Char`/`Atom` it then reports the column missing
+  -- UNCONDITIONALLY (`typecheck.ml:4375-4381`). So past the catch-all test
+  -- above, march's answer for such a scrutinee is "non-exhaustive", full
+  -- stop — independent of the arm patterns' shapes, which is why the
+  -- `isModeledArmPattern` safety net is deliberately NOT consulted first
+  -- here: there is no shape whose meaning we could be getting wrong, only a
+  -- wildcard row that is either present or absent.
+  --
+  -- This closes a live FALSE-ACCEPT class, verified directly against march
+  -- inside `cap no_panic`: `match n do 0 -> ..; 1 -> .. end` on an `Int`,
+  -- `match s do "a" -> ..; "b" -> .. end` on a `String`, and
+  -- `match x do 1.0 -> ..; 2.0 -> .. end` on a `Float` are all rejected
+  -- ("contains a non-exhaustive `match`"), and all three were accepted here
+  -- because `Pattern.lit` is not an `isModeledArmPattern` shape, so the
+  -- safety net short-circuited to "exhaustive" before the scrutinee type was
+  -- ever consulted.
+  --
+  -- This does NOT violate the general-conservatism rule below. That rule
+  -- governs the two inputs this checker RECONSTRUCTS (the ctor universe and
+  -- the or-expansion policy); neither is an input here. The wildcard test is
+  -- the one input this checker genuinely models, and it is the only one this
+  -- branch depends on.
+  else if (headTypeName scrutTy).any infiniteDomainTyNames.contains then false
+  -- `Bool` is the other type `find_missing_mc` decides outright, and the only
+  -- one it decides by enumerating LITERALS: it has exactly two values, so
+  -- (past the catch-all test) the match is exhaustive iff both the `true` and
+  -- the `false` literal appear on a GUARDLESS arm (`typecheck.ml:4363-4374`).
+  -- `Bool` is deliberately absent from `builtinCtors` (see its docstring), so
+  -- before this branch a `Bool` scrutinee fell through the `find?` below to
+  -- the unknown-type carve-out and was always judged exhaustive — a false
+  -- accept for `match b do true -> 1 end`, verified against march.
+  --
+  -- Unlike the infinite-domain branch, this one DOES read arm shapes (it
+  -- counts which literals are present), so it keeps a safety net: if any
+  -- guardless arm is not a boolean literal, this checker cannot say what it
+  -- covers and declines (exhaustive) rather than guess.
+  else if headTypeName scrutTy == some "Bool" then
+    if arms.any (fun (p, g, _) => g.isNone && !isBoolLitPattern p) then true
+    else
+      let lits := arms.flatMap (fun (p, g, _) =>
+        if g.isSome then [] else patCoveredBoolLits p)
+      lits.contains true && lits.contains false
   else if arms.any (fun (p, g, _) => g.isNone && !isModeledArmPattern p) then true
   else
     let covered : List String :=
@@ -4122,9 +4219,7 @@ def letTrailingDivNonZero : Module := {
 example : (checkCaps letTrailingDivNonZero).isViolation = false := by native_decide
 
 /-- Sibling walk `matchesIn`: a non-exhaustive `match` in a trailing let's
-RHS. (An `Int` scrutinee would NOT pin this — `matchExhaustive` is
-deliberately conservative there and answers "exhaustive"; only a user ADT
-whose constructors it can enumerate exercises the walk.) -/
+RHS, over a user ADT whose constructors `matchExhaustive` can enumerate. -/
 def letTrailingNonExhaustiveMatch : Module := {
   decls := [
   colorDType,
@@ -4164,5 +4259,91 @@ def letDestructuringBinderClean : Module := opqPureMod
     opqIntTy)
 #eval checkCaps letDestructuringBinderClean   -- expect: ok
 example : (checkCaps letDestructuringBinderClean).isViolation = false := by native_decide
+
+-- ── Non-ADT scrutinee exhaustiveness (FINDING I2, fixed) ────────────────────
+--
+-- Every fixture below was run against march directly (`--check`, exit 0 =
+-- accept / 1 = reject) as the `mod P do cap no_panic … end` program its
+-- comment quotes; the `expect:` line records march's own verdict, not this
+-- checker's preference. Before the fix the four rejecting cases all ACCEPTED
+-- here, because `Pattern.lit` is not an `isModeledArmPattern` shape and the
+-- safety net short-circuited to "exhaustive" before the scrutinee type was
+-- consulted.
+
+/-- Build a `cap no_panic` module wrapping a single `match` on `x : ty`. -/
+def npMatchMod (ty : Ty) (arms : List (Pattern × Option Term × Term)) : Module := {
+  decls := [Decl.dmod "NE" [
+    Decl.dopts ["no_panic"],
+    Decl.dfn "f" [("x", Lin.unrestricted, none)] none
+      (Term.match_ (Term.var "x" opqSp ty) arms opqIntTy)]],
+  schemes := [], insts := [], moduleCaps := [] }
+
+def npArm (l : Lit) : Pattern × Option Term × Term := (Pattern.lit l, none, opqInert)
+
+/-- `match n do 0 -> ..; 1 -> .. end` on an `Int`. march REJECTS. -/
+def neIntLits : Module := npMatchMod opqIntTy [npArm (.int 0), npArm (.int 1)]
+#eval checkCaps neIntLits   -- expect: violation naming no_panic
+example : (checkCaps neIntLits).isViolation = true := by native_decide
+
+/-- Teeth: the SAME shape with a `_` catch-all. march ACCEPTS. -/
+def neIntWild : Module :=
+  npMatchMod opqIntTy [npArm (.int 0), (Pattern.wild, none, opqInert)]
+#eval checkCaps neIntWild   -- expect: ok
+example : (checkCaps neIntWild).isViolation = false := by native_decide
+
+/-- A bare VAR arm is march's other `SPWild` row (`norm_pat`'s `PatVar ->
+SPWild`), so it catches all just like `_`. march ACCEPTS. -/
+def neIntVar : Module :=
+  npMatchMod opqIntTy [npArm (.int 0), (Pattern.var "k" Lin.unrestricted, none, opqInert)]
+#eval checkCaps neIntVar   -- expect: ok
+example : (checkCaps neIntVar).isViolation = false := by native_decide
+
+/-- `match s do "a" -> ..; "b" -> .. end` on a `String`. march REJECTS. -/
+def neStringLits : Module :=
+  npMatchMod (Ty.con "String" []) [npArm (.str "a"), npArm (.str "b")]
+#eval checkCaps neStringLits   -- expect: violation naming no_panic
+example : (checkCaps neStringLits).isViolation = true := by native_decide
+
+/-- `match x do 1.0 -> ..; 2.0 -> .. end` on a `Float`. march REJECTS. -/
+def neFloatLits : Module :=
+  npMatchMod (Ty.con "Float" []) [npArm (.float "1.0"), npArm (.float "2.0")]
+#eval checkCaps neFloatLits   -- expect: violation naming no_panic
+example : (checkCaps neFloatLits).isViolation = true := by native_decide
+
+/-- `match b do true -> .. end` — one of `Bool`'s two values. march REJECTS. -/
+def neBoolOne : Module := npMatchMod (Ty.con "Bool" []) [npArm (.bool true)]
+#eval checkCaps neBoolOne   -- expect: violation naming no_panic
+example : (checkCaps neBoolOne).isViolation = true := by native_decide
+
+/-- Teeth: both `Bool` literals present is EXHAUSTIVE — the branch must count
+literals, not simply reject every `Bool` match. march ACCEPTS. -/
+def neBoolBoth : Module :=
+  npMatchMod (Ty.con "Bool" []) [npArm (.bool true), npArm (.bool false)]
+#eval checkCaps neBoolBoth   -- expect: ok
+example : (checkCaps neBoolBoth).isViolation = false := by native_decide
+
+/-- Both literals reached through one OR-pattern (`true | false`), which
+`norm_pat_all` expands into two `SPLit` rows. march ACCEPTS. -/
+def neBoolOr : Module :=
+  npMatchMod (Ty.con "Bool" [])
+    [(Pattern.or_ [Pattern.lit (.bool true), Pattern.lit (.bool false)], none, opqInert)]
+#eval checkCaps neBoolOr   -- expect: ok
+example : (checkCaps neBoolOr).isViolation = false := by native_decide
+
+/-- A GUARDED arm contributes nothing to guaranteed coverage, so `true` behind
+a guard plus a bare `false` still misses `true`. march REJECTS. -/
+def neBoolGuardedTrue : Module :=
+  npMatchMod (Ty.con "Bool" [])
+    [(Pattern.lit (.bool true), some (Term.lit (Lit.bool true) (Ty.con "Bool" [])), opqInert),
+     npArm (.bool false)]
+#eval checkCaps neBoolGuardedTrue   -- expect: violation naming no_panic
+example : (checkCaps neBoolGuardedTrue).isViolation = true := by native_decide
+
+/-- A scrutinee type this checker cannot name at all (a type VARIABLE) still
+declines — the new branches key off a head type NAME and must not widen the
+unknown-type carve-out. -/
+def neUnknownScrut : Module := npMatchMod (Ty.var 0) [npArm (.int 0)]
+#eval checkCaps neUnknownScrut   -- expect: ok
+example : (checkCaps neUnknownScrut).isViolation = false := by native_decide
 
 end MarchLean.CapCheck
