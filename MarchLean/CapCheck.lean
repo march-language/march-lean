@@ -1344,6 +1344,34 @@ def checkOneModule (modName : String) (decls : List Decl)
   let retCaps :=
     if decls.any Decl.hasUnsupported then [] else decls.flatMap capsInReturnSignature
   let sigCaps := decls.flatMap capsInSignature ++ retCaps
+  -- R2 (march main): `root_cap` cannot be REFERENCED. It remains bound, at
+  -- type `Cap(IO)` (`Infer.lean` keeps it, exactly as march keeps the name
+  -- bound at `typecheck.ml:5118-5125` so a single mistake reports one
+  -- capability error rather than cascading unification failures) — only
+  -- naming it is refused, because the root is granted to `main` at the
+  -- boundary rather than taken from an ambient global.
+  --
+  -- march exempts four contexts via `env.root_cap_allowed`: a `DTest` body
+  -- (`:11741`), `DSetup` (`:11756`), `DSetupAll` (`:11765`), and the REPL
+  -- entry (`:12795`). **All four decode to `Decl.unsupported` here** (see
+  -- `Elab.decodeDecl`), so rather than model the flag this gates on the
+  -- module being entirely in fragment — the same residual gate `retCaps`
+  -- uses above, and for the same reason. `accept/t146_root_cap_in_test_body`
+  -- narrows `root_cap` inside `describe`/`test` and is exactly the file this
+  -- gate protects: cap checks run BEFORE the skip gate (A3 design §4), so
+  -- without it that file would be a false REJECT instead of a skip.
+  --
+  -- `accept/t147_main_receives_the_root` is unaffected either way: it takes
+  -- `cap : Cap(IO)` as a parameter and never names `root_cap`.
+  let fullyInFragment := !decls.any Decl.hasUnsupported
+  let mentionsRootCap := decls.any (fun d =>
+    match d with
+    | .dfn _ _ _ body => termMentionsAny ["root_cap"] body
+    | .dlet _ rhs     => termMentionsAny ["root_cap"] rhs
+    | _               => false)
+  if fullyInFragment && mentionsRootCap then
+    .violation s!"R2: `root_cap` cannot be referenced in module `{modName}` — the root capability is granted to `main`, not taken"
+  else
   -- Finding I1: a cap in `selfDeclaredCaps` is covered regardless of
   -- `needs` — march's self-declaration exemption (`typecheck.ml:6966-6970`)
   -- lets a proof cap's own declaring module use it in its own signatures
@@ -1784,6 +1812,45 @@ def siblingViolation : Module := {
   schemes := [], insts := [], moduleCaps := [] }
 #eval checkCaps siblingViolation
   -- expect: violation — IO.FileWrite not covered by IO.FileRead
+
+/-- reject/t152: naming `root_cap` in an ordinary function body is an R2
+violation, even in a module whose `needs` are fully declared. -/
+def rootCapReferenced : Module := {
+  decls := [Decl.dmod "TakesTheRoot" [
+    Decl.dneeds ["IO"],
+    Decl.dfn "main" [] none
+      (Term.let_ "stolen" Lin.unrestricted none
+        (Term.var "root_cap" ⟨"f",0,0,0,0⟩ (Ty.con "Cap" [Ty.con "IO" []]))
+        (Term.lit Lit.unit (Ty.con "Unit" []))
+        (Ty.con "Unit" []))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps rootCapReferenced
+  -- expect: violation — R2
+
+/-- accept/t147: `main` RECEIVES the root as a parameter and never names
+`root_cap`. Guards the R2 check against rejecting the legitimate shape. -/
+def rootCapReceived : Module := {
+  decls := [Decl.dmod "GrantedRoot" [
+    Decl.dneeds ["IO"],
+    Decl.dfn "main" [("cap", Lin.unrestricted, some (Ty.con "Cap" [Ty.con "IO" []]))]
+      none (Term.lit Lit.unit (Ty.con "Unit" []))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps rootCapReceived
+  -- expect: ok
+
+/-- accept/t146's shape: `root_cap` IS nameable in a test body, which march
+permits via `root_cap_allowed`. Here the enclosing `describe`/`test` decodes
+to `Decl.unsupported`, so the fragment gate must defer rather than reject —
+otherwise this is a false REJECT, since cap checks precede the skip gate. -/
+def rootCapInUnsupportedContext : Module := {
+  decls := [Decl.dmod "TestBodyCaps" [
+    Decl.dneeds ["IO"],
+    Decl.unsupported,
+    Decl.dfn "helper" [] none
+      (Term.var "root_cap" ⟨"f",0,0,0,0⟩ (Ty.con "Cap" [Ty.con "IO" []]))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps rootCapInUnsupportedContext
+  -- expect: NOT a violation (defers; the file skips downstream)
 
 /-- reject/t149: `Cap(IO.NetConnect)` in a VARIANT CONSTRUCTOR ARGUMENT under
 `needs IO.Console`. march reports Check 1 here (`typecheck.ml:8813`); before
