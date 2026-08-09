@@ -172,6 +172,63 @@ def capsInReturnSignature : Decl → List String
       match retAnnot with | some t => capsInTy t | none => []
   | _ => []
 
+/-- Every capability named by a type ANNOTATION inside an expression: a `let`
+binding's annotation, and a lambda's or local function's parameter
+annotations. Mirrors march's `cap_annots_in_expr` (`typecheck.ml:8109-8180`).
+
+**Why bodies at all.** Check 1 historically read function SIGNATURES only, so
+a capability named inside a body escaped `needs` entirely. march's own note
+records the route that made it reachable: `root_cap` was ambient, so a module
+declaring only `IO.Console` could narrow the root to `Cap(IO.FileWrite)` and
+bind it without ever putting a capability in a signature. R2 (see
+`checkOneModule`'s root-cap gate) closed that particular route, but not the
+hole — a LAMBDA PARAMETER annotation needs no capability VALUE at all, only
+the type name, so it survives R2 untouched. That is
+`reject/t151_cap_body_annotation_undeclared`, and it was a false ACCEPT here.
+
+**Total over every `Term` constructor, with no wildcard arm**, matching
+`bodyCalls`/`bodyAllocates`/`termMentionsAny`'s discipline in this file and
+march's own stated rule for its capability walks: a walk that ends in a
+catch-all is a silent hole rather than a visible bug, and adding a `Term`
+form must break this build instead of quietly reopening the gap.
+
+march also walks an `EAnnot` type; march's own comment says the parser never
+produces one (desugar synthesizes the single instance, a `SupervisorSpec` on
+an `app` block) and there is no reject-witness for it. This `Term` has no
+`EAnnot` counterpart at all, so there is nothing to mirror. `Term.letfn`
+likewise carries no return annotation, so march's `ELetFn` return arm has no
+counterpart here; a local function's return cap is unreachable in this
+fragment. -/
+partial def capAnnotsInTerm : Term → List String
+  | .lit _ _ => []
+  | .var _ _ _ => []
+  | .app fn args _ => capAnnotsInTerm fn ++ args.flatMap capAnnotsInTerm
+  | .lam params body _ =>
+      params.flatMap (fun (_, _, annot) =>
+        match annot with | some t => capsInTy t | none => []) ++ capAnnotsInTerm body
+  | .let_ _ _ annot rhs body _ =>
+      (match annot with | some t => capsInTy t | none => []) ++
+        capAnnotsInTerm rhs ++ capAnnotsInTerm body
+  | .letfn _ _ _ paramAnnot fnBody body _ =>
+      (match paramAnnot with | some t => capsInTy t | none => []) ++
+        capAnnotsInTerm fnBody ++ capAnnotsInTerm body
+  | .ite c t e _ => capAnnotsInTerm c ++ capAnnotsInTerm t ++ capAnnotsInTerm e
+  | .con _ args _ => args.flatMap capAnnotsInTerm
+  | .tuple elems _ => elems.flatMap capAnnotsInTerm
+  | .record fields _ => fields.flatMap (fun (_, e) => capAnnotsInTerm e)
+  | .field record _ _ _ => capAnnotsInTerm record
+  | .match_ scrut arms _ =>
+      capAnnotsInTerm scrut ++
+        arms.flatMap (fun (_, g, e) =>
+          (g.map capAnnotsInTerm).getD [] ++ capAnnotsInTerm e)
+  | .unsupported _ => []
+
+/-- The caps named by type annotations inside a declaration's body. -/
+def capsInBody : Decl → List String
+  | .dfn _ _ _ body => capAnnotsInTerm body
+  | .dlet _ rhs     => capAnnotsInTerm rhs
+  | _               => []
+
 /-- The caps this module declares via `needs`. -/
 def declaredNeeds (decls : List Decl) : List String :=
   decls.flatMap (fun d => match d with | .dneeds ps => ps | _ => [])
@@ -1343,7 +1400,12 @@ def checkOneModule (modName : String) (decls : List Decl)
   -- unconditional so no existing signature-based reject changes.
   let retCaps :=
     if decls.any Decl.hasUnsupported then [] else decls.flatMap capsInReturnSignature
-  let sigCaps := decls.flatMap capsInSignature ++ retCaps
+  -- Body-annotation caps (march's `cap_annots_in_expr`, folded into the same
+  -- `cap_uses` list Check 1 consumes). Ungated, like parameters: the cap is
+  -- named concretely by an annotation the author wrote, so the
+  -- unmodeled-machinery escape `retCaps`'s gate respects does not apply.
+  let bodyCapUses := decls.flatMap capsInBody
+  let sigCaps := decls.flatMap capsInSignature ++ retCaps ++ bodyCapUses
   -- R2 (march main): `root_cap` cannot be REFERENCED. It remains bound, at
   -- type `Cap(IO)` (`Infer.lean` keeps it, exactly as march keeps the name
   -- bound at `typecheck.ml:5118-5125` so a single mistake reports one
@@ -1812,6 +1874,56 @@ def siblingViolation : Module := {
   schemes := [], insts := [], moduleCaps := [] }
 #eval checkCaps siblingViolation
   -- expect: violation — IO.FileWrite not covered by IO.FileRead
+
+/-- reject/t151: a LAMBDA PARAMETER annotation names `Cap(IO.FileWrite)`
+inside a body, under `needs IO.Console`. Needs no capability value at all —
+only the type name — so it survives R2 and is the sharpest witness that
+Check 1 must reach inside bodies. -/
+def bodyLamAnnotUncovered : Module := {
+  decls := [Decl.dmod "BodyAnnCap" [
+    Decl.dneeds ["IO.Console"],
+    Decl.dfn "main" [] none
+      (Term.let_ "take" Lin.unrestricted none
+        (Term.lam [("c", Lin.unrestricted, some (Ty.con "Cap" [Ty.con "IO.FileWrite" []]))]
+          (Term.lit (Lit.int 1) (Ty.con "Int" []))
+          (Ty.con "Unit" []))
+        (Term.lit Lit.unit (Ty.con "Unit" []))
+        (Ty.con "Unit" []))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps bodyLamAnnotUncovered
+  -- expect: violation — IO.FileWrite not covered by IO.Console
+
+/-- accept/t145's shape: the same body annotation, DECLARED. Guards the body
+walk against over-rejecting a covered `let` annotation. -/
+def bodyLetAnnotCovered : Module := {
+  decls := [Decl.dmod "BodyAnnCap" [
+    Decl.dneeds ["IO.FileWrite"],
+    Decl.dfn "main" [] none
+      (Term.let_ "w" Lin.unrestricted (some (Ty.con "Cap" [Ty.con "IO.FileWrite" []]))
+        (Term.lit Lit.unit (Ty.con "Unit" []))
+        (Term.lit Lit.unit (Ty.con "Unit" []))
+        (Ty.con "Unit" []))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps bodyLetAnnotCovered
+  -- expect: ok
+
+/-- The body walk reaches through nesting, not just the outermost node —
+a cap annotation buried in a match arm inside a tuple still counts. -/
+def bodyAnnotNestedUncovered : Module := {
+  decls := [Decl.dmod "Deep" [
+    Decl.dneeds ["IO.Console"],
+    Decl.dfn "f" [] none
+      (Term.tuple [
+        Term.match_ (Term.lit (Lit.int 0) (Ty.con "Int" []))
+          [(Pattern.wild, none,
+            Term.lam [("c", Lin.unrestricted, some (Ty.con "Cap" [Ty.con "IO.Network" []]))]
+              (Term.lit (Lit.int 1) (Ty.con "Int" []))
+              (Ty.con "Unit" []))]
+          (Ty.con "Unit" [])]
+        (Ty.con "Unit" []))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps bodyAnnotNestedUncovered
+  -- expect: violation — IO.Network, found through tuple + match arm + lambda
 
 /-- reject/t152: naming `root_cap` in an ordinary function body is an R2
 violation, even in a module whose `needs` are fully declared. -/
