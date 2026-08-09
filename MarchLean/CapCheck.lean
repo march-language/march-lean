@@ -121,14 +121,40 @@ partial def capsInTy : Ty → List String
   | .lin _ t    => capsInTy t
   | _           => []
 
-/-- The caps a declaration's PARAMETER signature mentions. Only signatures
-matter for Check 1 — body uses are Check 1b, which is warning-only and not
-implemented. Return-type caps are handled separately by
-`capsInReturnSignature` (they are gated differently — see `checkOneModule`). -/
+/-- The caps a declaration's PARAMETER signature mentions, plus the caps named
+inside a TYPE DECLARATION's constructor arguments. Return-type caps are handled
+separately by `capsInReturnSignature` (they are gated differently — see
+`checkOneModule`).
+
+**Type declarations.** march's `check_module_needs` builds one `cap_uses` list
+over every decl form, and `DType`/`DAlwaysLinearType` contribute
+`Cap_surface_ty.caps_in_type_def td` to it (`typecheck.ml:8813-8814`) — a
+capability named in a variant constructor argument is a *use* of that
+capability, treated exactly like one in a function signature. march's own
+comment records that these arms were previously swallowed by a `| _ -> []`
+wildcard, so `type Handle = { tok : Cap(IO.FileWrite) }` under `needs
+IO.Console` typechecked clean; `reject/t148`-`t150` are the regression tests.
+This checker had the same hole and it was a live FALSE ACCEPT on
+`reject/t149_cap_variant_arg_undeclared` and
+`reject/t144_cap_derive_json_variant_arg`.
+
+Scanned UNGATED, like parameters and unlike return annotations: the cap is
+named concretely in the constructor's argument type, so there is no
+unmodeled-machinery escape hatch of the kind `capsInReturnSignature`'s gate
+exists to respect.
+
+Only `argTys` are scanned, matching `caps_in_type_def`'s `TDVariant` arm
+(`List.concat_map caps_in_ty v.var_args`) — a constructor's `resultTy` is
+this checker's own synthesized `Ty.con name [params]`, not surface syntax the
+author wrote, and march has no counterpart to it. `TDRecord` and `TDAlias`
+decode to `Decl.unsupported` (`Elab.lean`'s `DType` arm), so those two of
+`caps_in_type_def`'s three arms are reached as whole-file skips rather than
+here — honest, and why `reject/t148`/`t150` skip instead of matching. -/
 def capsInSignature : Decl → List String
   | .dfn _ params _ _ =>
       params.flatMap (fun (_, _, annot) =>
         match annot with | some t => capsInTy t | none => [])
+  | .dtype _ _ ctors => ctors.flatMap (fun c => c.argTys.flatMap capsInTy)
   | _ => []
 
 /-- The caps a declaration's RETURN-type annotation mentions. march's Check 1
@@ -1758,6 +1784,44 @@ def siblingViolation : Module := {
   schemes := [], insts := [], moduleCaps := [] }
 #eval checkCaps siblingViolation
   -- expect: violation — IO.FileWrite not covered by IO.FileRead
+
+/-- reject/t149: `Cap(IO.NetConnect)` in a VARIANT CONSTRUCTOR ARGUMENT under
+`needs IO.Console`. march reports Check 1 here (`typecheck.ml:8813`); before
+`capsInSignature` grew its `dtype` arm this was a false ACCEPT. -/
+def typeCtorArgUncovered : Module := {
+  decls := [Decl.dmod "VariantCap" [
+    Decl.dneeds ["IO.Console"],
+    Decl.dtype "Conn" [] [
+      { name := "Idle", argTys := [], resultTy := Ty.con "Conn" [] },
+      { name := "Live", argTys := [Ty.con "Cap" [Ty.con "IO.NetConnect" []]],
+        resultTy := Ty.con "Conn" [] }]]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps typeCtorArgUncovered
+  -- expect: violation — IO.NetConnect not covered by IO.Console
+
+/-- accept/t144's shape: the same variant-argument cap, but DECLARED. Guards
+against the `dtype` arm over-rejecting a covered type declaration. -/
+def typeCtorArgCovered : Module := {
+  decls := [Decl.dmod "VariantCap" [
+    Decl.dneeds ["IO.NetConnect"],
+    Decl.dtype "Conn" [] [
+      { name := "Live", argTys := [Ty.con "Cap" [Ty.con "IO.NetConnect" []]],
+        resultTy := Ty.con "Conn" [] }]]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps typeCtorArgCovered
+  -- expect: ok
+
+/-- A broader `needs` still covers a narrower cap in a constructor argument —
+the `dtype` arm goes through the same subsumption as every other Check 1 use. -/
+def typeCtorArgCoveredByRoot : Module := {
+  decls := [Decl.dmod "VariantCap" [
+    Decl.dneeds ["IO"],
+    Decl.dtype "Conn" [] [
+      { name := "Live", argTys := [Ty.con "Cap" [Ty.con "IO.NetConnect" []]],
+        resultTy := Ty.con "Conn" [] }]]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps typeCtorArgCoveredByRoot
+  -- expect: ok
 
 /-- accept/t46: the root `needs IO` covers `Cap(IO.Network)`. -/
 def rootCovers : Module := {
