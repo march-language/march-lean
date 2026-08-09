@@ -27,6 +27,16 @@ name: Conformance
 #     accept-side bug.
 # See those files' headers and the harness's own comments for the full
 # rationale.
+#
+# A third ledger gates a DIFFERENT question, ahead of the harness:
+#   - scripts/decoder-degraded-kinds.txt, enforced by
+#     scripts/decoder-coverage.sh, pins every march AST node "kind" that
+#     MarchLean/Elab.lean does not decode into a real modelled constructor,
+#     and exactly how it degrades. The harness cannot see this: a kind with
+#     no decoder arm just makes the file SKIP, which the harness and the
+#     skip ledger both read as expected. Two of the worst defects here
+#     (ELet, EAnnot) were precisely that, and were found by hand-probing
+#     rather than by CI.
 on:
   push:
     branches: [main]
@@ -133,6 +143,42 @@ jobs:
       # march *runtime* dependency, not a build dependency.
       - name: Install z3
         run: sudo apt-get install -y z3
+
+      # Decoder-coverage gate. Runs BEFORE the conformance harness on
+      # purpose: it re-checks nothing in Lean (it only runs --emit-core-ast
+      # and compares two sets), so it finishes in a couple of minutes where
+      # the harness takes 15-20, and a decoder gap should surface in that
+      # first couple of minutes rather than at the end of a long run.
+      #
+      # It catches a failure mode the harness structurally CANNOT. When
+      # MarchLean/Elab.lean has no arm for a "kind" march emits, the node
+      # decodes to `Term.unsupported`, `hasUnsupported` goes true, and
+      # march-lean-check honestly exits 2 — a SKIP, which the harness treats
+      # as expected (see its A1/A2 note). The skip ledger then observes only
+      # that the file's skip status is unchanged. Nothing anywhere reports
+      # that the REASON for the skip is a hole in the decoder. That is
+      # exactly how ELet and EAnnot survived: both silently discarded a
+      # child expression and blinded the CapCheck capability walks, and both
+      # were eventually found by hand-probing rather than by CI.
+      #
+      # Same four corpora and the same flag names the harness gets, so the
+      # two can never drift onto different inputs. --histogram prints kind
+      # -> occurrence counts into the log for auditing; it is worth the few
+      # lines, because rarity is the signal here (EAnnot occurs exactly ONCE
+      # across all 334 files, so a corpus sweep is the only thing likely to
+      # witness it). --jobs 4 matches the runner's core count:
+      # --emit-core-ast costs about a second of fixed startup per file
+      # regardless of file size, so the sweep is entirely process-bound and
+      # parallelises linearly.
+      - name: Check decoder coverage
+        run: |
+          scripts/decoder-coverage.sh \
+            --march-bin "$(command -v march)" \
+            --corpus-dir "$GITHUB_WORKSPACE/march-checkout/specs/lang/types" \
+            --lang-dir "$GITHUB_WORKSPACE/march-checkout/specs/lang" \
+            --march-lean-check-bin "$GITHUB_WORKSPACE/.lake/build/bin/march-lean-check" \
+            --jobs 4 \
+            --histogram
 
       - name: Run conformance harness
         run: |

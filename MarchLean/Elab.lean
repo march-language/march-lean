@@ -617,7 +617,7 @@ carry no name into the value/type namespace); `dmod`'s own decls are walked
 separately by `flattenedBindingNames`, one scope level at a time, so `dmod`
 itself contributes nothing here. -/
 def declBindingName : Decl → Option String
-  | .dfn n _ _ _ => some n
+  | .dfn _ n _ _ _ => some n
   | .dlet n _ => some n
   | .dtype n _ _ => some n
   | .dmod _ _ | .dneeds _ | .duse _ | .dextern _ _ | .dproofcap _ | .dopts _ | .unsupported => none
@@ -652,6 +652,18 @@ partial def decodeDecl (j : Json) : Except String Decl := do
   | "DFn" => do
       let fn ← field j "fn"
       let (name, _) ← decodeName (← field fn "name")
+      -- `fn.vis` — the `fn`/`pfn` marker, emitted as `{"kind":"Public"}` /
+      -- `{"kind":"Private"}` (`ast_json.ml`'s `visibility_to_json`, threaded
+      -- from `fn_def_to_json`). Read ONLY by `CapCheck`'s Check 6, whose
+      -- same-module branch fires exclusively on a PRIVATE fn. Anything other
+      -- than a literal `"Private"` — a missing field, a non-object payload, an
+      -- unrecognised kind string — is treated as PUBLIC, the verdict-free
+      -- value: an unread `vis` can then only cost a Check 6 reject we would
+      -- otherwise have made, never manufacture one.
+      let vis : Vis :=
+        match fn.getObjVal? "vis" >>= (·.getObjVal? "kind") >>= (·.getStr?) with
+        | .ok "Private" => Vis.priv
+        | _ => Vis.pub
       -- The declared return-type annotation (`ret_ty`), decoded as `Option Ty`
       -- (`none` for an unannotated `fn` or a `null` `ret_ty`). A refinement
       -- (`{Int | _ >= 0}` → `TyRefine`), a session channel, or any other
@@ -741,12 +753,12 @@ partial def decodeDecl (j : Json) : Except String Decl := do
                 -- `{"kind":"DLet",...}`) is unaffected — it still decodes via
                 -- the separate `"DLet"` arm below to `Decl.dlet`.
                 let body ← decodeTerm bodyJ
-                .ok (Decl.dfn name [] retTy body)
+                .ok (Decl.dfn vis name [] retTy body)
             | some params =>
                 -- N-ary: carry the whole param list directly (no currying),
                 -- plus the (in-fragment) return annotation for Check 1.
                 let body ← decodeTerm bodyJ
-                .ok (Decl.dfn name params retTy body)
+                .ok (Decl.dfn vis name params retTy body)
       | _ => .ok Decl.unsupported   -- 0 or 2+ clauses: multi-clause fns unsupported
   | "DLet" => do
       let binding ← field j "binding"

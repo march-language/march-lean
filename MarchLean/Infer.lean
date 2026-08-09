@@ -1028,7 +1028,7 @@ def inferModule' (s : Supply) (m : Module) : InferM (List (Span × MTy)) := do
         let t ← infer s { ctx with level := ctx.level + 1 } rhs
         let sch ← generalize s ctx.level t
         ctx := ctx.addScheme name sch
-    | .dfn name params retAnnot body => do
+    | .dfn _ name params retAnnot body => do
         let lvl := ctx.level + 1
         let recTy ← freshMVar s lvl
         let paramMTys ← params.mapM (fun _ => freshMVar s lvl)
@@ -1388,7 +1388,7 @@ with no unbound-variable throw for `cap_narrow`/`root_cap`. Modeled as a
   let s ← Supply.new
   let capIO : Ty := Ty.con "Cap" [Ty.con "IO" []]
   let capNet : Ty := Ty.con "Cap" [Ty.con "IO.Network" []]
-  let boot : Decl := .dfn "boot" [("root", .unrestricted, some capIO)] (some capNet)
+  let boot : Decl := .dfn .pub "boot" [("root", .unrestricted, some capIO)] (some capNet)
     (Term.app (Term.var "cap_narrow" dSpan dTy) [Term.var "root" dSpan dTy] dTy)
   let m : Module := { decls := [boot], schemes := [], insts := [] }
   match ← (inferModule' s m).run with
@@ -1433,7 +1433,7 @@ treat transparently). This `#eval` has teeth: deleting the `retAnnot` unify
 makes it print `retannot-mismatch-FAIL: accepted`. -/
 #eval show IO Unit from do
   let s ← Supply.new
-  let bad : Decl := .dfn "f" [("n", .unrestricted, some (Ty.con "Int" []))]
+  let bad : Decl := .dfn .pub "f" [("n", .unrestricted, some (Ty.con "Int" []))]
     (some (Ty.con "String" [])) (Term.var "n" dSpan dTy)
   match ← (inferModule' s { decls := [bad], schemes := [], insts := [] }).run with
   | .ok _ => IO.println "retannot-mismatch-FAIL: accepted"
@@ -1444,7 +1444,7 @@ makes it print `retannot-mismatch-FAIL: accepted`. -/
 AGREES with the body still infers cleanly. `fn f(n : Int) : Int do n end`. -/
 #eval show IO Unit from do
   let s ← Supply.new
-  let ok : Decl := .dfn "f" [("n", .unrestricted, some (Ty.con "Int" []))]
+  let ok : Decl := .dfn .pub "f" [("n", .unrestricted, some (Ty.con "Int" []))]
     (some (Ty.con "Int" [])) (Term.var "n" dSpan dTy)
   match ← (inferModule' s { decls := [ok], schemes := [], insts := [] }).run with
   | .ok _ => IO.println "retannot-match-accepted: true"
@@ -1455,7 +1455,7 @@ AGREES with the body still infers cleanly. `fn f(n : Int) : Int do n end`. -/
 so a body of any type still infers. `fn f(n : Int) do n end`. -/
 #eval show IO Unit from do
   let s ← Supply.new
-  let un : Decl := .dfn "f" [("n", .unrestricted, some (Ty.con "Int" []))]
+  let un : Decl := .dfn .pub "f" [("n", .unrestricted, some (Ty.con "Int" []))]
     none (Term.var "n" dSpan dTy)
   match ← (inferModule' s { decls := [un], schemes := [], insts := [] }).run with
   | .ok _ => IO.println "retannot-absent-accepted: true"

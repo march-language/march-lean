@@ -3,6 +3,7 @@ import MarchLean.Elab
 import MarchLean.CapCheck
 import MarchLean.Compare
 import MarchLean.Linearity
+import MarchLean.KindCoverage
 import Lean.Data.Json
 
 /-!
@@ -89,9 +90,33 @@ def run (input : String) : IO UInt32 := do
               | .typesDiffer r => IO.eprintln s!"accept, but types differ: {r}"; pure 4
               | _ => pure 0
 
-def main : IO UInt32 := do
+/-- `--kind-coverage`: read march `"kind"` tag names from stdin, one per
+line, and print one `KIND<TAB>CATEGORY<TAB>SITES` line each — what
+`MarchLean.Elab`'s decoder actually does with a node bearing that tag,
+derived by probing the live match arms (see `MarchLean.KindCoverage`).
+
+This is a diagnostic mode of the SAME binary the conformance harness uses,
+deliberately not a second executable: CI already builds and caches
+`march-lean-check`, and a separate target would be one more thing that can
+silently stop being built. It renders no verdict and reads no envelope. -/
+def runKindCoverage (input : String) : IO UInt32 := do
+  let kinds := (input.splitOn "\n").map (fun l => l.trimAscii.toString) |>.filter (· != "")
+  if kinds.isEmpty then
+    IO.eprintln "--kind-coverage: no kind names on stdin"
+    return 3
+  IO.println (MarchLean.KindCoverage.report kinds)
+  return 0
+
+def main (args : List String) : IO UInt32 := do
   let input ← (← IO.getStdin).readToEnd
-  run input
+  match args with
+  | [] => run input
+  | ["--kind-coverage"] => runKindCoverage input
+  | _ =>
+    IO.eprintln "usage: march-lean-check [--kind-coverage] < INPUT"
+    IO.eprintln "  (no args)        read a --emit-core-ast envelope, print a verdict via the exit code"
+    IO.eprintln "  --kind-coverage  read march \"kind\" tag names, print decoder coverage as TSV"
+    return 3
 
 namespace MarchLean.Test
 open MarchLean
