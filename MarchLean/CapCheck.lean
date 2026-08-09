@@ -223,6 +223,97 @@ partial def capAnnotsInTerm : Term → List String
           (g.map capAnnotsInTerm).getD [] ++ capAnnotsInTerm e)
   | .unsupported _ => []
 
+/-- The concrete IO-lattice capability a type denotes, if it is exactly
+`Cap(P)` for a nullary `P` that is a NAME IN THE HIERARCHY. Mirrors march's
+local `concrete` inside `check_cap_narrow_sites` (`typecheck.ml:9407-9411`),
+with one deliberate narrowing: march excludes proof caps explicitly
+(`is_proof`), while this additionally requires lattice membership.
+
+Requiring membership subsumes march's proof-cap exclusion (a proof cap like
+`Db.Migrated` is not in the hierarchy) and also excludes FFI caps, which are
+their own roots and subsume nothing but themselves — so a `cap_narrow`
+between two FFI names would otherwise be flagged. The difference can only
+make this checker MORE permissive than march, never less, so it cannot
+manufacture a false reject; it is the safe direction for a check whose whole
+job is replacing a guarantee that used to live in the type. -/
+def concreteLatticeCap : Ty → Option String
+  | .con "Cap" [.con p []] =>
+      if MarchLean.CapLattice.hierarchy.any (fun (n, _) => n == p) then some p else none
+  | _ => none
+
+/-- R4a: attenuation must move DOWN the lattice, or stay level.
+
+march's `cap_narrow` is now `∀a b. Cap(a) → Cap(b)` (see `Infer.builtins`),
+so the TYPE no longer stops a widen — `check_cap_narrow_sites`
+(`typecheck.ml:9406-9432`) does, as a deferred sweep over solved types. This
+is the mirror of that sweep, and it is load-bearing rather than defensive:
+without it, retyping `cap_narrow` turns `reject/t153` (widen), `t154`
+(siblings) and `t155` (widen visible only after later unification) into false
+ACCEPTS. Those three currently reject only as a side effect of the old
+argument type failing to unify, which is not a lattice check at all.
+
+The rule, exactly as march states it: an error iff BOTH sides resolve to
+concrete lattice capabilities AND the source does not subsume the target.
+Reflexivity is allowed — `capSubsumes p p` holds, which is what makes
+`accept/t148`'s `same_level` (narrowing `Cap(IO.FileRead)` to itself) legal.
+An UNPINNED side is silent: a result never pinned to a concrete capability is
+a result never USED as one, so no authority is exercised and there is nothing
+to widen into. Failing closed there would reject ordinary code that narrows
+into a polymorphic position — march records having considered and rejected
+that choice.
+
+Reading the two sides off the application node rather than off the callee's
+instantiated arrow is equivalent here and more robust: the emitter's
+`resolved_ty` is POST-solve, verified on `reject/t155`, whose `cap_narrow`
+application resolves to `Cap(IO.FileWrite)` with argument `Cap(IO.Console)` —
+precisely the deferred widen. -/
+partial def capNarrowViolation : Term → Option (String × String)
+  | .app (.var "cap_narrow" _ _) [arg] ty =>
+      match concreteLatticeCap arg.ty, concreteLatticeCap ty with
+      | some src, some dst =>
+          if capSubsumes src dst then capNarrowViolation arg
+          else some (src, dst)
+      | _, _ => capNarrowViolation arg
+  | .app fn args _ =>
+      match capNarrowViolation fn with
+      | some v => some v
+      | none   => args.findSome? capNarrowViolation
+  | .lit _ _ => none
+  | .var _ _ _ => none
+  | .lam _ body _ => capNarrowViolation body
+  | .let_ _ _ _ rhs body _ =>
+      match capNarrowViolation rhs with
+      | some v => some v
+      | none   => capNarrowViolation body
+  | .letfn _ _ _ _ fnBody body _ =>
+      match capNarrowViolation fnBody with
+      | some v => some v
+      | none   => capNarrowViolation body
+  | .ite c t e _ =>
+      match capNarrowViolation c with
+      | some v => some v
+      | none   => match capNarrowViolation t with
+                  | some v => some v
+                  | none   => capNarrowViolation e
+  | .con _ args _ => args.findSome? capNarrowViolation
+  | .tuple elems _ => elems.findSome? capNarrowViolation
+  | .record fields _ => fields.findSome? (fun (_, e) => capNarrowViolation e)
+  | .field record _ _ _ => capNarrowViolation record
+  | .match_ scrut arms _ =>
+      match capNarrowViolation scrut with
+      | some v => some v
+      | none   => arms.findSome? (fun (_, g, e) =>
+                    match (g.bind capNarrowViolation) with
+                    | some v => some v
+                    | none   => capNarrowViolation e)
+  | .unsupported _ => none
+
+/-- The first R4a widening in a declaration's body, if any. -/
+def declCapNarrowViolation : Decl → Option (String × String)
+  | .dfn _ _ _ body => capNarrowViolation body
+  | .dlet _ rhs     => capNarrowViolation rhs
+  | _               => none
+
 /-- The caps named by type annotations inside a declaration's body. -/
 def capsInBody : Decl → List String
   | .dfn _ _ _ body => capAnnotsInTerm body
@@ -1434,6 +1525,15 @@ def checkOneModule (modName : String) (decls : List Decl)
   if fullyInFragment && mentionsRootCap then
     .violation s!"R2: `root_cap` cannot be referenced in module `{modName}` — the root capability is granted to `main`, not taken"
   else
+  -- R4a — `cap_narrow` only attenuates. See `capNarrowViolation`: this is
+  -- what replaces the subsumption the old `Cap(IO)→Cap(a)` argument type used
+  -- to enforce through unification. Ungated: both sides must already have
+  -- resolved to concrete lattice capabilities for it to fire at all, so an
+  -- out-of-fragment neighbour cannot make it misfire.
+  match decls.findSome? declCapNarrowViolation with
+  | some (src, dst) =>
+      .violation s!"R4a: `Cap({src})` cannot be widened to `Cap({dst})` in module `{modName}` — `cap_narrow` only attenuates, so the source capability must subsume the target"
+  | none =>
   -- Finding I1: a cap in `selfDeclaredCaps` is covered regardless of
   -- `needs` — march's self-declaration exemption (`typecheck.ml:6966-6970`)
   -- lets a proof cap's own declaring module use it in its own signatures
@@ -1874,6 +1974,57 @@ def siblingViolation : Module := {
   schemes := [], insts := [], moduleCaps := [] }
 #eval checkCaps siblingViolation
   -- expect: violation — IO.FileWrite not covered by IO.FileRead
+
+/-! ### R4a — `cap_narrow` only attenuates
+
+These four pin the guarantee that MOVED when `cap_narrow` was retyped to
+`∀a b. Cap(a) → Cap(b)`. Before R4a the argument type enforced it through
+unification and `reject/t153`/`t154`/`t155` rejected as a side effect;
+`capNarrowViolation` is now the only thing standing between those files and a
+false ACCEPT, so it is pinned here as well as in the corpus. -/
+
+private def capNarrowApp (src dst : String) : Term :=
+  Term.app (Term.var "cap_narrow" ⟨"f",0,0,0,0⟩
+              (Ty.arrow (Ty.con "Cap" [Ty.con src []]) (Ty.con "Cap" [Ty.con dst []])))
+           [Term.var "c" ⟨"f",0,0,0,0⟩ (Ty.con "Cap" [Ty.con src []])]
+           (Ty.con "Cap" [Ty.con dst []])
+
+/-- `needs` lists both endpoints, so Check 1 is satisfied by construction and
+whatever these fixtures report comes from R4a alone. -/
+private def capNarrowModule (src dst : String) : Module := {
+  decls := [Decl.dmod "N" [
+    Decl.dneeds ["IO", src, dst],
+    Decl.dfn "f" [("c", Lin.unrestricted, some (Ty.con "Cap" [Ty.con src []]))]
+      (some (Ty.con "Cap" [Ty.con dst []])) (capNarrowApp src dst)]],
+  schemes := [], insts := [], moduleCaps := [] }
+
+-- reject/t153: widening `Cap(IO.Console)` to `Cap(IO.FileWrite)`.
+#eval checkCaps (capNarrowModule "IO.Console" "IO.FileWrite")
+  -- expect: violation — R4a
+
+-- reject/t154: siblings — `Cap(IO.FileRead)` to `Cap(IO.FileWrite)`.
+#eval checkCaps (capNarrowModule "IO.FileRead" "IO.FileWrite")
+  -- expect: violation — R4a
+
+-- accept/t148, the attenuating hop: `Cap(IO.FileSystem)` to
+-- `Cap(IO.FileRead)` moves DOWN the lattice and is legal.
+#eval checkCaps (capNarrowModule "IO.FileSystem" "IO.FileRead")
+  -- expect: ok
+
+-- accept/t148's `same_level`: narrowing to the SAME capability is legal,
+-- because `capSubsumes p p` holds. A strict-ancestor test would wrongly
+-- reject this — which is exactly what that file exists to catch.
+#eval checkCaps (capNarrowModule "IO.FileRead" "IO.FileRead")
+  -- expect: ok
+
+-- A PROOF cap is not in the IO lattice, so R4a stays silent rather than
+-- flagging a narrow it has no authority to judge (march exempts these
+-- explicitly via `is_proof`; `concreteLatticeCap` reaches the same
+-- conclusion by requiring hierarchy membership). `needs` covers the proof
+-- cap here so this isolates R4a from Check 1 — without that, the violation
+-- reported is Check 1's uncovered `Cap(Db.Migrated)`, not R4a at all.
+#eval checkCaps (capNarrowModule "IO" "Db.Migrated")
+  -- expect: ok — R4a declines to judge a non-lattice cap
 
 /-- reject/t151: a LAMBDA PARAMETER annotation names `Cap(IO.FileWrite)`
 inside a body, under `needs IO.Console`. Needs no capability value at all —

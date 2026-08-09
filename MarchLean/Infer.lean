@@ -898,10 +898,35 @@ def builtins (s : Supply) : InferM (List (String × EnvEntry)) := do
   -- Eq-constrained equality: ∀a:Eq. a→a→Bool
   for name in ["==", "!="] do
     out := (name, .scheme (← mkPoly1 s [Class.eq] (fun a => arr a (arr a b)))) :: out
-  -- Capability-narrowing: ∀a. Cap(IO)→Cap(a)  (typecheck.ml:1972)
+  -- Capability-narrowing: ∀a b. Cap(a)→Cap(b)  (march main, R4a).
+  --
+  -- Was `∀a. Cap(IO)→Cap(a)`: the argument was LITERALLY the root, so a
+  -- holder of anything narrower could not attenuate at all. march's R4a
+  -- widened the type precisely to allow delegation-with-attenuation
+  -- (`accept/t148_cap_narrow_chains`), which this checker rejected with
+  -- "cannot unify IO with IO.FileSystem".
+  --
+  -- **The subsumption guarantee moved, it did not disappear.** Before R4a
+  -- the argument type enforced it through unification; now nothing in the
+  -- TYPE does, and `CapCheck.capNarrowViolation` carries it instead —
+  -- mirroring march's own deferred `check_cap_narrow_sites` sweep
+  -- (`typecheck.ml:9406-9432`). Retyping here WITHOUT that sweep would turn
+  -- `reject/t153`/`t154`/`t155` into false accepts: those three reject today
+  -- only as a side effect of this unification failure, not because anything
+  -- checks the lattice. See `capNarrowViolation`'s docstring.
   let cap := fun (t : MTy) => MTy.con "Cap" [t]
+  -- Still needed by `root_cap` below: R2 keeps the NAME bound at `Cap(IO)`
+  -- (march does the same, `typecheck.ml:5118-5125`, so one mistake reports a
+  -- single capability error instead of cascading unification failures);
+  -- `CapCheck`'s R2 gate is what refuses references to it.
   let capIO := cap (MTy.con "IO" [])
-  out := ("cap_narrow", .scheme (← mkPoly1 s [] (fun a => arr capIO (cap a)))) :: out
+  let capA ← freshMVar s 0 []
+  let capB ← freshMVar s 0 []
+  let aid := match capA with | .mvar i => i | _ => 0
+  let bid := match capB with | .mvar i => i | _ => 0
+  out := ("cap_narrow",
+    .scheme { vars := [aid, bid], classes := [],
+              body := arr (cap capA) (cap capB) }) :: out
   pure <| out ++ [
     -- The IO capability root, threaded from the entry point. (typecheck.ml:1971)
     mono "root_cap" capIO,
@@ -970,10 +995,7 @@ def inferModule' (s : Supply) (m : Module) : InferM (List (Span × MTy)) := do
         let t ← infer s { ctx with level := ctx.level + 1 } rhs
         let sch ← generalize s ctx.level t
         ctx := ctx.addScheme name sch
-    | .dfn name params _ body => do
-        -- `retAnnot` (the surface return type) is ignored: inference derives
-        -- the body's type and cross-checks `resolved_ty`, rather than trusting
-        -- the annotation. It exists only for `CapCheck`'s Check 1 return scan.
+    | .dfn name params retAnnot body => do
         let lvl := ctx.level + 1
         let recTy ← freshMVar s lvl
         let paramMTys ← params.mapM (fun _ => freshMVar s lvl)
@@ -986,6 +1008,25 @@ def inferModule' (s : Supply) (m : Module) : InferM (List (Span × MTy)) := do
         let ctxIn := (params.zip paramMTys).foldl
           (fun c ((n, _, _), mt) => c.addMono n mt) (ctx.addMono name recTy)
         let bodyTy ← infer s { ctxIn with level := lvl } body
+        -- Honor the surface RETURN annotation, exactly as the parameter
+        -- annotations above are honored, and for the same reason: march
+        -- CHECKS the body against the declared return type rather than
+        -- inferring it freely, so an annotated return HAS that type by
+        -- definition.
+        --
+        -- This used to be skipped ("inference derives the body's type and
+        -- cross-checks resolved_ty, rather than trusting the annotation"),
+        -- which was invisible while every builtin's result was pinned by its
+        -- argument types. R4a broke that: `cap_narrow` is now `∀a b. Cap(a) →
+        -- Cap(b)`, so in `pfn same_level(r : Cap(IO.FileRead)) :
+        -- Cap(IO.FileRead) do cap_narrow(r) end` the result is pinned ONLY by
+        -- the return annotation. Without this unification the body stays a
+        -- metavariable, march resolves it to `Cap(IO.FileRead)`, and the
+        -- per-node cross-check reports types_differ (exit 4) on
+        -- `accept/t148_cap_narrow_chains`.
+        match retAnnot with
+        | some t => unify s bodyTy (← tyToMTy s [] t)
+        | none   => pure ()
         unify s recTy (paramMTys.foldr MTy.arrow bodyTy)
         let sch ← generalize s ctx.level recTy
         ctx := ctx.addScheme name sch
