@@ -152,3 +152,102 @@ march#82 but a distinct source location (second copy, three different call
 sites); should be reported as its own issue or as an amendment to #82 since
 the fix (adding `ETuple`/`ERecord`/`EList` arms to *this* `calls_in_expr`,
 not just the first one) is a separate code change.
+
+---
+
+## Checker gaps against march main 6867c783 that the corpus CANNOT catch
+
+Unlike every entry above, these are **checker-is-wrong** items, recorded here
+by exception because of a property they share: each is a live divergence
+against the pinned march with **zero corpus witnesses**, so the conformance
+gate is structurally incapable of reporting them. The standing rule that a
+green run is weak evidence is usually a caution; here it is a certainty.
+Each needs a hand-built probe, not a corpus file.
+
+Found during the 2026-08-08 capability resync (pin 7c1d701c -> 6867c783),
+which fixed five corpus-visible divergences; these three were found by
+reading march's diff rather than by running anything.
+
+### 1. Path-scoped capabilities decode as unscoped — FALSE ACCEPT by construction
+
+march added scopes: `needs IO.FileRead("/etc/myapp")` narrows a filesystem
+capability to a directory subtree (`lib/caps/cap_scope.ml`). The emitter now
+carries them in a NEW `scopes` array parallel to `paths`, and march's own
+comment on that change says the scope is emitted "so a dumped AST is not a
+widened version of the source."
+
+`Elab.decodeDecl`'s `DNeeds` arm reads only `paths`. The scope is dropped, so
+a scoped declaration decodes identically to an unscoped one. Since
+`Cap_scope.scope_subsumes` states that `None` (unscoped) subsumes everything
+and **a scope never subsumes `None`**, this checker reads a strictly narrower
+declaration as the broadest possible one — the exact direction that produces
+a false accept.
+
+Not yet reachable in the corpus: no file under `specs/lang/types` uses the
+syntax. That is why it is dangerous rather than reassuring.
+
+**Fix shape.** Decode `scopes` alongside `paths`, carry the scope on
+`Decl.dneeds`, and gate coverage on `scope_subsumes` as well as
+`capSubsumes`. Until then this is a known false-accept source.
+
+### 2. `capsInTy` does not descend into `Tagged`
+
+march's `Cap_surface_ty.caps_in_ty` recurses into every `TyCon`'s arguments,
+including `Tagged`. Its predecessor had an explicit `| Tagged -> []` arm;
+that arm is GONE, and march's comment records why: skipping it "also blinded
+the walk to `Tagged(R, Cap(IO))`, which is a worse trade."
+
+`CapCheck.capsInTy` still has `| .con "Tagged" _ => []`, mirroring the arm
+march deleted. A capability nested inside a `Tagged` payload is therefore
+invisible to Check 1 here and visible to march. No corpus file exercises it.
+
+### 3. `normalize` does not deduplicate
+
+march's `Cap_lattice.normalize` now dedupes before filtering; ours does not,
+so the two disagree on any input containing repeated caps (ours returns the
+duplicates, march returns one). march's change was a performance fix (an env
+reused across ~1800 modules grew the list without bound), but it is a
+semantic difference in the returned list.
+
+Latent only because `normalize` is not on this checker's verdict path — it is
+defined and proved about (`Calculus/Lattice.lean`) but never consulted by
+`checkCaps`. If it is ever wired in, this must be fixed first, and the
+`normalizeIn` theorems re-proved against the deduping definition.
+
+### 4. Check 4 uses the pre-#209 whole-module rule — we are now STRICTER than march
+
+march#209 ("an importer inherits only the capabilities it actually
+references", 8f8c66d6) changed Check 4's semantics. `use M` used to force
+every capability `M` declares onto the importer; it now forces only the
+capabilities demanded by the functions the importer actually references, via
+the new `import_required_caps`.
+
+`CapCheck.checkOneModule`'s Check 4 still implements the old rule: it takes
+`M`'s entire declared `needs` from the `module_caps` table and requires the
+importer to cover all of it. march's own commit message states the change is
+"strictly loosening by construction: the result is always a subset of what
+the import required before" — so this checker is now strictly STRICTER than
+march on Check 4, and the divergence direction is FALSE REJECT.
+
+The witness shape: a module that imports a cap-declaring module but
+references only its cap-free functions. march accepts (nothing referenced
+demands the cap); this checker rejects (the cap is in `M`'s declared set).
+
+No corpus witness today. `reject/t39_transitive_use_missing_cap` still
+matches, because there the capability is uncovered under either rule.
+`accept/t49_transitive_use_covered` was rewritten by the same commit to add
+the reference the new rule requires (`let _ = Vault.new("t")`), and now
+SKIPS here for an unrelated reason — see below.
+
+**Corollary finding (march side): an accepted file's emitted AST contains
+`TError`.** `accept/t49`'s added `Vault.new("t")` is a call into stdlib
+`Vault`. march's `--check` resolves it and ACCEPTS; its own
+`--emit-core-ast` emits `resolved_ty: TError` for that call and for the
+enclosing `let`, while the envelope's `verdict` field still says `accept`.
+This checker honest-skips on `TError` by design (H3: never check a file
+built on an elaboration error), which is why t49 regressed MATCH -> SKIP and
+why A3 slice (a) is now one file short of the 11 it claimed. The skip is
+correct behavior here; the inconsistency is march emitting an
+elaboration-error sentinel in a program it accepts.
+
+**Status.** reported upstream: NOT YET (both halves).

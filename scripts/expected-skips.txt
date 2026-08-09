@@ -201,3 +201,29 @@ reject/t131_refine_let_annotation_false.march                      # out-of-frag
 reject/t133_refine_trusted_violation_not_rescued.march             # out-of-fragment construct in a declaration
 reject/t134_refine_postcondition_strict_undischarged.march         # out-of-fragment construct in a declaration
 reject/t138_refine_impl_param_remedy_enforced.march                # out-of-fragment construct in a declaration
+accept/t141_refine_nth_in_range.march                             # out of modeled fragment: SKIP: unbound variable `List.nth`
+accept/t142_json_ordinary_type_in_cap_module.march                # out of modeled fragment: SKIP: unbound variable `from_json`
+accept/t143_derive_json_cap_free_in_cap_module.march              # out-of-fragment construct in a declaration
+accept/t144_cap_type_decl_covered.march                           # out-of-fragment construct in a declaration
+accept/t146_root_cap_in_test_body.march                           # out-of-fragment construct in a declaration
+accept/t149_cap_interface_impl_covered.march                      # out-of-fragment construct in a declaration
+accept/t150_actor_cap_flow.march                                  # out-of-fragment construct in a declaration
+accept/t151_ordinary_payload_through_all_send_paths.march         # out-of-fragment construct in a declaration
+accept/t49_transitive_use_covered.march                           # REGRESSION (was MATCH): march#209 rewrote this file to add `Vault.new("t")`, the reference the new per-function Check 4 requires. march ACCEPTS it but emits resolved_ty TError for that stdlib call, and H3 honest-skips on TError. See specs/march-findings.md section 4.
+reject/t142_refine_nth_out_of_range.march                         # out of modeled fragment: SKIP: unbound variable `List.nth`
+reject/t143_cap_from_json_deferred_zonk.march                     # out of modeled fragment: SKIP: unbound variable `from_json`
+reject/t145_cap_derive_json_record_field.march                    # out-of-fragment construct in a declaration
+reject/t146_cap_to_json_argument.march                            # out of modeled fragment: SKIP: unbound variable `to_json`
+reject/t147_cap_from_json_events.march                            # out of modeled fragment: SKIP: unbound variable `from_json_events`
+reject/t148_cap_record_field_undeclared.march                     # out-of-fragment construct in a declaration
+reject/t150_cap_nested_in_container_undeclared.march              # out-of-fragment construct in a declaration
+reject/t156_cap_interface_method_signature.march                  # out-of-fragment construct in a declaration
+reject/t157_cap_impl_body_annotation.march                        # out-of-fragment construct in a declaration
+reject/t158_get_cap_is_not_io_authority.march                     # out of modeled fragment: SKIP: unbound variable `get_cap`
+reject/t159_send_checked_bypasses_sendable_check.march            # out-of-fragment construct in a declaration
+reject/t160_actor_cast_qualified_bypasses_sendable_check.march    # out-of-fragment construct in a declaration
+reject/t161_actor_cast_bare_bypasses_sendable_check.march         # out-of-fragment construct in a declaration
+reject/t162_actor_call_qualified_bypasses_sendable_check.march    # out-of-fragment construct in a declaration
+reject/t163_actor_call_bare_bypasses_sendable_check.march         # out-of-fragment construct in a declaration
+reject/t164_native_int_arr_not_sendable.march                     # out-of-fragment construct in a declaration
+reject/t165_native_float_arr_not_sendable.march                   # out-of-fragment construct in a declaration

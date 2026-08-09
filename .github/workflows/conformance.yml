@@ -80,31 +80,49 @@ jobs:
           fi
 
       # Pinned to a march main SHA (not a branch) for reproducibility. This
-      # pin (7c1d701c) is march main HEAD as of the post-slice-(c)
-      # re-baseline (2026-08-03); its corpus has grown to 242 files. It
-      # supersedes 0a119c9d, which was 28 commits behind.
+      # pin (6867c783) is march main HEAD as of the capability resync
+      # (2026-08-08); its corpus has grown to 277 files. It supersedes
+      # 7c1d701c, which was 71 commits behind.
       #
-      # Drift from 0a119c9d was assessed before bumping:
-      #   - lib/dump/ast_json.ml: UNCHANGED. The emitter envelope is
-      #     identical; format_version and module_caps keys untouched.
-      #   - typecheck.ml +599, refine_check.ml +870, new precond_infer.ml
-      #     (580) — but exactly ONE new Err.error-level check across all of
-      #     it: `cap verified` (undischarged return-type constraint). That
-      #     is a sixth behavioral capability cap and it is NOT modeled here,
-      #     because it requires refinement-obligation discharge, which is
-      #     out of fragment. Its corpus files (accept/t132, accept/t135,
-      #     reject/t133) skip today for unrelated refinement-syntax reasons
-      #     — so we are currently safe by accident, not by design. If those
-      #     files ever stop skipping, `cap verified` becomes a live
-      #     false-accept source. See specs/march-findings.md.
-      #   - march#136 (calls_in_expr now total over Ast.expr) IS included in
-      #     this pin. It fixes the blind spot that made our deliberately
-      #     total bodyCalls disagree with march on calls nested in tuples,
-      #     records, and lambdas.
+      # Drift from 7c1d701c was assessed before bumping. Unlike the previous
+      # two bumps this one was NOT inert — it surfaced five real divergences,
+      # four of them false ACCEPTS, all fixed in the commits that accompany
+      # this pin:
+      #   - lib/dump/ast_json.ml: CHANGED, but compatibly. format_version is
+      #     still 3 (bin/main.ml:1934), and DNeeds.paths still emits the same
+      #     array of dotted paths. What is NEW is a parallel `scopes` array
+      #     (see below).
+      #   - Check 1 now reaches TYPE DECLARATIONS (caps_in_type_def, via the
+      #     new lib/caps/cap_surface_ty.ml) and FUNCTION BODIES
+      #     (cap_annots_in_expr). Both were holes here; both are now modeled.
+      #   - R2: root_cap is no longer an ambient global (typecheck.ml:5118).
+      #   - R4a: cap_narrow is now polymorphic and subsumption moved to a
+      #     deferred sweep (check_cap_narrow_sites); modeled by
+      #     CapCheck.capNarrowViolation.
       #
-      # Corpus grew 233 -> 242; all 9 new files skip (refinement-typed) and
-      # every pre-existing skip is unchanged, so the ledger delta is purely
-      # additive.
+      # THREE KNOWN GAPS remain against this pin. None is corpus-visible, so
+      # a green run is NOT evidence about them — each needs a hand-built
+      # probe (see specs/march-findings.md):
+      #   - PATH-SCOPED CAPABILITIES. march added `needs IO.FileRead("/etc")`
+      #     and emits the scope in a new `scopes` array; Elab's DNeeds
+      #     decoder reads only `paths` and drops it. Since scope_subsumes
+      #     says a scope never subsumes unscoped, a narrow declaration
+      #     decodes here as broad — a FALSE ACCEPT by construction. Zero
+      #     corpus files use the syntax today, which is exactly why this is
+      #     dangerous rather than reassuring.
+      #   - Tagged: march's caps_in_ty now RECURSES into Tagged (its old
+      #     `| Tagged -> []` arm is gone, deliberately: skipping it blinded
+      #     the walk to Tagged(R, Cap(IO))). CapCheck.capsInTy still mirrors
+      #     the old behavior. No corpus witness.
+      #   - normalize: march's now dedupes before filtering; ours does not,
+      #     so the two differ on duplicate cap lists. Latent only because
+      #     normalize is not on this checker's verdict path.
+      #
+      # Corpus grew 242 -> 277 (+35, heavily capability-focused). The ledger
+      # delta is NOT purely additive this time: accept/t49_transitive_use_
+      # covered regressed from MATCH to SKIP, and the four CORPUS_VIOLATION
+      # entries seen against the old local march 0.2.0 were artifacts of that
+      # stale binary and are gone.
       #
       # Bump periodically; no need to chase every push. setup-march builds
       # march from source and caches the result keyed on this SHA (actions/
@@ -114,7 +132,7 @@ jobs:
         id: setup-march
         uses: march-language/setup-march@main
         with:
-          march-version: 7c1d701cf561c13ad094845f52175f449e1c1892
+          march-version: 6867c783fbde7fb8ab58bae4b4fbe36703b626a1
 
       # Only the static-semantics corpus is needed from march's own repo
       # (the binary itself came from setup-march above); pinned to the
