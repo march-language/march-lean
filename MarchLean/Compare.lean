@@ -256,6 +256,296 @@ unbound-variable and unknown-constructor throws with this literal string
 genuine type disagreement and does not carry it. -/
 def skipMarker : String := "SKIP: "
 
+/-! ## The non-tail-recursion accept gate
+
+march runs an **ERROR**-level check this oracle does not model at all:
+`enforce_tail_calls_in_decls` (`typecheck.ml:10902`, invoked as "Pass 3" at
+`typecheck.ml:11368`), whose analysis is `check_tail_position`
+(`typecheck.ml:10715-10898`). It rejects a recursive call that is **both**
+outside tail position **and** not provably structurally decreasing. The
+discriminator is easy to miss and worth stating precisely, because it is what
+makes the check impossible to approximate safely:
+
+- `fn pong(n : Int) : Int do pong(n - 1) + 1 end` — march proves the argument
+  decreases, emits only a WARNING, and **accepts** (exit 0).
+- `fn a(n : Int) : Int do b(n + 1) + 1 end` / `fn b(n : Int) : Int do a(n + 1) + 1 end`
+  — march cannot prove decrease, so the non-tail call is an ERROR and march
+  **rejects** (exit 1).
+
+Both were verified directly. Telling those two apart requires march's
+structural-decrease analysis, which this oracle deliberately does not
+reconstruct (partial reconstructions of a march decision are how false rejects
+get built). So the honest response to *either* is a non-verdict.
+
+Before this gate, the inference layer answered ACCEPT for both — a confident
+verdict on a program march rejects, on grounds we never examined. The
+ground-signature pre-pass made that reachable for mutual recursion; it was
+**already** reachable for self-recursion
+(`fn loopy(n : Int) : Int do loopy(n + 1) + 1 end` ⇒ march 1, oracle 0), and the
+same gate covers both.
+
+**What the gate does.** Purely syntactically, and only on the ACCEPT path: if
+any top-level `dfn` that participates in recursion mentions a member of its own
+recursive group anywhere other than as the direct callee of a tail-position
+call, the module returns `.skip`. It renders no opinion about tail-call
+legality — it declines to answer.
+
+**Scope, mirrored from march** (`typecheck.ml:10917-10966`): the call graph is
+built over top-level `DFn` names only, a function is "recursive" exactly when
+its SCC has more than one member or it calls itself directly
+(`typecheck.ml:10951-10954`), and the names checked inside its body are its
+whole SCC (`rec_set`, `typecheck.ml:10956`). Matching that scoping is what
+keeps the gate from firing on an ordinary non-recursive caller — `fn main`
+calling a recursive helper inside `println(...)` is not itself recursive, so it
+is never gated.
+
+**Every approximation is deliberately toward MORE skipping**, since
+over-skipping is safe here and under-skipping is the false accept being closed:
+
+- Graph edges come from *every* name a body mentions, ignoring shadowing, where
+  march uses direct calls only (`collect_direct_fn_calls`). A superset of edges
+  can only merge SCCs, never split them.
+- march exempts a `fn` carrying the `no_warn_recursion` attribute
+  (`typecheck.ml:10955`); this decoder does not model attributes, so such a
+  function is gated anyway.
+- A bare (non-callee) mention of a group member is treated as disqualifying even
+  in tail position, and a lambda / local-`fn` body is treated as a non-tail
+  context, even though march gives both their own scope
+  (`typecheck.ml:10856-10863`).
+- Anything not recognised as a tail position is treated as non-tail.
+- march builds a separate graph per module level, recursing into each `DMod`
+  with its own declarations (`typecheck.ml:10968`). This runs after
+  `flattenDecls`, so nested-module functions share one graph with the top
+  level — again only able to merge groups, never split them.
+
+**REJECT stays reachable.** The gate runs only after `Infer.inferModule'` has
+already succeeded, so a genuine type error — a wrong argument type, a wrong
+return annotation, a wrong arity — still rejects exactly as before, tail
+position notwithstanding. Only a would-be ACCEPT is downgraded. -/
+
+/-- Every name syntactically mentioned anywhere in `t`. Deliberately
+over-approximating: binder shadowing is ignored, so a local `let map = …` still
+contributes the name `map`. Used only to build the recursion call graph, where a
+superset of edges is the safe direction (see the section doc). -/
+partial def termMentions : Term → List String
+  | .lit _ _ => []
+  | .var n _ _ => [n]
+  | .app fn args _ => termMentions fn ++ args.flatMap termMentions
+  | .lam _ body _ => termMentions body
+  | .let_ _ _ _ rhs body _ => termMentions rhs ++ termMentions body
+  | .letfn _ _ _ _ fnBody body _ => termMentions fnBody ++ termMentions body
+  | .ite c t e _ => termMentions c ++ termMentions t ++ termMentions e
+  | .con _ args _ => args.flatMap termMentions
+  | .tuple es _ => es.flatMap termMentions
+  | .record fs _ => fs.flatMap (fun (_, e) => termMentions e)
+  | .field r _ _ _ => termMentions r
+  | .match_ scrut arms _ =>
+      termMentions scrut ++
+        arms.flatMap (fun (_, g, b) => (g.map termMentions).getD [] ++ termMentions b)
+  -- `.opaque_`/`.unsupported` children are never inferred (the whole module has
+  -- already skipped by the time this runs), so they contribute no edges.
+  | .opaque_ _ _ => []
+  | .unsupported _ => []
+
+/-- `(name, body)` for every top-level `dfn`. march's tail-call pass builds its
+call graph over `DFn` declarations only (`typecheck.ml:10918-10935`); a `dlet` is
+not a function and contributes neither a node nor an edge. -/
+def dfnBodies (decls : List Decl) : List (String × Term) :=
+  decls.filterMap (fun d => match d with
+    | .dfn _ n _ _ body => some (n, body)
+    | _ => none)
+
+/-- One round of transitive-closure widening: replace each node's reachable set
+with itself plus everything its members reach directly. -/
+def closureStep (direct : List (String × List String)) (cur : List (String × List String)) :
+    List (String × List String) :=
+  cur.map (fun (x, ys) =>
+    (x, ys.foldl (fun acc y =>
+      match direct.find? (fun p => p.1 == y) with
+      | some (_, zs) => zs.foldl (fun a z => if a.contains z then a else z :: a) acc
+      | none => acc) ys))
+
+/-- Transitive closure of `direct`, by bounded iteration. `fuel` rounds suffice
+for a graph with `fuel` nodes (each round adds at least one edge to some node's
+reachable set, or the fixpoint is already reached). -/
+def closure : Nat → List (String × List String) → List (String × List String) → List (String × List String)
+  | 0, _, cur => cur
+  | fuel + 1, direct, cur =>
+      let next := closureStep direct cur
+      if next.map (fun p => p.2.length) == cur.map (fun p => p.2.length) then cur
+      else closure fuel direct next
+
+/-- Is `b` in `a`'s reachable set, per an already-computed `closure` table? -/
+def reachesIn (reach : List (String × List String)) (a b : String) : Bool :=
+  match reach.find? (fun p => p.1 == a) with
+  | some (_, zs) => zs.contains b
+  | none => false
+
+/-- For each top-level `dfn`, the set of names it must be checked against: its
+own recursive group, or `[]` when it does not participate in recursion.
+
+This is march's `scc_of` / `is_recursive` / `rec_set` triple
+(`typecheck.ml:10937-10956`) computed by mutual reachability rather than by
+Tarjan: `n` is in `d`'s group exactly when each reaches the other, which is the
+definition of "same SCC", and `d` is recursive exactly when its group is
+non-empty (`d` reaches itself — covering both `|scc| > 1` and a direct
+self-call). -/
+def recursiveGroups (decls : List Decl) : List (String × List String) :=
+  let bodies := dfnBodies decls
+  let names := bodies.map (·.1)
+  let direct := bodies.map (fun (n, b) =>
+    (n, (termMentions b).filter (fun m => names.contains m)))
+  let reach := closure names.length direct direct
+  names.map (fun d =>
+    if reachesIn reach d d then
+      (d, names.filter (fun n => reachesIn reach d n && reachesIn reach n d))
+    else (d, []))
+
+/-! ### The structural-decrease whitelist
+
+A non-tail recursive call is only an ERROR for march when it is ALSO not
+provably structurally decreasing (`typecheck.ml:10738-10751`). Gating every
+non-tail recursive call therefore over-skips a large and completely ordinary
+class — `fn fib(n) do fib(n - 1) + fib(n - 2) end`, `n * fact(n - 1)` — that
+march merely WARNS about and accepts. `specs/lang/grammar/parse/p15` is exactly
+this, and blanket gating cost it.
+
+So the gate consults a **whitelist of decreasing-argument shapes we are certain
+about**. It is deliberately a strict SUBSET of march's own
+`is_structurally_smaller` (`typecheck.ml:10693-10706`), never an attempt to
+reproduce it, because the asymmetry is total: over-gating costs coverage,
+under-gating reinstates the false accept that this whole gate exists to remove.
+
+march's rule, for reference (`typecheck.ml:10693-10706` plus the `List.exists`
+at `:10743`): a call is allowed when **at least one argument** is
+(1) a variable in `smaller`, (2) `v - _` or `v / _` where `v` is a parameter or
+in `smaller` — **the right operand is not examined at all**, so march accepts
+`n - 0` and `n - m`, (3) a list-accessor application, or (4) a nullary
+constructor. `smaller` grows at a `match` whose scrutinee is a bare parameter (or
+already-smaller variable): every variable bound by an arm's pattern joins
+`smaller` inside that arm (`typecheck.ml:10812-10824`) — which is what makes the
+desugared multi-head `fib` work, since merging leaves one synthetic `__arg0`
+parameter and binds `n` in a `PatVar` arm.
+
+**What this whitelist recognises, and nothing else:** an argument
+`p - k` where `p` is a bare variable in the current decrease base and `k` is a
+**positive integer literal**. The base starts as the `dfn`'s own directly-bound
+parameter names and grows exactly as march's `smaller` does at a `match` on a
+base variable.
+
+Every difference from march is in the over-gating direction:
+
+| shape | march | here |
+|---|---|---|
+| `f(n - 1)` | smaller | **recognised** |
+| `f(n - 0)` | smaller (rhs unexamined) | gated — `k` must be positive |
+| `f(n - m)` | smaller | gated — `k` must be a literal |
+| `f(n / 2)` | smaller | gated — only `-` is recognised |
+| `f(xs_tail)` where `xs_tail` is pattern-bound | smaller (rule 1) | gated |
+| `f(List.nth(xs, i))`, `f(Nil)` | smaller (rules 3, 4) | gated |
+| `p` shadowed by an inner `let`/`lam`/pattern | still counted (march never removes) | gated — base is shadowing-aware |
+| `f(n + 1)`, `f(n * 2)`, `f(g(n))`, `f(q)` | NOT smaller | gated (agrees) |
+
+The last row is the one that matters for safety, and it agrees exactly. -/
+
+/-- Every variable name a pattern binds (march's `collect_pattern_vars`). -/
+partial def patternVars : Pattern → List String
+  | .wild | .lit _ | .unsupported => []
+  | .var n _ => [n]
+  | .con _ args => args.flatMap patternVars
+  | .tuple es => es.flatMap patternVars
+  | .record fs => fs.flatMap (fun (_, p) => patternVars p)
+  | .as n p => n :: patternVars p
+  | .or_ alts => alts.flatMap patternVars
+
+/-- Is `arg` a recognised structurally-decreasing argument — `p - k` for a bare
+`p` in the decrease base `base` and a positive integer literal `k`? See the
+section doc: this is a deliberate strict subset of march's
+`is_structurally_smaller`. -/
+def isRecognisedDecrease (base : List String) : Term → Bool
+  | .app (.var "-" _ _) [.var p _ _, .lit (.int k) _] _ => base.contains p && k > 0
+  | _ => false
+
+/-- Does `t` contain a use of a member of `names` that march's tail-call pass
+could flag as an ERROR — i.e. anything other than (a) the direct callee of a
+tail-position call, or (b) the direct callee of a call carrying a recognised
+structurally-decreasing argument?
+
+`tail` is whether `t` itself sits in tail position; `base` is the decrease base
+(see the section doc). Every unrecognised or ambiguous position is treated as
+non-tail and every unrecognised argument as non-decreasing, so the answer errs
+toward `true` (⇒ skip). -/
+partial def hasNonTailRecUse (names : List String) : Bool → List String → Term → Bool
+  | _, _, .lit _ _ => false
+  -- A bare mention that is not an app callee: conservatively disqualifying even
+  -- in tail position (march would not count it as a recursive CALL at all).
+  | _, _, .var n _ _ => names.contains n
+  | tail, base, .app fn args _ =>
+      let calleeBad :=
+        match fn with
+        -- A direct call to a group member is fine when the call is itself in
+        -- tail position, or when at least one argument is a recognised
+        -- structural decrease (march's `List.exists`, `typecheck.ml:10743`).
+        | .var n _ _ =>
+            if names.contains n then
+              !(tail || args.any (isRecognisedDecrease base))
+            else false
+        | _ => hasNonTailRecUse names false base fn
+      calleeBad || args.any (hasNonTailRecUse names false base)
+  -- A lambda's parameters shadow same-named entries in the decrease base.
+  | _, base, .lam ps body _ =>
+      hasNonTailRecUse names false (base.filter (fun b => !(ps.map (·.1)).contains b)) body
+  | tail, base, .let_ n _ _ rhs body _ =>
+      hasNonTailRecUse names false base rhs ||
+        hasNonTailRecUse names tail (base.filter (· != n)) body
+  | tail, base, .letfn n p _ _ fnBody body _ =>
+      hasNonTailRecUse names false (base.filter (fun b => b != n && b != p)) fnBody ||
+        hasNonTailRecUse names tail (base.filter (· != n)) body
+  | tail, base, .ite c t e _ =>
+      hasNonTailRecUse names false base c ||
+        hasNonTailRecUse names tail base t || hasNonTailRecUse names tail base e
+  | _, base, .con _ args _ => args.any (hasNonTailRecUse names false base)
+  | _, base, .tuple es _ => es.any (hasNonTailRecUse names false base)
+  | _, base, .record fs _ => fs.any (fun (_, e) => hasNonTailRecUse names false base e)
+  | _, base, .field r _ _ _ => hasNonTailRecUse names false base r
+  | tail, base, .match_ scrut arms _ =>
+      -- march's `smaller` growth (`typecheck.ml:10812-10824`): matching on a
+      -- bare base variable makes every arm-bound pattern variable part of the
+      -- base inside that arm. Otherwise the pattern variables SHADOW, so they
+      -- leave the base (march does not do this removal; doing it is stricter).
+      let scrutInBase := match scrut with
+        | .var v _ _ => base.contains v
+        | _ => false
+      hasNonTailRecUse names false base scrut ||
+        arms.any (fun (p, g, b) =>
+          let pv := patternVars p
+          let armBase :=
+            if scrutInBase then base ++ pv.filter (fun x => !base.contains x)
+            else base.filter (fun x => !pv.contains x)
+          (g.map (hasNonTailRecUse names false armBase)).getD false ||
+            hasNonTailRecUse names tail armBase b)
+  | _, _, .opaque_ _ _ => false
+  | _, _, .unsupported _ => false
+
+/-- The gate itself: `some name` when top-level `dfn` `name` participates in
+recursion and uses a member of its own recursive group outside a tail-position
+call — i.e. exactly when march would apply an ERROR-level check this oracle does
+not model, and the module must therefore return `.skip` instead of `.accept`. -/
+def nonTailRecursionGate (decls : List Decl) : Option String :=
+  let groups := recursiveGroups decls
+  decls.findSome? (fun d =>
+    match d with
+    | .dfn _ n params _ body =>
+        match groups.find? (fun p => p.1 == n) with
+        | some (_, grp) =>
+            if grp.isEmpty then none
+            -- The decrease base starts as this `dfn`'s own directly-bound
+            -- parameter names (march's `fn_params`, `typecheck.ml:10957-10963`).
+            else if hasNonTailRecUse grp true (params.map (·.1)) body then some n
+            else none
+        | none => none
+    | _ => none)
+
 /-- `inferModule m`: A2's independent verdict on a module, as an
 `OracleVerdict` (not a pure value) because `Infer.inferModule'` runs in
 `IO` (the `Supply` metavariable arena is backed by `IO.Ref`s) — this
@@ -308,6 +598,18 @@ def inferModule (m : Module) : IO OracleVerdict := do
     else
       return .reject s!"infer: {e}"
   | .ok recorded =>
+    -- (2c) Non-tail-recursion accept gate. Inference found no type error, so
+    -- the only verdicts still open are `.accept`/`.typesDiffer` — and neither
+    -- is honest for a module where march applies its unmodeled ERROR-level
+    -- tail-call check (`enforce_tail_calls_in_decls`). Decline to answer
+    -- instead. Placed AFTER the `.error` branch above so a genuine type
+    -- disagreement still rejects regardless of tail position, and BEFORE the
+    -- step-(3) cross-check so we do not report `.typesDiffer` about a module we
+    -- have just admitted we cannot judge. See `nonTailRecursionGate`.
+    match nonTailRecursionGate m'.decls with
+    | some n =>
+      return .skip s!"out of modeled fragment: `{n}` uses its recursive group outside tail position; march's ERROR-level tail-call check (typecheck.ml:10902) is not modeled"
+    | none => pure ()
     -- (3) cross-check every recorded var/field node against march's resolved_ty.
     let env := buildTyEnv m'.decls
     let spanTys := moduleSpanTys env m'
@@ -448,5 +750,188 @@ private def mRejectAnnotMismatch : Module :=
   let r ← inferModule mRejectAnnotMismatch
   IO.println s!"reject-annot-mismatch-case: {repr r}"
 -- expected: reject-annot-mismatch-case: OracleVerdict.reject "infer: ..."
+
+/-! ### The non-tail-recursion accept gate
+
+Fixtures for `nonTailRecursionGate` (see its section doc). Each shape below was
+also run end-to-end against the real march binary; the quoted march verdict is
+the observed one, and every `march=1` was confirmed to carry march's tail-call
+diagnostic (`recursive call to 'X' is not in tail position`), not a parse or
+unbound-name error. -/
+
+private def iTy : Ty := Ty.con "Int" []
+private def sp (k : Nat) : Span := ⟨"t", k, 0, k, 1⟩
+private def vI (n : String) (k : Nat) : Term := Term.var n (sp k) iTy
+private def lit1 : Term := Term.lit (.int 1) iTy
+/-- `a + b`. The `+` callee node carries a non-arrow `resolved_ty`, exactly the
+operator quirk `termSpanTys` already excludes from the cross-check. -/
+private def plusT (k : Nat) (a b : Term) : Term :=
+  Term.app (Term.var "+" (sp k) iTy) [a, b] iTy
+/-- `f(arg)`. -/
+private def call1 (f : String) (k : Nat) (arg : Term) : Term :=
+  Term.app (Term.var f (sp k) iTy) [arg] iTy
+/-- `fn <name>(n : Int) : Int do <body> end`. -/
+private def fnI (name : String) (body : Term) : Decl :=
+  .dfn .pub name [("n", .unrestricted, some iTy)] (some iTy) body
+
+/-- SELF-RECURSION, non-tail. `fn loopy(n : Int) : Int do loopy(n + 1) + 1 end`.
+march REJECTS (`recursive call to 'loopy' is not in tail position`). This was a
+false accept BEFORE the forward-reference work too — self-recursion never needed
+the pre-pass — and the gate closes it. -/
+private def mGateSelf : Module :=
+  { decls := [fnI "loopy" (plusT 10 (call1 "loopy" 11 (plusT 12 (vI "n" 13) lit1)) lit1)],
+    schemes := [], insts := [] }
+
+#eval show IO Unit from do
+  let r ← inferModule mGateSelf
+  IO.println s!"gate-self-nontail: {repr r}"
+-- expected: gate-self-nontail: OracleVerdict.skip "out of modeled fragment: `loopy` uses ..."
+
+/-- MUTUAL RECURSION, non-tail. `fn a(n) do b(n + 1) + 1 end` /
+`fn b(n) do a(n + 1) + 1 end`. march REJECTS. Reachable only since the
+ground-signature pre-pass made the pair inferable at all; without the gate this
+was a confident ACCEPT on a program march rejects. -/
+private def mGateMutual : Module :=
+  { decls := [fnI "a" (plusT 20 (call1 "b" 21 (plusT 22 (vI "n" 23) lit1)) lit1),
+              fnI "b" (plusT 24 (call1 "a" 25 (plusT 26 (vI "n" 27) lit1)) lit1)],
+    schemes := [], insts := [] }
+
+#eval show IO Unit from do
+  let r ← inferModule mGateMutual
+  IO.println s!"gate-mutual-nontail: {repr r}"
+-- expected: gate-mutual-nontail: OracleVerdict.skip "out of modeled fragment: `a` uses ..."
+
+/-- The gate must NOT fire on a tail-safe recursive group. `fn a(n) do b(n) end`
+/ `fn b(n) do a(n) end`: every recursive call is the whole body, hence in tail
+position. march accepts the corresponding program, and so must this. -/
+private def mGateTailSafe : Module :=
+  { decls := [fnI "a" (call1 "b" 30 (vI "n" 31)),
+              fnI "b" (call1 "a" 32 (vI "n" 33))],
+    schemes := [], insts := [] }
+
+#eval show IO Unit from do
+  let r ← inferModule mGateTailSafe
+  IO.println s!"gate-tailsafe: {repr r}"
+-- expected: gate-tailsafe: OracleVerdict.accept
+
+/-- SCOPING — the load-bearing half. A function that is not itself recursive is
+never gated, however it calls a recursive one. `fn user(n) do count(n) + 1 end`
+calls the (tail-safe, self-recursive) `count` from a non-tail position; march
+does not flag that, because `check_tail_position` is only ever applied to
+members of a recursive group with that group as `rec_set`
+(`typecheck.ml:10943-10965`). Were the gate not scoped the same way, the
+overwhelmingly common `fn main() do println(int_to_string(helper(x))) end`
+would skip and the corpus baseline would collapse. -/
+private def mGateScoping : Module :=
+  { decls := [fnI "count" (call1 "count" 40 (vI "n" 41)),
+              fnI "user" (plusT 42 (call1 "count" 43 (vI "n" 44)) lit1)],
+    schemes := [], insts := [] }
+
+#eval show IO Unit from do
+  let r ← inferModule mGateScoping
+  IO.println s!"gate-scoping: {repr r}"
+-- expected: gate-scoping: OracleVerdict.accept
+
+/-- The gate must never MASK a reject. Same non-tail mutual shape as
+`mGateMutual`, but `a` is called with a `Bool`: a genuine type error. The gate
+runs only after inference has succeeded, so this must still be
+`.reject`, not `.skip` — tail position is irrelevant once the program is
+independently known to be ill-typed. -/
+private def mGateRejectStillWins : Module :=
+  { decls := [fnI "a" (plusT 50 (call1 "b" 51 (vI "n" 52)) lit1),
+              fnI "b" (call1 "a" 53 (Term.lit (.bool true) (Ty.con "Bool" [])))],
+    schemes := [], insts := [] }
+
+#eval show IO Unit from do
+  let r ← inferModule mGateRejectStillWins
+  IO.println s!"gate-reject-still-wins: {repr r}"
+-- expected: gate-reject-still-wins: OracleVerdict.reject "infer: ..."
+
+/-! #### The structural-decrease whitelist
+
+`fn f(n) do f(n - 1) … end` is non-tail but march proves the decrease and only
+WARNS, so it must NOT be gated. `specs/lang/grammar/parse/p15` (the desugared
+multi-head `fib`) is the real-corpus instance: blanket gating regressed it from
+MATCH to SKIP, which is what motivated the whitelist. -/
+
+/-- `a - b`. -/
+private def minusT (k : Nat) (a b : Term) : Term :=
+  Term.app (Term.var "-" (sp k) iTy) [a, b] iTy
+private def litN (v : Int) : Term := Term.lit (.int v) iTy
+
+/-- `n * fact(n - 1)` — non-tail, but the argument decreases, so march WARNS and
+accepts, and the gate must not fire. -/
+private def mDecFact : Module :=
+  { decls := [fnI "fact"
+      (Term.app (Term.var "*" (sp 60) iTy)
+        [vI "n" 61, call1 "fact" 62 (minusT 63 (vI "n" 64) (litN 1))] iTy)],
+    schemes := [], insts := [] }
+
+#eval show IO Unit from do
+  let r ← inferModule mDecFact
+  IO.println s!"dec-fact: {repr r}"
+-- expected: dec-fact: OracleVerdict.accept
+
+/-- The `p15` shape: a merged multi-head `fn`, i.e. one synthetic parameter
+`__arg0`, a `match` on it, and the recursive arm binding `n` via `PatVar`. `n`
+is therefore NOT a parameter — it only counts because march's `smaller` set
+grows at a match on a parameter (`typecheck.ml:10812-10824`), which
+`hasNonTailRecUse`'s `match_` arm mirrors. Deleting that mirroring makes this
+fixture skip, and takes p15 with it. -/
+private def mDecFib : Module :=
+  { decls := [.dfn .pub "fib" [("__arg0", .unrestricted, some iTy)] (some iTy)
+      (Term.match_ (vI "__arg0" 70)
+        [(Pattern.lit (.int 0), none, litN 0),
+         (Pattern.var "n" .unrestricted, none,
+           plusT 71 (call1 "fib" 72 (minusT 73 (vI "n" 74) (litN 1)))
+                    (call1 "fib" 75 (minusT 76 (vI "n" 77) (litN 2))))]
+        iTy)],
+    schemes := [], insts := [] }
+
+#eval show IO Unit from do
+  let r ← inferModule mDecFib
+  IO.println s!"dec-fib: {repr r}"
+-- expected: dec-fib: OracleVerdict.accept
+
+/-- Shadowing has teeth: same body as `mDecFib`, but the arm variable is bound
+by a `match` on something that is NOT in the decrease base (a literal), so `n`
+never joins it and the call is gated. Pins that the base really is consulted
+rather than every `PatVar` being trusted. -/
+private def mDecFibNoBase : Module :=
+  { decls := [.dfn .pub "fib2" [("__arg0", .unrestricted, some iTy)] (some iTy)
+      (Term.match_ (litN 7)
+        [(Pattern.var "n" .unrestricted, none,
+           plusT 78 (call1 "fib2" 79 (minusT 80 (vI "n" 81) (litN 1))) (litN 0))]
+        iTy)],
+    schemes := [], insts := [] }
+
+#eval show IO Unit from do
+  let r ← inferModule mDecFibNoBase
+  IO.println s!"dec-fib-no-base: {repr r}"
+-- expected: dec-fib-no-base: OracleVerdict.skip ...
+
+/- `isRecognisedDecrease` at its edges, with `n` in the base and `q` not.
+Recognised: `n - 1`. Not recognised, each for its own reason: `n - 0` (`k` must
+be positive — march WOULD accept this, we over-gate), `n + 1` (wrong operator),
+`n - m` (`k` not a literal), `q - 1` (`q` not in the base), and a bare `n`
+(march's rule 1, deliberately not implemented). -/
+#eval show IO Unit from do
+  let base := ["n"]
+  let r := [ isRecognisedDecrease base (minusT 1 (vI "n" 2) (litN 1)),
+             isRecognisedDecrease base (minusT 1 (vI "n" 2) (litN 0)),
+             isRecognisedDecrease base (plusT 1 (vI "n" 2) (litN 1)),
+             isRecognisedDecrease base (minusT 1 (vI "n" 2) (vI "m" 3)),
+             isRecognisedDecrease base (minusT 1 (vI "q" 2) (litN 1)),
+             isRecognisedDecrease base (vI "n" 2) ]
+  IO.println s!"dec-shapes: {r}"
+-- expected: dec-shapes: [true, false, false, false, false, false]
+
+/- `recursiveGroups` directly: `count` is its own one-member group (a direct
+self-call), while `user` — which only calls into it — is not recursive and gets
+the empty group that disables gating. -/
+#eval show IO Unit from do
+  let g := recursiveGroups mGateScoping.decls
+  IO.println s!"gate-groups: {repr g}"
+-- expected: gate-groups: [("count", ["count"]), ("user", [])]
 
 end MarchLean.Compare.Test
