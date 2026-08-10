@@ -1,0 +1,6 @@
+mod M do
+  fn fact(n : Int) : Int do
+    if n <= 1 do 1 else fact(n - 1) * n end
+  end
+  fn main() do println(int_to_string(fact(5))) end
+end

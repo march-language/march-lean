@@ -1,0 +1,19 @@
+mod M do
+  fn step(x : Int) : Result(Int, String) do
+    if x > 0 do Ok(x - 1) else Err("neg") end
+  end
+  fn spin(n : Int) : Result(Int, String) do
+    if n == 0 do
+      Ok(0)
+    else
+      let? a = step(n)
+      spin(a)
+    end
+  end
+  fn main() do
+    match spin(3) do
+      Ok(v)  -> println(int_to_string(v))
+      Err(e) -> println(e)
+    end
+  end
+end

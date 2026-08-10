@@ -1,2 +1,8 @@
 /.lake
 /.march
+
+# march writes its content-addressed build cache next to whatever file it
+# compiles, so a `.march/` appears under scripts/tailcall-probes/ the first
+# time the probe suite runs. The rooted `/.march` above only covers the repo
+# root; this covers it anywhere.
+.march/

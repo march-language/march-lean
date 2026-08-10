@@ -1,0 +1,6 @@
+mod M do
+  fn count(n : Int, acc : Int) : Int do
+    if n == 0 do acc else count(n + 1, acc + 1) end
+  end
+  fn main() do println(int_to_string(count(0, 0))) end
+end

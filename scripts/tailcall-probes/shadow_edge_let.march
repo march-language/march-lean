@@ -1,0 +1,11 @@
+mod M do
+  fn helper(x : Int) : Int do x + 1 end
+  fn peer(n : Int) : Int do
+    if n == 0 do 0 else spin(n + 1) + 1 end
+  end
+  fn spin(n : Int) : Int do
+    let peer = helper
+    peer(n)
+  end
+  fn main() do println(int_to_string(spin(1))) end
+end

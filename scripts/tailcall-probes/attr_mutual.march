@@ -1,0 +1,11 @@
+mod M do
+  @[no_warn_recursion]
+  fn ping(n : Int) : Int do
+    if n == 0 do 0 else pong(n + 1) + 1 end
+  end
+  @[no_warn_recursion]
+  fn pong(n : Int) : Int do
+    if n == 0 do 0 else ping(n + 1) + 1 end
+  end
+  fn main() do println(int_to_string(ping(0))) end
+end

@@ -1,0 +1,10 @@
+mod M do
+  fn dec(x : Int) : Int do x - 1 end
+  fn spin(n : Int) : Int do
+    match do
+      n == 0 -> 0
+      true   -> spin(dec(n))
+    end
+  end
+  fn main() do println(int_to_string(spin(3))) end
+end

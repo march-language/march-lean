@@ -3,6 +3,7 @@ import MarchLean.Elab
 import MarchLean.CapCheck
 import MarchLean.Compare
 import MarchLean.Linearity
+import MarchLean.TailCall
 import Lean.Data.Json
 
 /-!
@@ -73,6 +74,23 @@ def run (input : String) : IO UInt32 := do
           match capRes with
           | .violation msg => IO.eprintln s!"reject (capability): {msg}"; pure 1
           | _ =>
+          -- Pass 3: tail-call enforcement. Placed here for the same reason
+          -- `CapCheck` is — it needs no inference, so running it BEFORE the
+          -- skip gate lets it judge a module whose body is out of fragment.
+          -- march orders it identically (its capability checks at
+          -- `typecheck.ml:11351-11364` precede Pass 3 at `:11367`).
+          --
+          -- It reads the raw envelope, not `m`: `Elab` drops `fn.attrs` (so
+          -- `@[no_warn_recursion]` would be invisible) and collapses
+          -- `ECond`/`ELetQ`/`ELetFn` to `Term.opaque_`, erasing exactly the
+          -- tail positions and binders this analysis is made of. See
+          -- `MarchLean.TailCall`'s docstring.
+          --
+          -- Like a clean `CapCheck`, `.ok` licenses NOTHING: control falls
+          -- through to the unchanged skip-gate → inference → linearity path.
+          match MarchLean.TailCall.check envelope with
+          | .violation msg => IO.eprintln s!"reject (tail-call): {msg}"; pure 1
+          | .ok =>
           let iv ← MarchLean.Compare.inferModule m
           match iv with
           | .skip r => IO.eprintln s!"skip: {r}"; pure 2

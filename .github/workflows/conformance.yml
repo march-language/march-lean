@@ -134,6 +134,20 @@ jobs:
       - name: Install z3
         run: sudo apt-get install -y z3
 
+      # Tail-call probes (march Pass 3). These do NOT overlap the corpus: the
+      # conformance corpus contains no unbounded non-tail recursion, so a green
+      # harness run is no evidence at all that the tail-call pass works. The
+      # probes are hand-built programs that exercise it directly — both the
+      # rejects it must now catch and, more importantly, the shapes march
+      # deliberately allows (structural recursion, tail positions, shadowed
+      # names, `@[no_warn_recursion]`, nested `mod`) that it must never reject.
+      # Runs before the harness so a false reject here fails fast.
+      - name: Run tail-call probes
+        run: |
+          scripts/tailcall-probes.sh \
+            --march-bin "$(command -v march)" \
+            --march-lean-check-bin "$GITHUB_WORKSPACE/.lake/build/bin/march-lean-check"
+
       - name: Run conformance harness
         run: |
           scripts/conformance-harness.sh \
