@@ -1,4 +1,5 @@
 mod M do
+  needs IO.Console
   fn helper(x : Int) : Int do x + 1 end
   fn peer(n : Int) : Int do
     if n == 0 do 0 else spin(n + 1) + 1 end

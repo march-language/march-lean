@@ -1,4 +1,5 @@
 mod Inner do
+  needs IO.Console
   fn boom(n : Int) : Int do
     if n == 0 do 0 else boom(n + 1) + 1 end
   end

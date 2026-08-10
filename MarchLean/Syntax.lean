@@ -39,13 +39,31 @@ inductive Ty where
   | unsupported
   deriving Repr, Inhabited
 
+/-! ### Why these walks are `mutual` rather than `partial`
+
+Every tree walk below recurses through a `List` of children (`args`, `elems`,
+`fields`). Written with `List.any`/`List.all` the recursion is *nested* inside
+a higher-order call, which Lean's structural-recursion checker cannot see
+through — which is why these were all `partial def`.
+
+`partial def` is not free: it compiles to an opaque constant, so the kernel
+can neither unfold it nor induct on it. That is why every test over these
+functions had to say `decide` (trusting the compiler) rather than
+`decide` (trusting the kernel), and why no theorem about them was possible at
+all. Pairing each walk with an explicit `List` helper in a `mutual` block
+makes the descent structural, which buys both back.
+
+Behavior is unchanged: each helper is the fold `List.any`/`List.all` already
+performed, in the same order and with the same short-circuiting. -/
+
+mutual
 /-- Does this type contain an `unsupported` node anywhere? -/
-partial def Ty.hasUnsupported : Ty → Bool
+def Ty.hasUnsupported : Ty → Bool
   | .unsupported => true
-  | .con _ args => args.any Ty.hasUnsupported
+  | .con _ args => Ty.anyHasUnsupported args
   | .arrow a b => a.hasUnsupported || b.hasUnsupported
-  | .tuple ts => ts.any Ty.hasUnsupported
-  | .record fs => fs.any (fun (_, t) => t.hasUnsupported)
+  | .tuple ts => Ty.anyHasUnsupported ts
+  | .record fs => Ty.anyFieldHasUnsupported fs
   | .lin _ t => t.hasUnsupported
   | .natOp _ a b => a.hasUnsupported || b.hasUnsupported
   -- H3: a `TError` should never appear in accept output; if it does, honest-skip
@@ -53,14 +71,30 @@ partial def Ty.hasUnsupported : Ty → Bool
   | .err => true
   | .var _ | .nat _ => false
 
+/-- `args.any Ty.hasUnsupported`, made structural. -/
+def Ty.anyHasUnsupported : List Ty → Bool
+  | [] => false
+  | t :: ts => t.hasUnsupported || Ty.anyHasUnsupported ts
+
+/-- `fs.any (fun (_, t) => t.hasUnsupported)`, made structural. -/
+def Ty.anyFieldHasUnsupported : List (String × Ty) → Bool
+  | [] => false
+  | (_, t) :: fs => t.hasUnsupported || Ty.anyFieldHasUnsupported fs
+end
+
+mutual
 /-- Structural type equality (NOT canonical — `Check` canonicalizes named
-records first, then calls this). -/
-partial def Ty.beq : Ty → Ty → Bool
-  | .con n1 a1, .con n2 a2 => n1 == n2 && a1.length == a2.length && (a1.zip a2).all (fun (x,y) => x.beq y)
+records first, then calls this).
+
+The list arms fold `length ==` and the zipped element comparison into a single
+structural walk: `beqList` returns `false` on a length mismatch by falling
+through to its `_, _` arm, which is exactly what `length == length && zip …`
+computed before. -/
+def Ty.beq : Ty → Ty → Bool
+  | .con n1 a1, .con n2 a2 => n1 == n2 && Ty.beqList a1 a2
   | .arrow a1 b1, .arrow a2 b2 => a1.beq a2 && b1.beq b2
-  | .tuple t1, .tuple t2 => t1.length == t2.length && (t1.zip t2).all (fun (x,y) => x.beq y)
-  | .record f1, .record f2 =>
-      f1.length == f2.length && (f1.zip f2).all (fun ((n1,t1),(n2,t2)) => n1 == n2 && t1.beq t2)
+  | .tuple t1, .tuple t2 => Ty.beqList t1 t2
+  | .record f1, .record f2 => Ty.beqFields f1 f2
   | .var i1, .var i2 => i1 == i2
   | .lin l1 t1, .lin l2 t2 => l1 == l2 && t1.beq t2
   | .nat n1, .nat n2 => n1 == n2
@@ -68,6 +102,20 @@ partial def Ty.beq : Ty → Ty → Bool
   | .err, .err => true
   | .unsupported, .unsupported => true
   | _, _ => false
+
+/-- Pointwise `Ty.beq` over two lists; `false` if the lengths differ. -/
+def Ty.beqList : List Ty → List Ty → Bool
+  | [], [] => true
+  | x :: xs, y :: ys => x.beq y && Ty.beqList xs ys
+  | _, _ => false
+
+/-- Pointwise name-and-type equality over two record field lists; `false` if
+the lengths differ. -/
+def Ty.beqFields : List (String × Ty) → List (String × Ty) → Bool
+  | [], [] => true
+  | (n1, t1) :: f1, (n2, t2) :: f2 => n1 == n2 && t1.beq t2 && Ty.beqFields f1 f2
+  | _, _ => false
+end
 
 instance : BEq Ty := ⟨Ty.beq⟩
 
@@ -106,15 +154,27 @@ inductive Pattern where
   | unsupported
   deriving Repr, Inhabited
 
+mutual
 /-- Does this pattern contain an `unsupported` node anywhere? -/
-partial def Pattern.hasUnsupported : Pattern → Bool
+def Pattern.hasUnsupported : Pattern → Bool
   | .unsupported => true
-  | .con _ args => args.any Pattern.hasUnsupported
-  | .tuple ps => ps.any Pattern.hasUnsupported
-  | .record fs => fs.any (fun (_, p) => p.hasUnsupported)
+  | .con _ args => Pattern.anyHasUnsupported args
+  | .tuple ps => Pattern.anyHasUnsupported ps
+  | .record fs => Pattern.anyFieldHasUnsupported fs
   | .as _ p => p.hasUnsupported
-  | .or_ alts => alts.any Pattern.hasUnsupported
+  | .or_ alts => Pattern.anyHasUnsupported alts
   | .wild | .var _ _ | .lit _ => false
+
+/-- `ps.any Pattern.hasUnsupported`, made structural. -/
+def Pattern.anyHasUnsupported : List Pattern → Bool
+  | [] => false
+  | p :: ps => p.hasUnsupported || Pattern.anyHasUnsupported ps
+
+/-- `fs.any (fun (_, p) => p.hasUnsupported)`, made structural. -/
+def Pattern.anyFieldHasUnsupported : List (String × Pattern) → Bool
+  | [] => false
+  | (_, p) :: fs => p.hasUnsupported || Pattern.anyFieldHasUnsupported fs
+end
 
 /-- Term. Each node carries its resolved type `ty`. `var` and `field` also
 carry their `span` (for the instantiation join). -/
@@ -188,8 +248,21 @@ def optTyHasUnsupported : Option Ty → Bool
   | none => false
   | some t => t.hasUnsupported
 
-/-- Is this term (or any subterm/type) out of fragment? -/
-partial def Term.hasUnsupported : Term → Bool
+/-- `ps.any (fun (_, _, a) => optTyHasUnsupported a)` over lambda params. -/
+def anyParamAnnotUnsupported : List (String × Lin × Option Ty) → Bool
+  | [] => false
+  | (_, _, a) :: ps => optTyHasUnsupported a || anyParamAnnotUnsupported ps
+
+mutual
+/-- Is this term (or any subterm/type) out of fragment?
+
+The `| t => t.ty.hasUnsupported || (match t with …)` shape this replaced was
+convenient but not structural — the outer catch-all binds the whole term, so
+Lean cannot see that the inner `match`'s recursive calls descend. Every
+constructor now names its own arm and repeats the node's own `ty` check
+explicitly. Same result on every input; `.unsupported` still short-circuits
+before the `ty` check, and every other arm still tests `ty` first. -/
+def Term.hasUnsupported : Term → Bool
   | .unsupported _ => true
   -- LOAD-BEARING, and deliberately NOT a recursion into `children`: an
   -- `opaque_` node is out of fragment BY CONSTRUCTION (its own shape is
@@ -198,23 +271,51 @@ partial def Term.hasUnsupported : Term → Bool
   -- gate firing on exactly the files it fired on before this constructor
   -- existed, which is the entire reason carrying the children costs nothing
   -- in false-reject exposure. Do not "improve" this to
-  -- `children.any hasUnsupported`.
+  -- `Term.anyHasUnsupported children`.
   | .opaque_ _ _ => true
-  | t =>
-    t.ty.hasUnsupported ||
-    (match t with
-     | .app f args _ => f.hasUnsupported || args.any Term.hasUnsupported
-     | .lam ps b _ => ps.any (fun (_, _, a) => optTyHasUnsupported a) || b.hasUnsupported
-     | .let_ _ _ annot r b _ => optTyHasUnsupported annot || r.hasUnsupported || b.hasUnsupported
-     | .letfn _ _ _ pa fb b _ => optTyHasUnsupported pa || fb.hasUnsupported || b.hasUnsupported
-     | .ite c u v _ => c.hasUnsupported || u.hasUnsupported || v.hasUnsupported
-     | .con _ args _ => args.any Term.hasUnsupported
-     | .tuple es _ => es.any Term.hasUnsupported
-     | .record fs _ => fs.any (fun (_, e) => e.hasUnsupported)
-     | .field r _ _ _ => r.hasUnsupported
-     | .match_ s arms _ => s.hasUnsupported ||
-         arms.any (fun (p, g, e) => p.hasUnsupported || (g.map Term.hasUnsupported).getD false || e.hasUnsupported)
-     | _ => false)
+  | .lit _ ty => ty.hasUnsupported
+  | .var _ _ ty => ty.hasUnsupported
+  | .app f args ty =>
+      ty.hasUnsupported || f.hasUnsupported || Term.anyHasUnsupported args
+  | .lam ps b ty =>
+      ty.hasUnsupported || anyParamAnnotUnsupported ps || b.hasUnsupported
+  | .let_ _ _ annot r b ty =>
+      ty.hasUnsupported || optTyHasUnsupported annot || r.hasUnsupported || b.hasUnsupported
+  | .letfn _ _ _ pa fb b ty =>
+      ty.hasUnsupported || optTyHasUnsupported pa || fb.hasUnsupported || b.hasUnsupported
+  | .ite c u v ty =>
+      ty.hasUnsupported || c.hasUnsupported || u.hasUnsupported || v.hasUnsupported
+  | .con _ args ty => ty.hasUnsupported || Term.anyHasUnsupported args
+  | .tuple es ty => ty.hasUnsupported || Term.anyHasUnsupported es
+  | .record fs ty => ty.hasUnsupported || Term.anyFieldHasUnsupported fs
+  | .field r _ _ ty => ty.hasUnsupported || r.hasUnsupported
+  | .match_ s arms ty =>
+      ty.hasUnsupported || s.hasUnsupported || Term.anyArmHasUnsupported arms
+
+/-- `es.any Term.hasUnsupported`, made structural. -/
+def Term.anyHasUnsupported : List Term → Bool
+  | [] => false
+  | e :: es => e.hasUnsupported || Term.anyHasUnsupported es
+
+/-- `fs.any (fun (_, e) => e.hasUnsupported)`, made structural. -/
+def Term.anyFieldHasUnsupported : List (String × Term) → Bool
+  | [] => false
+  | (_, e) :: fs => e.hasUnsupported || Term.anyFieldHasUnsupported fs
+
+/-- Match arms: pattern, optional guard, and body all count. The pattern
+component is load-bearing — dropping it was a real false-accept bug (see this
+file's regression tests). -/
+def Term.anyArmHasUnsupported : List (Pattern × Option Term × Term) → Bool
+  | [] => false
+  | (p, g, e) :: arms =>
+      p.hasUnsupported || Term.optHasUnsupported g || e.hasUnsupported
+        || Term.anyArmHasUnsupported arms
+
+/-- `(g.map Term.hasUnsupported).getD false`, made structural. -/
+def Term.optHasUnsupported : Option Term → Bool
+  | none => false
+  | some e => e.hasUnsupported
+end
 
 /-- Datatype constructor signature (from a `DType` decl). -/
 structure CtorSig where
@@ -293,28 +394,39 @@ inductive Decl where
   | unsupported
   deriving Repr, Inhabited
 
+mutual
 /-- Is this declaration (or any term/type it carries) out of fragment?
 `dtype` carries no terms, but its constructor signatures may reference
 out-of-fragment types, so those are checked too. The four A3 constructors are
 IN fragment on their own (`dneeds`/`duse`/`dextern` carry no term/type of
 their own); `dmod` recurses into its nested decls, since one of those could
-still be an unsupported `dfn`/`dlet`/`dtype`. Marked `partial`: the recursion
-through `List Decl` inside `dmod` isn't structurally recognized by the
-kernel, matching how `Term.hasUnsupported` handles its own nesting. -/
-partial def Decl.hasUnsupported : Decl → Bool
+still be an unsupported `dfn`/`dlet`/`dtype`. -/
+def Decl.hasUnsupported : Decl → Bool
   | .unsupported => true
   | .dfn _ params retAnnot body =>
-      params.any (fun (_, _, a) => optTyHasUnsupported a)
+      anyParamAnnotUnsupported params
         || optTyHasUnsupported retAnnot || body.hasUnsupported
   | .dlet _ body => body.hasUnsupported
-  | .dtype _ _ ctors =>
-      ctors.any (fun c => c.argTys.any Ty.hasUnsupported || c.resultTy.hasUnsupported)
-  | .dmod _ decls => decls.any Decl.hasUnsupported
+  | .dtype _ _ ctors => Decl.anyCtorHasUnsupported ctors
+  | .dmod _ decls => Decl.anyHasUnsupported decls
   | .dneeds _ => false
   | .duse _ => false
   | .dextern _ _ => false
   | .dproofcap _ => false
   | .dopts _ => false
+
+/-- `decls.any Decl.hasUnsupported`, made structural. -/
+def Decl.anyHasUnsupported : List Decl → Bool
+  | [] => false
+  | d :: ds => d.hasUnsupported || Decl.anyHasUnsupported ds
+
+/-- `ctors.any (fun c => c.argTys.any Ty.hasUnsupported || c.resultTy.hasUnsupported)`. -/
+def Decl.anyCtorHasUnsupported : List CtorSig → Bool
+  | [] => false
+  | c :: cs =>
+      Ty.anyHasUnsupported c.argTys || c.resultTy.hasUnsupported
+        || Decl.anyCtorHasUnsupported cs
+end
 
 /-- Splice nested `dmod` decls into a single flat list, for the passes that
 treat a module as a transparent scope (inference, linearity). Cap checking
@@ -324,12 +436,20 @@ tree instead (see `Decl.dmod`'s docstring).
 This is an approximation of march, which scopes names per module and supports
 qualified cross-module references. It is sound only while names do not collide
 across sibling modules; `Elab.decodeModule` refuses files where they do.
-Marked `partial`: the recursion through `List Decl` inside `dmod` isn't
-structurally recognized by the kernel, matching `Decl.hasUnsupported`. -/
-partial def flattenDecls : List Decl → List Decl
+
+Unlike the other walks here this one is not structural even with a helper:
+the `dmod` arm recurses into `inner`, a list nested *inside* the head element
+rather than a tail of the list being consumed. It terminates on the total
+size of the declaration forest instead, which `decreasing_by` discharges —
+`sizeOf inner` is strictly below `sizeOf (.dmod _ inner :: rest)` because the
+list constructor and the `dmod` wrapper each contribute. -/
+def flattenDecls : List Decl → List Decl
   | [] => []
   | .dmod _ inner :: rest => flattenDecls inner ++ flattenDecls rest
   | d :: rest => d :: flattenDecls rest
+termination_by ds => sizeOf ds
+decreasing_by
+  all_goals simp_wf <;> omega
 
 structure Scheme where
   ids : List Int
@@ -374,15 +494,19 @@ end MarchLean.Syntax
 namespace MarchLean.Syntax.Test
 open MarchLean.Syntax
 -- A literal-int term annotated Int must be constructible and flagged clean.
--- `Ty.hasUnsupported` is a `partial def` (nested recursion through `List.any`
--- isn't structurally-recognized by the kernel), so plain `decide` gets stuck
--- unfolding it; `native_decide` evaluates via the compiler instead.
-example : Ty.hasUnsupported (Ty.con "Int" []) = false := by native_decide
+--
+-- These say `decide`, not `native_decide`. They used to say `native_decide`,
+-- because the walks below were `partial def`s the kernel could not unfold —
+-- so every one of these tests was trusting the compiled evaluator rather than
+-- the kernel. Pairing each walk with an explicit `List` helper (see the note
+-- above `Ty.hasUnsupported`) made them structural, and the kernel now checks
+-- these directly. Do not reintroduce `native_decide` here without saying why.
+example : Ty.hasUnsupported (Ty.con "Int" []) = false := by decide
 -- unsupported propagates through structure.
-example : Ty.hasUnsupported (Ty.arrow Ty.unsupported (Ty.con "Int" [])) = true := by native_decide
+example : Ty.hasUnsupported (Ty.arrow Ty.unsupported (Ty.con "Int" [])) = true := by decide
 -- H3: `TError` is a skip trigger — a TError anywhere flags the type.
-example : Ty.hasUnsupported Ty.err = true := by native_decide
-example : Ty.hasUnsupported (Ty.tuple [Ty.con "Int" [], Ty.err]) = true := by native_decide
+example : Ty.hasUnsupported Ty.err = true := by decide
+example : Ty.hasUnsupported (Ty.tuple [Ty.con "Int" [], Ty.err]) = true := by decide
 
 -- Regression for the false-accept bug where `Term.hasUnsupported`'s
 -- `match_` arm discarded the `Pattern` component of each arm, so an
@@ -397,24 +521,24 @@ private def badNestedArm : Pattern × Option Term × Term :=
   (Pattern.con "Some" [Pattern.unsupported], none, Term.lit (Lit.int 1) intTy)
 
 -- A match with only clean patterns/arms is in-fragment.
-example : Term.hasUnsupported (Term.match_ okScrut [okArm] intTy) = false := by native_decide
+example : Term.hasUnsupported (Term.match_ okScrut [okArm] intTy) = false := by decide
 -- A match with an `unsupported` pattern directly in an arm must be flagged
 -- (this is exactly what the old code missed: `fun (_, e) => e.hasUnsupported`
 -- ignored the pattern).
-example : Term.hasUnsupported (Term.match_ okScrut [okArm, badArm] intTy) = true := by native_decide
+example : Term.hasUnsupported (Term.match_ okScrut [okArm, badArm] intTy) = true := by decide
 -- Same, but the `unsupported` is nested inside a constructor pattern.
-example : Term.hasUnsupported (Term.match_ okScrut [okArm, badNestedArm] intTy) = true := by native_decide
+example : Term.hasUnsupported (Term.match_ okScrut [okArm, badNestedArm] intTy) = true := by decide
 -- `Pattern.hasUnsupported` itself, standalone: top-level and nested.
-example : Pattern.hasUnsupported Pattern.wild = false := by native_decide
-example : Pattern.hasUnsupported Pattern.unsupported = true := by native_decide
+example : Pattern.hasUnsupported Pattern.wild = false := by decide
+example : Pattern.hasUnsupported Pattern.unsupported = true := by decide
 example : Pattern.hasUnsupported (Pattern.tuple [Pattern.wild, Pattern.unsupported]) = true := by
-  native_decide
-example : Pattern.hasUnsupported (Pattern.as "x" Pattern.unsupported) = true := by native_decide
+  decide
+example : Pattern.hasUnsupported (Pattern.as "x" Pattern.unsupported) = true := by decide
 -- `Pattern.or_`: clean alternatives are in-fragment; an `unsupported`
 -- alternative anywhere in the list is not (A3 slice (c) review finding C1).
 example : Pattern.hasUnsupported (Pattern.or_ [Pattern.con "Red" [], Pattern.con "Green" []]) = false := by
-  native_decide
+  decide
 example : Pattern.hasUnsupported (Pattern.or_ [Pattern.con "Red" [], Pattern.unsupported]) = true := by
-  native_decide
+  decide
 
 end MarchLean.Syntax.Test

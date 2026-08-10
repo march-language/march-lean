@@ -1,4 +1,5 @@
 mod M do
+  needs IO.Console
   fn step(x : Int) : Result(Int, String) do
     if x > 0 do Ok(x - 1) else Err("neg") end
   end
