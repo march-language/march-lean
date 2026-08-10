@@ -1,4 +1,5 @@
 mod M do
+  needs IO.Console
   type Tree = Leaf | Node(Tree, Tree)
   fn size(t : Tree) : Int do
     match t do
