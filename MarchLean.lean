@@ -10,3 +10,4 @@ import MarchLean.CapLattice
 import MarchLean.CapCheck
 import MarchLean.Calculus.Verdicts
 import MarchLean.Calculus.Concrete
+import MarchLean.Calculus.CheckCaps
