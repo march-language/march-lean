@@ -354,10 +354,30 @@ throwaway probes found it immediately.
 **Fix shape.** The machinery already exists: `CapCheck.builtinCaps` maps
 builtin name -> required cap path, and `bodyCalls` already walks bodies for
 builtin calls (both were built for Check 8 and the behavioral caps). Check 1b
-is those two joined to `covered declared`. What needs care is march's exact
-gating — which bodies are scanned, and whether the check is per-function or
-per-module — since implementing it slightly too eagerly converts this
-false-accept class into a false-REJECT class.
+is those two joined to `covered declared`. What needs care is the gating, and it is
+not hypothetical care — implementing this slightly too eagerly converts the
+false-accept class into a false-REJECT class. Three specific hazards, all
+verified against march `6867c783`:
+
+1. **Shadowing.** `bodyCalls` matches purely by NAME
+   (`banned.contains n`), with no scope awareness. A module defining its own
+   `fn println(...)` and calling it would be flagged as calling the builtin.
+   The corpus already contains shadowing cases
+   (`accept/t126_entry_module_shadows_list_length`,
+   `accept/t139_nested_module_shadows_list_length_extern`) and march grew
+   `shadow_*` tail-call probes, so this WILL fire.
+2. **Direct calls only.** march's own comment scopes 1b explicitly: it
+   catches a direct builtin call in a module body; a stdlib-MEDIATED call
+   (`File.read` rather than `file_read`) is invisible to it and is handled by
+   `--cap-strict`'s TIR ceiling instead. Scanning transitively would reject
+   where march accepts.
+3. **1c stays off.** march flipped 1b only —
+   Check 1c (extern implies `IO.Foreign`) is deliberately still a warning.
+   Flipping both because they were skipped together would be wrong.
+
+The self-declaration exemption applies here too: march tests
+`not covered && not self_declared` against `env.proof_caps`, which
+`checkOneModule` already threads as `selfDeclaredCaps`.
 
 **Status.** reported upstream: N/A (march is correct here; this checker is
 behind). NOT YET FIXED in march-lean.
