@@ -1,3 +1,5 @@
+import MarchLean.Calculus.Lattice
+
 /-!
 # The IO capability lattice
 
@@ -10,12 +12,20 @@ three places and `lang/capabilities.md`'s tree omits two; both are stale. The
 entries the docs miss are `IO.Signal` and `IO.WebSocket`. Modelling 18 would
 give wrong subsumption for those two, so this port is taken from the OCaml
 source, not the prose.
+
+Since P0 (`specs/plans/2026-08-08-calculus-proof-capabilities-design.md`),
+each operation here is the specialization of its abstract counterpart in
+`MarchLean.Calculus.Lattice` to `hierarchy` — definitionally, so behavior is
+unchanged. The metatheory (subsumption is a partial order, `normalize` is
+idempotent and coverage-preserving, fuel `hierarchy.length` is adequate) is
+proved there for any well-formed table; `MarchLean.Calculus.Concrete`
+discharges `hierarchy`'s well-formedness by `decide`.
 -/
 namespace MarchLean.CapLattice
 
 /-- The capability hierarchy: `(cap_path, parent_path)`. Mirrors
 `cap_lattice.ml`'s `hierarchy` list exactly, including order. -/
-def hierarchy : List (String × Option String) :=
+def hierarchy : MarchLean.Calculus.Table :=
   [ ("IO",                  none),
     ("IO.Console",          some "IO"),
     ("IO.FileSystem",       some "IO"),
@@ -39,9 +49,7 @@ def hierarchy : List (String × Option String) :=
 
 /-- The parent of a capability, or `none` for a root or an unknown (FFI) name. -/
 def capParent (c : String) : Option String :=
-  match hierarchy.find? (fun (n, _) => n == c) with
-  | some (_, p) => p
-  | none        => none
+  MarchLean.Calculus.parentIn hierarchy c
 
 /-- `capAncestors c` is `c` followed by every ancestor up to the root,
 most-specific first: `capAncestors "IO.FileRead" = ["IO.FileRead",
@@ -53,29 +61,28 @@ like `LibC` are their own roots with no subtyping relationship to anything.
 
 `fuel` is the recursion bound. `hierarchy.length` is a safe bound because the
 table is a finite forest with no cycles, so no chain can exceed its size; the
-parameter exists only to make the function structurally terminating. -/
-def capAncestorsFuel : Nat → String → List String
-  | 0,        c => [c]
-  | fuel + 1, c =>
-      match capParent c with
-      | some p => c :: capAncestorsFuel fuel p
-      | none   => [c]
+parameter exists only to make the function structurally terminating. Since P0
+this is no longer only a prose claim: `Calculus.ancestorsIn_fuel_adequate`
+proves the bound adequate for any well-formed table, and
+`Calculus.Concrete.hierarchy_wellFormed` discharges this table by `decide`. -/
+def capAncestorsFuel (fuel : Nat) (c : String) : List String :=
+  MarchLean.Calculus.ancestorsInFuel hierarchy fuel c
 
 def capAncestors (c : String) : List String :=
-  capAncestorsFuel hierarchy.length c
+  MarchLean.Calculus.ancestorsIn hierarchy c
 
 /-- `capSubsumes parent child` — is `parent` an ancestor of, or equal to,
 `child`? **Reflexive** (`capAncestors X` always starts with `X`) and
 **directional** (a broader declared cap covers a narrower used one, never the
 reverse). Two siblings never subsume each other. -/
 def capSubsumes (parent child : String) : Bool :=
-  (capAncestors child).contains parent
+  MarchLean.Calculus.subsumesIn hierarchy parent child
 
 /-- Drop any cap subsumed by another cap already present, preserving the
 relative order of the survivors: `normalize ["IO", "IO.FileRead"] = ["IO"]`
 regardless of the order they were given in. -/
 def normalize (caps : List String) : List String :=
-  caps.filter (fun c => !caps.any (fun other => other != c && capSubsumes other c))
+  MarchLean.Calculus.normalizeIn hierarchy caps
 
 end MarchLean.CapLattice
 

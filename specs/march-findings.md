@@ -211,3 +211,173 @@ so it keeps `Mono (String → ())` and march rejects `print(1)`. We match. The
 
 **Status.** not a march bug; no upstream report. Recorded because our
 correctness depends on it and the dependency is invisible from our source alone.
+
+---
+
+## Checker gaps against march main 6867c783 that the corpus CANNOT catch
+
+Unlike every entry above, these are **checker-is-wrong** items, recorded here
+by exception because of a property they share: each is a live divergence
+against the pinned march with **zero corpus witnesses**, so the conformance
+gate is structurally incapable of reporting them. The standing rule that a
+green run is weak evidence is usually a caution; here it is a certainty.
+Each needs a hand-built probe, not a corpus file.
+
+Found during the 2026-08-08 capability resync (pin 7c1d701c -> 6867c783),
+which fixed five corpus-visible divergences; these three were found by
+reading march's diff rather than by running anything.
+
+### 1. Path-scoped capabilities decode as unscoped — FALSE ACCEPT by construction
+
+march added scopes: `needs IO.FileRead("/etc/myapp")` narrows a filesystem
+capability to a directory subtree (`lib/caps/cap_scope.ml`). The emitter now
+carries them in a NEW `scopes` array parallel to `paths`, and march's own
+comment on that change says the scope is emitted "so a dumped AST is not a
+widened version of the source."
+
+`Elab.decodeDecl`'s `DNeeds` arm reads only `paths`. The scope is dropped, so
+a scoped declaration decodes identically to an unscoped one. Since
+`Cap_scope.scope_subsumes` states that `None` (unscoped) subsumes everything
+and **a scope never subsumes `None`**, this checker reads a strictly narrower
+declaration as the broadest possible one — the exact direction that produces
+a false accept.
+
+Not yet reachable in the corpus: no file under `specs/lang/types` uses the
+syntax. That is why it is dangerous rather than reassuring.
+
+**Fix shape.** Decode `scopes` alongside `paths`, carry the scope on
+`Decl.dneeds`, and gate coverage on `scope_subsumes` as well as
+`capSubsumes`. Until then this is a known false-accept source.
+
+### 2. `capsInTy` does not descend into `Tagged`
+
+march's `Cap_surface_ty.caps_in_ty` recurses into every `TyCon`'s arguments,
+including `Tagged`. Its predecessor had an explicit `| Tagged -> []` arm;
+that arm is GONE, and march's comment records why: skipping it "also blinded
+the walk to `Tagged(R, Cap(IO))`, which is a worse trade."
+
+`CapCheck.capsInTy` still has `| .con "Tagged" _ => []`, mirroring the arm
+march deleted. A capability nested inside a `Tagged` payload is therefore
+invisible to Check 1 here and visible to march. No corpus file exercises it.
+
+### 3. `normalize` does not deduplicate
+
+march's `Cap_lattice.normalize` now dedupes before filtering; ours does not,
+so the two disagree on any input containing repeated caps (ours returns the
+duplicates, march returns one). march's change was a performance fix (an env
+reused across ~1800 modules grew the list without bound), but it is a
+semantic difference in the returned list.
+
+Latent only because `normalize` is not on this checker's verdict path — it is
+defined and proved about (`Calculus/Lattice.lean`) but never consulted by
+`checkCaps`. If it is ever wired in, this must be fixed first, and the
+`normalizeIn` theorems re-proved against the deduping definition.
+
+### 4. Check 4 uses the pre-#209 whole-module rule — we are now STRICTER than march
+
+march#209 ("an importer inherits only the capabilities it actually
+references", 8f8c66d6) changed Check 4's semantics. `use M` used to force
+every capability `M` declares onto the importer; it now forces only the
+capabilities demanded by the functions the importer actually references, via
+the new `import_required_caps`.
+
+`CapCheck.checkOneModule`'s Check 4 still implements the old rule: it takes
+`M`'s entire declared `needs` from the `module_caps` table and requires the
+importer to cover all of it. march's own commit message states the change is
+"strictly loosening by construction: the result is always a subset of what
+the import required before" — so this checker is now strictly STRICTER than
+march on Check 4, and the divergence direction is FALSE REJECT.
+
+The witness shape: a module that imports a cap-declaring module but
+references only its cap-free functions. march accepts (nothing referenced
+demands the cap); this checker rejects (the cap is in `M`'s declared set).
+
+No corpus witness today. `reject/t39_transitive_use_missing_cap` still
+matches, because there the capability is uncovered under either rule.
+`accept/t49_transitive_use_covered` was rewritten by the same commit to add
+the reference the new rule requires (`let _ = Vault.new("t")`), and now
+SKIPS here for an unrelated reason — see below.
+
+**Corollary finding (march side): an accepted file's emitted AST contains
+`TError`.** `accept/t49`'s added `Vault.new("t")` is a call into stdlib
+`Vault`. march's `--check` resolves it and ACCEPTS; its own
+`--emit-core-ast` emits `resolved_ty: TError` for that call and for the
+enclosing `let`, while the envelope's `verdict` field still says `accept`.
+This checker honest-skips on `TError` by design (H3: never check a file
+built on an elaboration error), which is why t49 regressed MATCH -> SKIP and
+why A3 slice (a) is now one file short of the 11 it claimed. The skip is
+correct behavior here; the inconsistency is march emitting an
+elaboration-error sentinel in a program it accepts.
+
+**Status.** reported upstream: NOT YET (both halves).
+
+### 5. Check 1b is now an ERROR in march, and this checker does not implement it — a LIVE false-accept class
+
+**This one obsoletes a design decision, so it is the most consequential entry
+in this section.**
+
+`specs/plans/2026-07-23-a3-capability-lattice-design.md` §1.3 decided NOT to
+implement Checks 1b/1c, and said so plainly:
+
+> They are WARNING-only in march. §2.8.6 calls this three-tier reality "the
+> single most consequential fact for anyone relying on `needs` as a soundness
+> guarantee." A checker that rejected on them would manufacture false
+> MISMATCHes against a march that accepts. Consequence, stated plainly: the
+> oracle inherits march's weaker guarantee here — it will not catch a program
+> that uses a builtin requiring an undeclared cap in a function body.
+
+That reasoning was correct when written. It is now obsolete: march main
+(`6867c783`) raises Check 1b with `Err.error_with_fix`
+(`typecheck.ml:9098-9106`), not `Err.warning` —
+
+    function body calls a builtin that requires `Cap(IO.Console)`
+    but `M` does not declare `needs IO.Console`.
+
+march closed the hole its own docs called the most consequential fact about
+`needs`. This checker did not, so the "weaker guarantee" the design accepted
+is no longer shared with march — it is a **divergence**, and it points the
+false-ACCEPT way: any module calling an IO builtin in a body without declaring
+the capability is rejected by march and accepted here.
+
+**Witness.** Every one of `scripts/tailcall-probes/*.march` before the
+accompanying fix: `mod M do fn main() do println("hi") end end` with no
+`needs`. march rejects; `march-lean-check` exits 0.
+
+**How it was found, which matters more than the finding.** The 277-file
+conformance corpus reports MISMATCH 0 against this same pin — every corpus
+file declares its capabilities properly, so not one of them witnesses this.
+It surfaced only because the tail-call probes were hand-written without
+capability manifests and the pin bump made march start rejecting them. A
+green corpus run said nothing about a whole false-accept class; eighteen
+throwaway probes found it immediately.
+
+**Fix shape.** The machinery already exists: `CapCheck.builtinCaps` maps
+builtin name -> required cap path, and `bodyCalls` already walks bodies for
+builtin calls (both were built for Check 8 and the behavioral caps). Check 1b
+is those two joined to `covered declared`. What needs care is the gating, and it is
+not hypothetical care — implementing this slightly too eagerly converts the
+false-accept class into a false-REJECT class. Three specific hazards, all
+verified against march `6867c783`:
+
+1. **Shadowing.** `bodyCalls` matches purely by NAME
+   (`banned.contains n`), with no scope awareness. A module defining its own
+   `fn println(...)` and calling it would be flagged as calling the builtin.
+   The corpus already contains shadowing cases
+   (`accept/t126_entry_module_shadows_list_length`,
+   `accept/t139_nested_module_shadows_list_length_extern`) and march grew
+   `shadow_*` tail-call probes, so this WILL fire.
+2. **Direct calls only.** march's own comment scopes 1b explicitly: it
+   catches a direct builtin call in a module body; a stdlib-MEDIATED call
+   (`File.read` rather than `file_read`) is invisible to it and is handled by
+   `--cap-strict`'s TIR ceiling instead. Scanning transitively would reject
+   where march accepts.
+3. **1c stays off.** march flipped 1b only —
+   Check 1c (extern implies `IO.Foreign`) is deliberately still a warning.
+   Flipping both because they were skipped together would be wrong.
+
+The self-declaration exemption applies here too: march tests
+`not covered && not self_declared` against `env.proof_caps`, which
+`checkOneModule` already threads as `selfDeclaredCaps`.
+
+**Status.** reported upstream: N/A (march is correct here; this checker is
+behind). NOT YET FIXED in march-lean.

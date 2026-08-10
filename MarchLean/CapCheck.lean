@@ -121,14 +121,40 @@ partial def capsInTy : Ty → List String
   | .lin _ t    => capsInTy t
   | _           => []
 
-/-- The caps a declaration's PARAMETER signature mentions. Only signatures
-matter for Check 1 — body uses are Check 1b, which is warning-only and not
-implemented. Return-type caps are handled separately by
-`capsInReturnSignature` (they are gated differently — see `checkOneModule`). -/
+/-- The caps a declaration's PARAMETER signature mentions, plus the caps named
+inside a TYPE DECLARATION's constructor arguments. Return-type caps are handled
+separately by `capsInReturnSignature` (they are gated differently — see
+`checkOneModule`).
+
+**Type declarations.** march's `check_module_needs` builds one `cap_uses` list
+over every decl form, and `DType`/`DAlwaysLinearType` contribute
+`Cap_surface_ty.caps_in_type_def td` to it (`typecheck.ml:8813-8814`) — a
+capability named in a variant constructor argument is a *use* of that
+capability, treated exactly like one in a function signature. march's own
+comment records that these arms were previously swallowed by a `| _ -> []`
+wildcard, so `type Handle = { tok : Cap(IO.FileWrite) }` under `needs
+IO.Console` typechecked clean; `reject/t148`-`t150` are the regression tests.
+This checker had the same hole and it was a live FALSE ACCEPT on
+`reject/t149_cap_variant_arg_undeclared` and
+`reject/t144_cap_derive_json_variant_arg`.
+
+Scanned UNGATED, like parameters and unlike return annotations: the cap is
+named concretely in the constructor's argument type, so there is no
+unmodeled-machinery escape hatch of the kind `capsInReturnSignature`'s gate
+exists to respect.
+
+Only `argTys` are scanned, matching `caps_in_type_def`'s `TDVariant` arm
+(`List.concat_map caps_in_ty v.var_args`) — a constructor's `resultTy` is
+this checker's own synthesized `Ty.con name [params]`, not surface syntax the
+author wrote, and march has no counterpart to it. `TDRecord` and `TDAlias`
+decode to `Decl.unsupported` (`Elab.lean`'s `DType` arm), so those two of
+`caps_in_type_def`'s three arms are reached as whole-file skips rather than
+here — honest, and why `reject/t148`/`t150` skip instead of matching. -/
 def capsInSignature : Decl → List String
   | .dfn _ params _ _ =>
       params.flatMap (fun (_, _, annot) =>
         match annot with | some t => capsInTy t | none => [])
+  | .dtype _ _ ctors => ctors.flatMap (fun c => c.argTys.flatMap capsInTy)
   | _ => []
 
 /-- The caps a declaration's RETURN-type annotation mentions. march's Check 1
@@ -145,6 +171,165 @@ def capsInReturnSignature : Decl → List String
   | .dfn _ _ retAnnot _ =>
       match retAnnot with | some t => capsInTy t | none => []
   | _ => []
+
+/-- Every capability named by a type ANNOTATION inside an expression: a `let`
+binding's annotation, and a lambda's or local function's parameter
+annotations. Mirrors march's `cap_annots_in_expr` (`typecheck.ml:8109-8180`).
+
+**Why bodies at all.** Check 1 historically read function SIGNATURES only, so
+a capability named inside a body escaped `needs` entirely. march's own note
+records the route that made it reachable: `root_cap` was ambient, so a module
+declaring only `IO.Console` could narrow the root to `Cap(IO.FileWrite)` and
+bind it without ever putting a capability in a signature. R2 (see
+`checkOneModule`'s root-cap gate) closed that particular route, but not the
+hole — a LAMBDA PARAMETER annotation needs no capability VALUE at all, only
+the type name, so it survives R2 untouched. That is
+`reject/t151_cap_body_annotation_undeclared`, and it was a false ACCEPT here.
+
+**Total over every `Term` constructor, with no wildcard arm**, matching
+`bodyCalls`/`bodyAllocates`/`termMentionsAny`'s discipline in this file and
+march's own stated rule for its capability walks: a walk that ends in a
+catch-all is a silent hole rather than a visible bug, and adding a `Term`
+form must break this build instead of quietly reopening the gap.
+
+march also walks an `EAnnot` type; march's own comment says the parser never
+produces one (desugar synthesizes the single instance, a `SupervisorSpec` on
+an `app` block) and there is no reject-witness for it. This `Term` has no
+`EAnnot` counterpart at all, so there is nothing to mirror. `Term.letfn`
+likewise carries no return annotation, so march's `ELetFn` return arm has no
+counterpart here; a local function's return cap is unreachable in this
+fragment. -/
+partial def capAnnotsInTerm : Term → List String
+  | .lit _ _ => []
+  | .var _ _ _ => []
+  | .app fn args _ => capAnnotsInTerm fn ++ args.flatMap capAnnotsInTerm
+  | .lam params body _ =>
+      params.flatMap (fun (_, _, annot) =>
+        match annot with | some t => capsInTy t | none => []) ++ capAnnotsInTerm body
+  | .let_ _ _ annot rhs body _ =>
+      (match annot with | some t => capsInTy t | none => []) ++
+        capAnnotsInTerm rhs ++ capAnnotsInTerm body
+  | .letfn _ _ _ paramAnnot fnBody body _ =>
+      (match paramAnnot with | some t => capsInTy t | none => []) ++
+        capAnnotsInTerm fnBody ++ capAnnotsInTerm body
+  | .ite c t e _ => capAnnotsInTerm c ++ capAnnotsInTerm t ++ capAnnotsInTerm e
+  | .con _ args _ => args.flatMap capAnnotsInTerm
+  | .tuple elems _ => elems.flatMap capAnnotsInTerm
+  | .record fields _ => fields.flatMap (fun (_, e) => capAnnotsInTerm e)
+  | .field record _ _ _ => capAnnotsInTerm record
+  | .match_ scrut arms _ =>
+      capAnnotsInTerm scrut ++
+        arms.flatMap (fun (_, g, e) =>
+          (g.map capAnnotsInTerm).getD [] ++ capAnnotsInTerm e)
+  -- `.opaque_` RECURSES, matching every other collector here (`bodyCalls`,
+  -- `bodyAllocates`, `matchesIn`). `Elab` decodes the nine unmodelled-but-
+  -- child-carrying march kinds to `opaque_` precisely so their children
+  -- survive to the cap layer; a `Cap(X)` annotation on a lambda parameter
+  -- inside, say, an `ECond` arm is exactly as much a `needs` use as one
+  -- anywhere else.
+  | .opaque_ children _ => children.flatMap capAnnotsInTerm
+  | .unsupported _ => []
+
+/-- The concrete IO-lattice capability a type denotes, if it is exactly
+`Cap(P)` for a nullary `P` that is a NAME IN THE HIERARCHY. Mirrors march's
+local `concrete` inside `check_cap_narrow_sites` (`typecheck.ml:9407-9411`),
+with one deliberate narrowing: march excludes proof caps explicitly
+(`is_proof`), while this additionally requires lattice membership.
+
+Requiring membership subsumes march's proof-cap exclusion (a proof cap like
+`Db.Migrated` is not in the hierarchy) and also excludes FFI caps, which are
+their own roots and subsume nothing but themselves — so a `cap_narrow`
+between two FFI names would otherwise be flagged. The difference can only
+make this checker MORE permissive than march, never less, so it cannot
+manufacture a false reject; it is the safe direction for a check whose whole
+job is replacing a guarantee that used to live in the type. -/
+def concreteLatticeCap : Ty → Option String
+  | .con "Cap" [.con p []] =>
+      if MarchLean.CapLattice.hierarchy.any (fun (n, _) => n == p) then some p else none
+  | _ => none
+
+/-- R4a: attenuation must move DOWN the lattice, or stay level.
+
+march's `cap_narrow` is now `∀a b. Cap(a) → Cap(b)` (see `Infer.builtins`),
+so the TYPE no longer stops a widen — `check_cap_narrow_sites`
+(`typecheck.ml:9406-9432`) does, as a deferred sweep over solved types. This
+is the mirror of that sweep, and it is load-bearing rather than defensive:
+without it, retyping `cap_narrow` turns `reject/t153` (widen), `t154`
+(siblings) and `t155` (widen visible only after later unification) into false
+ACCEPTS. Those three currently reject only as a side effect of the old
+argument type failing to unify, which is not a lattice check at all.
+
+The rule, exactly as march states it: an error iff BOTH sides resolve to
+concrete lattice capabilities AND the source does not subsume the target.
+Reflexivity is allowed — `capSubsumes p p` holds, which is what makes
+`accept/t148`'s `same_level` (narrowing `Cap(IO.FileRead)` to itself) legal.
+An UNPINNED side is silent: a result never pinned to a concrete capability is
+a result never USED as one, so no authority is exercised and there is nothing
+to widen into. Failing closed there would reject ordinary code that narrows
+into a polymorphic position — march records having considered and rejected
+that choice.
+
+Reading the two sides off the application node rather than off the callee's
+instantiated arrow is equivalent here and more robust: the emitter's
+`resolved_ty` is POST-solve, verified on `reject/t155`, whose `cap_narrow`
+application resolves to `Cap(IO.FileWrite)` with argument `Cap(IO.Console)` —
+precisely the deferred widen. -/
+partial def capNarrowViolation : Term → Option (String × String)
+  | .app (.var "cap_narrow" _ _) [arg] ty =>
+      match concreteLatticeCap arg.ty, concreteLatticeCap ty with
+      | some src, some dst =>
+          if capSubsumes src dst then capNarrowViolation arg
+          else some (src, dst)
+      | _, _ => capNarrowViolation arg
+  | .app fn args _ =>
+      match capNarrowViolation fn with
+      | some v => some v
+      | none   => args.findSome? capNarrowViolation
+  | .lit _ _ => none
+  | .var _ _ _ => none
+  | .lam _ body _ => capNarrowViolation body
+  | .let_ _ _ _ rhs body _ =>
+      match capNarrowViolation rhs with
+      | some v => some v
+      | none   => capNarrowViolation body
+  | .letfn _ _ _ _ fnBody body _ =>
+      match capNarrowViolation fnBody with
+      | some v => some v
+      | none   => capNarrowViolation body
+  | .ite c t e _ =>
+      match capNarrowViolation c with
+      | some v => some v
+      | none   => match capNarrowViolation t with
+                  | some v => some v
+                  | none   => capNarrowViolation e
+  | .con _ args _ => args.findSome? capNarrowViolation
+  | .tuple elems _ => elems.findSome? capNarrowViolation
+  | .record fields _ => fields.findSome? (fun (_, e) => capNarrowViolation e)
+  | .field record _ _ _ => capNarrowViolation record
+  | .match_ scrut arms _ =>
+      match capNarrowViolation scrut with
+      | some v => some v
+      | none   => arms.findSome? (fun (_, g, e) =>
+                    match (g.bind capNarrowViolation) with
+                    | some v => some v
+                    | none   => capNarrowViolation e)
+  -- `.opaque_` RECURSES, same rationale as `capAnnotsInTerm` above: a widening
+  -- `cap_narrow` buried in an unmodelled-but-child-carrying node is still a
+  -- widening, and its two sides are still concretely resolved.
+  | .opaque_ children _ => children.findSome? capNarrowViolation
+  | .unsupported _ => none
+
+/-- The first R4a widening in a declaration's body, if any. -/
+def declCapNarrowViolation : Decl → Option (String × String)
+  | .dfn _ _ _ body => capNarrowViolation body
+  | .dlet _ rhs     => capNarrowViolation rhs
+  | _               => none
+
+/-- The caps named by type annotations inside a declaration's body. -/
+def capsInBody : Decl → List String
+  | .dfn _ _ _ body => capAnnotsInTerm body
+  | .dlet _ rhs     => capAnnotsInTerm rhs
+  | _               => []
 
 /-- The caps this module declares via `needs`. -/
 def declaredNeeds (decls : List Decl) : List String :=
@@ -1498,7 +1683,49 @@ def checkOneModule (modName : String) (decls : List Decl)
   -- unconditional so no existing signature-based reject changes.
   let retCaps :=
     if decls.any Decl.hasUnsupported then [] else decls.flatMap capsInReturnSignature
-  let sigCaps := decls.flatMap capsInSignature ++ retCaps
+  -- Body-annotation caps (march's `cap_annots_in_expr`, folded into the same
+  -- `cap_uses` list Check 1 consumes). Ungated, like parameters: the cap is
+  -- named concretely by an annotation the author wrote, so the
+  -- unmodeled-machinery escape `retCaps`'s gate respects does not apply.
+  let bodyCapUses := decls.flatMap capsInBody
+  let sigCaps := decls.flatMap capsInSignature ++ retCaps ++ bodyCapUses
+  -- R2 (march main): `root_cap` cannot be REFERENCED. It remains bound, at
+  -- type `Cap(IO)` (`Infer.lean` keeps it, exactly as march keeps the name
+  -- bound at `typecheck.ml:5118-5125` so a single mistake reports one
+  -- capability error rather than cascading unification failures) — only
+  -- naming it is refused, because the root is granted to `main` at the
+  -- boundary rather than taken from an ambient global.
+  --
+  -- march exempts four contexts via `env.root_cap_allowed`: a `DTest` body
+  -- (`:11741`), `DSetup` (`:11756`), `DSetupAll` (`:11765`), and the REPL
+  -- entry (`:12795`). **All four decode to `Decl.unsupported` here** (see
+  -- `Elab.decodeDecl`), so rather than model the flag this gates on the
+  -- module being entirely in fragment — the same residual gate `retCaps`
+  -- uses above, and for the same reason. `accept/t146_root_cap_in_test_body`
+  -- narrows `root_cap` inside `describe`/`test` and is exactly the file this
+  -- gate protects: cap checks run BEFORE the skip gate (A3 design §4), so
+  -- without it that file would be a false REJECT instead of a skip.
+  --
+  -- `accept/t147_main_receives_the_root` is unaffected either way: it takes
+  -- `cap : Cap(IO)` as a parameter and never names `root_cap`.
+  let fullyInFragment := !decls.any Decl.hasUnsupported
+  let mentionsRootCap := decls.any (fun d =>
+    match d with
+    | .dfn _ _ _ body => termMentionsAny ["root_cap"] body
+    | .dlet _ rhs     => termMentionsAny ["root_cap"] rhs
+    | _               => false)
+  if fullyInFragment && mentionsRootCap then
+    .violation s!"R2: `root_cap` cannot be referenced in module `{modName}` — the root capability is granted to `main`, not taken"
+  else
+  -- R4a — `cap_narrow` only attenuates. See `capNarrowViolation`: this is
+  -- what replaces the subsumption the old `Cap(IO)→Cap(a)` argument type used
+  -- to enforce through unification. Ungated: both sides must already have
+  -- resolved to concrete lattice capabilities for it to fire at all, so an
+  -- out-of-fragment neighbour cannot make it misfire.
+  match decls.findSome? declCapNarrowViolation with
+  | some (src, dst) =>
+      .violation s!"R4a: `Cap({src})` cannot be widened to `Cap({dst})` in module `{modName}` — `cap_narrow` only attenuates, so the source capability must subsume the target"
+  | none =>
   -- Finding I1: a cap in `selfDeclaredCaps` is covered regardless of
   -- `needs` — march's self-declaration exemption (`typecheck.ml:6966-6970`)
   -- lets a proof cap's own declaring module use it in its own signatures
@@ -1970,6 +2197,184 @@ def siblingViolation : Module := {
   schemes := [], insts := [], moduleCaps := [] }
 #eval checkCaps siblingViolation
   -- expect: violation — IO.FileWrite not covered by IO.FileRead
+
+/-! ### R4a — `cap_narrow` only attenuates
+
+These four pin the guarantee that MOVED when `cap_narrow` was retyped to
+`∀a b. Cap(a) → Cap(b)`. Before R4a the argument type enforced it through
+unification and `reject/t153`/`t154`/`t155` rejected as a side effect;
+`capNarrowViolation` is now the only thing standing between those files and a
+false ACCEPT, so it is pinned here as well as in the corpus. -/
+
+private def capNarrowApp (src dst : String) : Term :=
+  Term.app (Term.var "cap_narrow" ⟨"f",0,0,0,0⟩
+              (Ty.arrow (Ty.con "Cap" [Ty.con src []]) (Ty.con "Cap" [Ty.con dst []])))
+           [Term.var "c" ⟨"f",0,0,0,0⟩ (Ty.con "Cap" [Ty.con src []])]
+           (Ty.con "Cap" [Ty.con dst []])
+
+/-- `needs` lists both endpoints, so Check 1 is satisfied by construction and
+whatever these fixtures report comes from R4a alone. -/
+private def capNarrowModule (src dst : String) : Module := {
+  decls := [Decl.dmod "N" [
+    Decl.dneeds ["IO", src, dst],
+    Decl.dfn "f" [("c", Lin.unrestricted, some (Ty.con "Cap" [Ty.con src []]))]
+      (some (Ty.con "Cap" [Ty.con dst []])) (capNarrowApp src dst)]],
+  schemes := [], insts := [], moduleCaps := [] }
+
+-- reject/t153: widening `Cap(IO.Console)` to `Cap(IO.FileWrite)`.
+#eval checkCaps (capNarrowModule "IO.Console" "IO.FileWrite")
+  -- expect: violation — R4a
+
+-- reject/t154: siblings — `Cap(IO.FileRead)` to `Cap(IO.FileWrite)`.
+#eval checkCaps (capNarrowModule "IO.FileRead" "IO.FileWrite")
+  -- expect: violation — R4a
+
+-- accept/t148, the attenuating hop: `Cap(IO.FileSystem)` to
+-- `Cap(IO.FileRead)` moves DOWN the lattice and is legal.
+#eval checkCaps (capNarrowModule "IO.FileSystem" "IO.FileRead")
+  -- expect: ok
+
+-- accept/t148's `same_level`: narrowing to the SAME capability is legal,
+-- because `capSubsumes p p` holds. A strict-ancestor test would wrongly
+-- reject this — which is exactly what that file exists to catch.
+#eval checkCaps (capNarrowModule "IO.FileRead" "IO.FileRead")
+  -- expect: ok
+
+-- A PROOF cap is not in the IO lattice, so R4a stays silent rather than
+-- flagging a narrow it has no authority to judge (march exempts these
+-- explicitly via `is_proof`; `concreteLatticeCap` reaches the same
+-- conclusion by requiring hierarchy membership). `needs` covers the proof
+-- cap here so this isolates R4a from Check 1 — without that, the violation
+-- reported is Check 1's uncovered `Cap(Db.Migrated)`, not R4a at all.
+#eval checkCaps (capNarrowModule "IO" "Db.Migrated")
+  -- expect: ok — R4a declines to judge a non-lattice cap
+
+/-- reject/t151: a LAMBDA PARAMETER annotation names `Cap(IO.FileWrite)`
+inside a body, under `needs IO.Console`. Needs no capability value at all —
+only the type name — so it survives R2 and is the sharpest witness that
+Check 1 must reach inside bodies. -/
+def bodyLamAnnotUncovered : Module := {
+  decls := [Decl.dmod "BodyAnnCap" [
+    Decl.dneeds ["IO.Console"],
+    Decl.dfn "main" [] none
+      (Term.let_ "take" Lin.unrestricted none
+        (Term.lam [("c", Lin.unrestricted, some (Ty.con "Cap" [Ty.con "IO.FileWrite" []]))]
+          (Term.lit (Lit.int 1) (Ty.con "Int" []))
+          (Ty.con "Unit" []))
+        (Term.lit Lit.unit (Ty.con "Unit" []))
+        (Ty.con "Unit" []))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps bodyLamAnnotUncovered
+  -- expect: violation — IO.FileWrite not covered by IO.Console
+
+/-- accept/t145's shape: the same body annotation, DECLARED. Guards the body
+walk against over-rejecting a covered `let` annotation. -/
+def bodyLetAnnotCovered : Module := {
+  decls := [Decl.dmod "BodyAnnCap" [
+    Decl.dneeds ["IO.FileWrite"],
+    Decl.dfn "main" [] none
+      (Term.let_ "w" Lin.unrestricted (some (Ty.con "Cap" [Ty.con "IO.FileWrite" []]))
+        (Term.lit Lit.unit (Ty.con "Unit" []))
+        (Term.lit Lit.unit (Ty.con "Unit" []))
+        (Ty.con "Unit" []))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps bodyLetAnnotCovered
+  -- expect: ok
+
+/-- The body walk reaches through nesting, not just the outermost node —
+a cap annotation buried in a match arm inside a tuple still counts. -/
+def bodyAnnotNestedUncovered : Module := {
+  decls := [Decl.dmod "Deep" [
+    Decl.dneeds ["IO.Console"],
+    Decl.dfn "f" [] none
+      (Term.tuple [
+        Term.match_ (Term.lit (Lit.int 0) (Ty.con "Int" []))
+          [(Pattern.wild, none,
+            Term.lam [("c", Lin.unrestricted, some (Ty.con "Cap" [Ty.con "IO.Network" []]))]
+              (Term.lit (Lit.int 1) (Ty.con "Int" []))
+              (Ty.con "Unit" []))]
+          (Ty.con "Unit" [])]
+        (Ty.con "Unit" []))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps bodyAnnotNestedUncovered
+  -- expect: violation — IO.Network, found through tuple + match arm + lambda
+
+/-- reject/t152: naming `root_cap` in an ordinary function body is an R2
+violation, even in a module whose `needs` are fully declared. -/
+def rootCapReferenced : Module := {
+  decls := [Decl.dmod "TakesTheRoot" [
+    Decl.dneeds ["IO"],
+    Decl.dfn "main" [] none
+      (Term.let_ "stolen" Lin.unrestricted none
+        (Term.var "root_cap" ⟨"f",0,0,0,0⟩ (Ty.con "Cap" [Ty.con "IO" []]))
+        (Term.lit Lit.unit (Ty.con "Unit" []))
+        (Ty.con "Unit" []))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps rootCapReferenced
+  -- expect: violation — R2
+
+/-- accept/t147: `main` RECEIVES the root as a parameter and never names
+`root_cap`. Guards the R2 check against rejecting the legitimate shape. -/
+def rootCapReceived : Module := {
+  decls := [Decl.dmod "GrantedRoot" [
+    Decl.dneeds ["IO"],
+    Decl.dfn "main" [("cap", Lin.unrestricted, some (Ty.con "Cap" [Ty.con "IO" []]))]
+      none (Term.lit Lit.unit (Ty.con "Unit" []))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps rootCapReceived
+  -- expect: ok
+
+/-- accept/t146's shape: `root_cap` IS nameable in a test body, which march
+permits via `root_cap_allowed`. Here the enclosing `describe`/`test` decodes
+to `Decl.unsupported`, so the fragment gate must defer rather than reject —
+otherwise this is a false REJECT, since cap checks precede the skip gate. -/
+def rootCapInUnsupportedContext : Module := {
+  decls := [Decl.dmod "TestBodyCaps" [
+    Decl.dneeds ["IO"],
+    Decl.unsupported,
+    Decl.dfn "helper" [] none
+      (Term.var "root_cap" ⟨"f",0,0,0,0⟩ (Ty.con "Cap" [Ty.con "IO" []]))]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps rootCapInUnsupportedContext
+  -- expect: NOT a violation (defers; the file skips downstream)
+
+/-- reject/t149: `Cap(IO.NetConnect)` in a VARIANT CONSTRUCTOR ARGUMENT under
+`needs IO.Console`. march reports Check 1 here (`typecheck.ml:8813`); before
+`capsInSignature` grew its `dtype` arm this was a false ACCEPT. -/
+def typeCtorArgUncovered : Module := {
+  decls := [Decl.dmod "VariantCap" [
+    Decl.dneeds ["IO.Console"],
+    Decl.dtype "Conn" [] [
+      { name := "Idle", argTys := [], resultTy := Ty.con "Conn" [] },
+      { name := "Live", argTys := [Ty.con "Cap" [Ty.con "IO.NetConnect" []]],
+        resultTy := Ty.con "Conn" [] }]]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps typeCtorArgUncovered
+  -- expect: violation — IO.NetConnect not covered by IO.Console
+
+/-- accept/t144's shape: the same variant-argument cap, but DECLARED. Guards
+against the `dtype` arm over-rejecting a covered type declaration. -/
+def typeCtorArgCovered : Module := {
+  decls := [Decl.dmod "VariantCap" [
+    Decl.dneeds ["IO.NetConnect"],
+    Decl.dtype "Conn" [] [
+      { name := "Live", argTys := [Ty.con "Cap" [Ty.con "IO.NetConnect" []]],
+        resultTy := Ty.con "Conn" [] }]]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps typeCtorArgCovered
+  -- expect: ok
+
+/-- A broader `needs` still covers a narrower cap in a constructor argument —
+the `dtype` arm goes through the same subsumption as every other Check 1 use. -/
+def typeCtorArgCoveredByRoot : Module := {
+  decls := [Decl.dmod "VariantCap" [
+    Decl.dneeds ["IO"],
+    Decl.dtype "Conn" [] [
+      { name := "Live", argTys := [Ty.con "Cap" [Ty.con "IO.NetConnect" []]],
+        resultTy := Ty.con "Conn" [] }]]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps typeCtorArgCoveredByRoot
+  -- expect: ok
 
 /-- accept/t46: the root `needs IO` covers `Cap(IO.Network)`. -/
 def rootCovers : Module := {

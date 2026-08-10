@@ -905,10 +905,35 @@ def builtins (s : Supply) : InferM (List (String × EnvEntry)) := do
   -- Eq-constrained equality: ∀a:Eq. a→a→Bool
   for name in ["==", "!="] do
     out := (name, .scheme (← mkPoly1 s [Class.eq] (fun a => arr a (arr a b)))) :: out
-  -- Capability-narrowing: ∀a. Cap(IO)→Cap(a)  (typecheck.ml:1972)
+  -- Capability-narrowing: ∀a b. Cap(a)→Cap(b)  (march main, R4a).
+  --
+  -- Was `∀a. Cap(IO)→Cap(a)`: the argument was LITERALLY the root, so a
+  -- holder of anything narrower could not attenuate at all. march's R4a
+  -- widened the type precisely to allow delegation-with-attenuation
+  -- (`accept/t148_cap_narrow_chains`), which this checker rejected with
+  -- "cannot unify IO with IO.FileSystem".
+  --
+  -- **The subsumption guarantee moved, it did not disappear.** Before R4a
+  -- the argument type enforced it through unification; now nothing in the
+  -- TYPE does, and `CapCheck.capNarrowViolation` carries it instead —
+  -- mirroring march's own deferred `check_cap_narrow_sites` sweep
+  -- (`typecheck.ml:9406-9432`). Retyping here WITHOUT that sweep would turn
+  -- `reject/t153`/`t154`/`t155` into false accepts: those three reject today
+  -- only as a side effect of this unification failure, not because anything
+  -- checks the lattice. See `capNarrowViolation`'s docstring.
   let cap := fun (t : MTy) => MTy.con "Cap" [t]
+  -- Still needed by `root_cap` below: R2 keeps the NAME bound at `Cap(IO)`
+  -- (march does the same, `typecheck.ml:5118-5125`, so one mistake reports a
+  -- single capability error instead of cascading unification failures);
+  -- `CapCheck`'s R2 gate is what refuses references to it.
   let capIO := cap (MTy.con "IO" [])
-  out := ("cap_narrow", .scheme (← mkPoly1 s [] (fun a => arr capIO (cap a)))) :: out
+  let capA ← freshMVar s 0 []
+  let capB ← freshMVar s 0 []
+  let aid := match capA with | .mvar i => i | _ => 0
+  let bid := match capB with | .mvar i => i | _ => 0
+  out := ("cap_narrow",
+    .scheme { vars := [aid, bid], classes := [],
+              body := arr (cap capA) (cap capB) }) :: out
   -- `println : ∀a. a → ()` — UNCONSTRAINED, and deliberately NOT the
   -- `Mono (String → ())` that march's builtin table registers at
   -- `typecheck.ml:1951`. See the `println` note below for why march's own
@@ -1053,6 +1078,14 @@ def inferModule' (s : Supply) (m : Module) : InferM (List (Span × MTy)) := do
         -- (`type Age = Int` is NOT transparent to march — it rejects
         -- `fn f(x : Int) : Age do x end`), and a call to a correctly-typed
         -- function at the wrong return type.
+        --
+        -- It is ALSO load-bearing for R4a. `cap_narrow` is now
+        -- `∀a b. Cap(a) → Cap(b)` (see its entry in `builtins`), so in
+        -- `pfn same_level(r : Cap(IO.FileRead)) : Cap(IO.FileRead) do
+        -- cap_narrow(r) end` the result is pinned ONLY by this annotation.
+        -- Without this unification the body stays a metavariable, march
+        -- resolves it to `Cap(IO.FileRead)`, and the per-node cross-check
+        -- reports types_differ (exit 4) on `accept/t148_cap_narrow_chains`.
         --
         -- This cannot manufacture a false reject from a mis-decoded
         -- annotation: `Decl.dfn.retAnnot` is `some` only when the annotation

@@ -1,4 +1,5 @@
 mod M do
+  needs IO.Console
   fn go(n : Int) : Int do
     if n == 0 do 0 else go(n + 1) + 1 end
   end

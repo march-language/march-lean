@@ -5,6 +5,11 @@ import MarchLean.Result
 import MarchLean.Linearity
 import MarchLean.Infer
 import MarchLean.Compare
+import MarchLean.Calculus.Lattice
+import MarchLean.Calculus.Walks
 import MarchLean.CapLattice
 import MarchLean.CapCheck
 import MarchLean.TailCall
+import MarchLean.Calculus.Verdicts
+import MarchLean.Calculus.Concrete
+import MarchLean.Calculus.CheckCaps

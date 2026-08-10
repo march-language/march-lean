@@ -1,4 +1,5 @@
 mod M do
+  needs IO.Console
   type Node = Leaf | Branch(Int)
   fn walk(n : Node) : Int do
     match n do
