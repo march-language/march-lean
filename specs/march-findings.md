@@ -381,3 +381,75 @@ The self-declaration exemption applies here too: march tests
 
 **Status.** reported upstream: N/A (march is correct here; this checker is
 behind). NOT YET FIXED in march-lean.
+
+### 6. R1's grant discharge is unmodelled — a LIVE false-accept class the corpus witnesses CANNOT catch
+
+march `78143049` (#236, merged 2026-08-09) made `main`'s capability parameter
+the program's GRANT: the whole transitive capability closure from `main` must
+sit under it, and a truthful `needs` manifest does not raise it
+(`Typecheck.check_main_grant`, `typecheck.ml:12687`). This checker has no model
+of a grant at all — `grant` occurs twice in `CapCheck.lean`, both inside R2's
+`root_cap` message.
+
+**Witness.** `scripts/grant-probes/grant_violated_console.march`:
+
+    mod Main do
+      needs IO.Console
+      needs IO.FileRead
+      fn greet(name : String) : () do println("hello " ++ name) end
+      fn main(cap : Cap(IO.FileRead)) : () do greet("march") end
+    end
+
+Both `needs` lines are truthful, so Check 1 and Check 1b pass and the manifest
+is perfect. march rejects on the grant alone:
+
+    `main` is granted `Cap(IO.FileRead)`, but the program reaches `IO.Console`
+    (reached in `println`). The grant is a ceiling on the WHOLE program —
+    declaring `needs IO.Console` does not raise it.
+
+Verified against march `f3908f82` (origin/main, contains #236):
+
+| probe | march | march-lean-check |
+|---|---|---|
+| `grant_ok_console.march` | 0 (accept) | 0 (accept) — MATCH |
+| `grant_violated_console.march` | **1 (reject)** | **0 (accept)** — **FALSE ACCEPT** |
+| `t166_masked_by_skip.march` | 1 (reject) | 2 (skip) |
+
+**Why the corpus witnesses do not catch it, which matters more than the
+finding.** march shipped `reject/t166_grant_narrow_violated_by_helper.march`
+and `accept/t167_grant_narrow_console_proven.march` as the R1 stage A+B
+witness pair. Against this checker:
+
+- **t167 already MATCHES.** It accepts, correctly, for reasons unrelated to
+  grants. It needs no ledger entry and pins nothing about R1.
+- **t166 SKIPS**, and for an entirely unrelated reason — `skip: out of modeled
+  fragment: SKIP: unbound variable "file_write"`. A2's inference does not bind
+  `file_write`, so the file never reaches a capability verdict.
+
+So ledgering both witnesses — the obvious first move, and the one the R1
+resync brief called for — would have added one stale-safe skip entry and one
+match, and pinned **nothing** about the actual divergence. The false accept
+above was found only by hand-writing a probe that swaps `file_write` for a
+builtin A2 already binds. This is the third time in this log that a green
+corpus said nothing about a whole false-verdict class.
+
+**It is worse than a plain gap: t166's skip is MASKING it.** `builtinCaps`
+already maps `file_write -> IO.FileWrite` (`CapCheck.lean:376`); only the
+inference layer is missing the binding. The moment A2 learns `file_write` —
+an ordinary coverage improvement, desirable on its own terms — t166 stops
+skipping and becomes a false ACCEPT, because nothing between the two layers
+models the grant. Per the standing rule, a coverage win must gate ACCEPT and
+keep REJECT: **the grant model has to land before, or with, any widening that
+binds the file builtins.**
+
+**Fix shape.** The lattice half is already proved: `coveredIn` / `subsumesIn`
+with transitivity, antisymmetry and `coveredIn_mono` (PR #23, `ae3f471`). What
+is missing is (a) recovering `main`'s `Cap(P)` parameter from the decoded
+signature, and (b) a transitive closure from `main` over the module's call
+graph — which `bodyCalls` already computes for Check 4 — checked against `P`
+with `coveredIn`. Note that R1 stage C generalizes the discharge to EVERY
+function with a concrete `Cap(P)` parameter; that work is not on march
+`origin/main` as of this writing, so only the `main` case is pinnable today.
+
+**Status.** reported upstream: N/A (march is correct here; this checker is
+behind). NOT YET FIXED in march-lean. Probes live in `scripts/grant-probes/`.

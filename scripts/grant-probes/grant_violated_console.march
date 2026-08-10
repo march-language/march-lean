@@ -1,0 +1,12 @@
+mod Main do
+  needs IO.Console
+  needs IO.FileRead
+
+  fn greet(name : String) : () do
+    println("hello " ++ name)
+  end
+
+  fn main(cap : Cap(IO.FileRead)) : () do
+    greet("march")
+  end
+end

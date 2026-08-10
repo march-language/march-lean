@@ -1,0 +1,11 @@
+mod Main do
+  needs IO.Console
+
+  fn greet(name : String) : () do
+    println("hello " ++ name)
+  end
+
+  fn main(cap : Cap(IO.Console)) : () do
+    greet("march")
+  end
+end
