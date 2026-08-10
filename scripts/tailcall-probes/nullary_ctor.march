@@ -1,0 +1,10 @@
+mod M do
+  type Tree = Leaf | Node(Tree, Tree)
+  fn size(t : Tree) : Int do
+    match t do
+      Leaf -> 0
+      Node(l, r) -> size(Leaf) + 1
+    end
+  end
+  fn main() do println(int_to_string(size(Leaf))) end
+end

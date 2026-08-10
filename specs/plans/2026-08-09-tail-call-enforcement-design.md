@@ -25,7 +25,6 @@ probe       march  lean   what it is
 --------------------------------------------------------------------------------
 loopy         1      0    self-recursive `loopy(n + 1) + 1`      FALSE ACCEPT
 go            1      0    same shape, name `go`                  FALSE ACCEPT
-length        1      4    same shape, name collides with prelude FALSE ACCEPT
 mutual        1      2    `walk`/`helper` SCC                    unconfirmed reject (§7)
 fact          0      0    `fact(n - 1) * n` — structural         correct, MUST NOT REGRESS
 attr          0      0    `@[no_warn_recursion]` on `loopy`      correct, MUST NOT REGRESS
@@ -36,6 +35,11 @@ march's diagnostic on `loopy` is confirmed to be the tail-call error, not a pars
 unbound-name error:
 
 > ``Function `loopy`: recursive call to `loopy` is not in tail position (wrapped in binary operation `+`).``
+
+That confirmation is not ceremony. A `length` probe of the identical shape was drafted
+and dropped: march does exit 1 on it, but for a **type** error — `length` resolves to
+prelude's `length : List(a) -> Int`, so the probe would have passed while testing
+nothing. Every `tailcall` probe asserts on the diagnostic text, not just the exit code.
 
 A blanket "any non-tail recursive call ⇒ reject" is therefore **wrong** — `fact`
 disproves it. A blanket skip on any recursive module is also wrong: it would forfeit
@@ -120,8 +124,8 @@ changes verdict for a non-tail-call reason.
 
 ### 5.1 Per-level driver (`enforce_tail_calls_in_decls`, `typecheck.ml:10902`)
 
-Applied to `module.decls`, recursing into each `DMod`'s own `decls` as an independent
-level:
+Applied to `module.decls`. **It does not recurse into `DMod`** — see §5.5, which is a
+correction to this design's first draft, found by a probe.
 
 - `externNames` ← ∪ over `DExtern` of `extern.fns[*].name.txt`. An extern has no body
   and cannot recurse; march subtracts these so a bare call to one is not resolved
@@ -185,7 +189,39 @@ Report the **first** error found. march reports all of them; one suffices for ex
 Message text mirrors march's `ctx` strings so probe output diffs directly against
 march's diagnostic.
 
-### 5.4 Shared helpers
+### 5.4 SCCs by mutual reachability
+
+march runs Tarjan (`find_sccs`, `typecheck.ml:10631`) and asks the result two
+questions: is this function on a cycle, and what is its SCC. Both are answered here by
+mutual reachability, which *is* the definition of an SCC — a much smaller surface than
+a hand-ported Tarjan, over graphs of a few dozen nodes. `reachFrom` returns the names
+reachable in **one or more** steps, so `f ∈ reachFrom f` is exactly march's
+`List.length scc > 1 || name ∈ direct`.
+
+### 5.5 `DMod` is NOT recursed into — a correction from the probes
+
+The first draft of this design said to recurse into `DMod`, mirroring the arm at
+`typecheck.ml:10968-10969`. That would have been a **false reject**. A probe showed
+march accepts a non-tail unbounded recursion nested inside `mod Inner do … end` while
+rejecting the identical function at top level. Two follow-ups pinned it down:
+
+- A nested *structural* recursion emits no "structurally recursive but not
+  tail-recursive" warning either, so it is Pass 3 as a whole that never reaches inside,
+  not just its error path.
+- A blatant type error inside a nested `mod` is also not reported, so those decls
+  appear not to be checked at all in the `--check` path.
+
+Reading the source would not have found this: the `DMod` arm is right there in
+`enforce_tail_calls_in_decls` and looks load-bearing. It is dead in this path.
+
+A second, independent mechanism reinforces it, found while mutation-testing the first:
+inside a nested module the emitter writes the recursive call as `EVar "Inner.boom"` —
+**qualified** — while the declaration is named `boom`. So even a version of this pass
+that *did* recurse would form no call-graph edge. `scripts/tailcall-probes/nested_mod.march`
+is therefore protected twice over, which is why breaking one mechanism alone does not
+turn it red.
+
+### 5.6 Shared helpers
 
 `collectPatternVars` (`typecheck.ml:10507`) and `isInfixOp` (`typecheck.ml:10679`) are
 ported verbatim. `isInfixOp` affects only message text, never the verdict.
@@ -239,23 +275,59 @@ would stay a skip and the mutual-recursion half would be untestable end-to-end t
 
 ## 8. Verification
 
-**Probes.** Built as hand-written `.march` files, each run both ways
-(`main.exe --check F` vs `main.exe --emit-core-ast F | march-lean-check`), and each
-confirmed to produce march's *tail-call* diagnostic rather than a parse or
-unbound-name error. The seven in §1 exist already. Still to write:
+**Probes** — `scripts/tailcall-probes/*.march`, driven by `scripts/tailcall-probes.sh`,
+which runs in CI *before* the harness so a false reject fails fast. 22 probes in two
+classes: `tailcall` (march must exit 1 **with** the "not in tail position" diagnostic,
+and we must exit 1) and `clean` (march must exit 0, and we must not exit 1). The
+`clean` probes are the false-reject detectors and are the bulk of the suite.
 
-- structural recursion through an ADT `match` (the `smaller`-via-scrutinee path)
-- `list_nth_safe` / `List.hd` accessor arguments
-- a nullary-constructor argument
-- shadowing by `let`, by `letfn`, and by a match-arm pattern
-- an `extern` name colliding with a `DFn` name
-- a multi-clause callee inside a cycle
-- a nested `DMod`
-- `@[no_warn_recursion]` on a *mutually* recursive pair
+The runner deliberately does **not** set `pipefail`. march exits 1 on
+`--emit-core-ast` for a file it rejects, so a pipefail'd
+`march --emit-core-ast | march-lean-check` reports march's 1 in place of the checker's
+0 — which silently turned every false accept in the `tailcall` class into a spurious
+"ok" on the first run of this suite.
 
-**In-repo guards.** `native_decide` examples over real emitter envelopes in
-`TailCall.lean`, following the M1 pattern at `MarchLeanCheck.lean:123`. Committed tests
-must not read the gitignored `.superpowers/sdd/samples/` directory.
+**Mutation testing.** Every `clean` probe was verified to *bite* by breaking the guard
+it protects and confirming it goes red. This caught three probes that passed for the
+wrong reason:
+
+- `cond_tail` originally recursed as `spin(n - 1)`, which is structurally smaller and
+  therefore allowed **whether or not** the arm body is tail position. It tested
+  nothing. Rewritten to `spin(dec(n))`.
+- The `shadow_*` trio turned out to guard the *walk*, not the *call graph*, so `calls`'
+  shadowing was unguarded. Added a `shadow_edge_*` trio in which the shadowed binder is
+  the only thing that would forge the SCC edge and the offending non-tail call sits in
+  the other function, where no shadowing is in scope to rescue it.
+- Nothing guarded `calls` treating `ELam`/`ELetFn` bodies as new scopes. Added
+  `lambda_edge` and `letfn_edge` on the same principle.
+
+Guard → probe that goes red when it is broken:
+
+| guard | probe(s) |
+|---|---|
+| `no_warn_recursion` read | `attr`, `attr_mutual` |
+| structural-smallness allowance | `fact`, `match_structural`, `nullary_ctor` |
+| `smaller` via match scrutinee | `match_structural` |
+| nullary-constructor smallness | `nullary_ctor` |
+| `ECond` arm body is tail | `cond_tail` |
+| `ELetQ` continuation is tail | `letq_tail` |
+| `EIf` branches inherit tail | `tail_ok`, `letq_tail` |
+| `chk` does not descend into `ELam` | `lambda_body` |
+| `calls`: `ELam` is a new scope | `lambda_edge` |
+| `calls`: `ELetFn` is a new scope | `letfn_edge` |
+| `calls`: `let` / `letfn` / match-arm shadowing | `shadow_edge_let` / `_letfn` / `_match` |
+| both shadowing sites together | `shadow_let` / `shadow_letfn` / `shadow_match` |
+| SCC detection (mutual recursion) | `mutual` |
+
+`nested_mod` is the one probe no single mutation turns red, because it is protected
+twice over — see §5.5.
+
+**In-repo guards.** Three `native_decide` examples in `TailCall.lean` over real
+`--emit-core-ast` envelopes (spans normalised), following the M1 pattern at
+`MarchLeanCheck.lean`: `loopy` must violate, `fact` and `attr` must not. These need no
+march binary, so they run everywhere the library builds, and a regression breaks the
+**build**. Committed tests must not read the gitignored `.superpowers/sdd/samples/`
+directory.
 
 **Corpus gate.** Baseline, measured at this commit with
 `--corpus-dir specs/lang/types --lang-dir specs/lang`:
@@ -273,6 +345,19 @@ The change must hold this or improve it by converting reject-side SKIPs to MATCH
 **Any accept-side regression is a stop.** Per the standing lesson that green
 conformance runs are weak evidence, the hand-built probes — not the corpus — are the
 primary instrument here; the corpus is the regression gate.
+
+**Result:** identical to baseline — `MATCH 86 / MISMATCH 0 / SKIP 246 (145 + 101) /
+KNOWN_LIMITATION 2 / RESULT: PASS`. Exactly as expected: the corpus contains no
+unbounded non-tail recursion, so it moved not one file. It confirms no regression and
+nothing else.
+
+**Stdlib sweep** (one-time, not in CI — the workflow's sparse checkout does not include
+`stdlib/`). Every march-**accepted** file under march's `stdlib/` and `examples/` was
+run through the pass: **124 files, 0 tail-call rejects**. Since march accepts all of
+them, any reject would have been a false reject by definition. This is the broadest
+false-reject evidence available, and it exercises real `@[no_warn_recursion]` uses in
+`hamt.march` and `dataframe.march`. Performance is a non-issue: `dataframe.march`
+(3520 lines, a 4 MB envelope) checks in 0.12 s.
 
 ## 9. Build
 

@@ -1,0 +1,13 @@
+mod M do
+  type Node = Leaf | Branch(Int)
+  fn walk(n : Node) : Int do
+    match n do
+      Leaf -> 0
+      Branch(k) -> helper(k)
+    end
+  end
+  fn helper(k : Int) : Int do
+    if k <= 0 do 0 else walk(Branch(k - 1)) + 1 end
+  end
+  fn main() do println(int_to_string(walk(Branch(3)))) end
+end
