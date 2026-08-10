@@ -310,3 +310,54 @@ correct behavior here; the inconsistency is march emitting an
 elaboration-error sentinel in a program it accepts.
 
 **Status.** reported upstream: NOT YET (both halves).
+
+### 5. Check 1b is now an ERROR in march, and this checker does not implement it — a LIVE false-accept class
+
+**This one obsoletes a design decision, so it is the most consequential entry
+in this section.**
+
+`specs/plans/2026-07-23-a3-capability-lattice-design.md` §1.3 decided NOT to
+implement Checks 1b/1c, and said so plainly:
+
+> They are WARNING-only in march. §2.8.6 calls this three-tier reality "the
+> single most consequential fact for anyone relying on `needs` as a soundness
+> guarantee." A checker that rejected on them would manufacture false
+> MISMATCHes against a march that accepts. Consequence, stated plainly: the
+> oracle inherits march's weaker guarantee here — it will not catch a program
+> that uses a builtin requiring an undeclared cap in a function body.
+
+That reasoning was correct when written. It is now obsolete: march main
+(`6867c783`) raises Check 1b with `Err.error_with_fix`
+(`typecheck.ml:9098-9106`), not `Err.warning` —
+
+    function body calls a builtin that requires `Cap(IO.Console)`
+    but `M` does not declare `needs IO.Console`.
+
+march closed the hole its own docs called the most consequential fact about
+`needs`. This checker did not, so the "weaker guarantee" the design accepted
+is no longer shared with march — it is a **divergence**, and it points the
+false-ACCEPT way: any module calling an IO builtin in a body without declaring
+the capability is rejected by march and accepted here.
+
+**Witness.** Every one of `scripts/tailcall-probes/*.march` before the
+accompanying fix: `mod M do fn main() do println("hi") end end` with no
+`needs`. march rejects; `march-lean-check` exits 0.
+
+**How it was found, which matters more than the finding.** The 277-file
+conformance corpus reports MISMATCH 0 against this same pin — every corpus
+file declares its capabilities properly, so not one of them witnesses this.
+It surfaced only because the tail-call probes were hand-written without
+capability manifests and the pin bump made march start rejecting them. A
+green corpus run said nothing about a whole false-accept class; eighteen
+throwaway probes found it immediately.
+
+**Fix shape.** The machinery already exists: `CapCheck.builtinCaps` maps
+builtin name -> required cap path, and `bodyCalls` already walks bodies for
+builtin calls (both were built for Check 8 and the behavioral caps). Check 1b
+is those two joined to `covered declared`. What needs care is march's exact
+gating — which bodies are scanned, and whether the check is per-function or
+per-module — since implementing it slightly too eagerly converts this
+false-accept class into a false-REJECT class.
+
+**Status.** reported upstream: N/A (march is correct here; this checker is
+behind). NOT YET FIXED in march-lean.

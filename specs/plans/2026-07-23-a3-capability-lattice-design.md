@@ -53,6 +53,12 @@ this project comes to a provably-equivalent model of march.
    emitter already builds the exact structure needed (§2.2), so this surfaces
    an existing value rather than computing anything new.
 
+> **SUPERSEDED (2026-08-10).** march main `6867c783` promoted Check 1b from
+> WARNING to ERROR (`typecheck.ml:9098`, `Err.error_with_fix`). Decision 3
+> below was correct against the march of its time and is now obsolete: not
+> implementing 1b is no longer "inheriting march's weaker guarantee", it is a
+> live false-ACCEPT divergence. See `specs/march-findings.md` §5.
+
 3. **Do NOT implement Checks 1b/1c.** They are WARNING-only in march. §2.8.6
    calls this three-tier reality "the single most consequential fact for
    anyone relying on `needs` as a soundness guarantee." A checker that
