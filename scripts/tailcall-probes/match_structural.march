@@ -1,0 +1,10 @@
+mod M do
+  type Tree = Leaf | Node(Tree, Tree)
+  fn depth(t : Tree) : Int do
+    match t do
+      Leaf -> 0
+      Node(l, r) -> depth(l) + depth(r)
+    end
+  end
+  fn main() do println(int_to_string(depth(Node(Leaf, Leaf)))) end
+end

@@ -221,6 +221,13 @@ partial def capAnnotsInTerm : Term → List String
       capAnnotsInTerm scrut ++
         arms.flatMap (fun (_, g, e) =>
           (g.map capAnnotsInTerm).getD [] ++ capAnnotsInTerm e)
+  -- `.opaque_` RECURSES, matching every other collector here (`bodyCalls`,
+  -- `bodyAllocates`, `matchesIn`). `Elab` decodes the nine unmodelled-but-
+  -- child-carrying march kinds to `opaque_` precisely so their children
+  -- survive to the cap layer; a `Cap(X)` annotation on a lambda parameter
+  -- inside, say, an `ECond` arm is exactly as much a `needs` use as one
+  -- anywhere else.
+  | .opaque_ children _ => children.flatMap capAnnotsInTerm
   | .unsupported _ => []
 
 /-- The concrete IO-lattice capability a type denotes, if it is exactly
@@ -306,6 +313,10 @@ partial def capNarrowViolation : Term → Option (String × String)
                     match (g.bind capNarrowViolation) with
                     | some v => some v
                     | none   => capNarrowViolation e)
+  -- `.opaque_` RECURSES, same rationale as `capAnnotsInTerm` above: a widening
+  -- `cap_narrow` buried in an unmodelled-but-child-carrying node is still a
+  -- widening, and its two sides are still concretely resolved.
+  | .opaque_ children _ => children.findSome? capNarrowViolation
   | .unsupported _ => none
 
 /-- The first R4a widening in a declaration's body, if any. -/
@@ -566,6 +577,18 @@ partial def bodyCalls (banned : List String) : Term → Bool
   | .match_ scrut arms _ =>
       bodyCalls banned scrut ||
         arms.any (fun (_, g, e) => (g.map (bodyCalls banned)).getD false || bodyCalls banned e)
+  -- `.opaque_` (`ECond`/`ERecordUpdate`/`EAtom`/`EAssert`/`EDbg`/`ELetFn`/
+  -- `ELetQ`/`ESend`/`ESpawn`) RECURSES. Its own shape is unmodelled, but it
+  -- carries the exact child-expression list march's `calls_in_expr` descends
+  -- into for those kinds (`typecheck.ml:7734-7750`), and `calls_in_expr` is
+  -- the shared body-walk behind `check_pure_module`,
+  -- `check_deterministic_module`, `check_no_panic_module` and Check 8. A
+  -- banned call inside `match do c -> println("leak") end` or
+  -- `send(p, unix_time_ms())` must therefore be found HERE — before the skip
+  -- gate — or the file exits 2 while march exits 1. Recursing costs nothing
+  -- in false-reject exposure: it can only ever ADD a `true`, i.e. only ever
+  -- turn a skip into a reject that march also renders.
+  | .opaque_ children _ => children.any (bodyCalls banned)
   -- LOAD-BEARING: this arm is safe returning `false` (rather than `true`,
   -- which would be the conservative choice) ONLY because
   -- `MarchLeanCheck.lean`'s `run` invokes `CapCheck.checkCaps` BEFORE the
@@ -577,6 +600,20 @@ partial def bodyCalls (banned : List String) : Term → Bool
   -- arm itself reports "no IO here". If the driver is ever reordered so the
   -- skip gate runs before (or independently of) `checkCaps`, this arm
   -- becomes a false accept and must be revisited.
+  --
+  -- **That ordering dependency is now DEEPER, not merely inherited.**
+  -- `Term.opaque_` exists solely to exploit it: the constructor hard-codes
+  -- `Term.hasUnsupported = true` (so the file still skips, so `Infer` and
+  -- `Linearity` never judge a construct they have no rules for — the exact
+  -- mechanism that produced the previous slice's false rejects) WHILE its
+  -- children stay visible to this walk and its siblings (`bodyAllocates`,
+  -- `divisionVerdict`, `matchesIn`, `termMentionsAny`). The whole value of
+  -- the constructor is the window between `checkCaps` and the skip gate. If
+  -- anyone reorders `MarchLeanCheck.run` so the skip gate precedes (or
+  -- short-circuits) `checkCaps`, `Term.opaque_` stops detecting ANYTHING —
+  -- it does not degrade to "conservative", it degrades to silent — and this
+  -- arm becomes a false accept besides. Reorder the driver only by first
+  -- deleting `Term.opaque_`.
   | .unsupported _ => false
 
 /-- `bodyCallsIO`, kept as a thin specialisation of `bodyCalls` over
@@ -618,6 +655,16 @@ partial def bodyAllocates : Term → Bool
   | .match_ scrut arms _ =>
       bodyAllocates scrut ||
         arms.any (fun (_, g, e) => (g.map bodyAllocates).getD false || bodyAllocates e)
+  -- `.opaque_` RECURSES, and contributes NO allocation of its own. Verified
+  -- against march's `no_alloc.ml` directly: its four allocating arms are
+  -- `ETuple (_::_)`, `ERecord`, `ECon (_, _::_)` and `ELam` — none of the
+  -- nine `opaque_` kinds is among them, and `check_expr` has an explicit
+  -- recurse-only arm for every one (`ELetFn`, `ELetQ`, `ECond`, `ESpawn`,
+  -- `EAssert`, `EDbg`, `ESend`, `ERecordUpdate`, `EAtom`;
+  -- `no_alloc.ml:41-63`). Note in particular that march does NOT treat
+  -- `ERecordUpdate` as an allocation even though it treats `ERecord` as one,
+  -- so this arm must not answer `true` the way `.record` does.
+  | .opaque_ children _ => children.any bodyAllocates
   | .unsupported _ => false
 
 /-- Division operators march's own division-safety pass flags
@@ -718,6 +765,15 @@ partial def termMentionsAny (names : List String) : Term → Bool
   | .match_ scrut arms _ =>
       termMentionsAny names scrut ||
         arms.any (fun (_, g, e) => (g.map (termMentionsAny names)).getD false || termMentionsAny names e)
+  -- `.opaque_` RECURSES. This walk is the DELIBERATELY over-approximate
+  -- `expr_mentions`, whose only use is to DISCARD a path fact when a name it
+  -- talks about is rebound; over-approximating loses information (a division
+  -- goes unproven → skip) instead of inventing a proof. Recursing therefore
+  -- moves strictly in the safe direction, and matches march, whose
+  -- `expr_mentions` is itself total over `Ast.expr`. Leaving it at `false`
+  -- would let a stale guard about an outer `d` survive a rebinding hidden in
+  -- an `ELetQ`/`ELetFn` child and license a WRONG non-zero proof.
+  | .opaque_ children _ => children.any (termMentionsAny names)
   | .unsupported _ => false
 
 /-- Drop every path entry whose condition mentions a name in `names` — march's
@@ -943,6 +999,17 @@ def divisorVerdict (facts : DivFacts) (path : DivPath) (divisor : Term) : DivVer
     | .lit _ _ | .app _ _ _ | .lam _ _ _ | .let_ _ _ _ _ _ _
     | .letfn _ _ _ _ _ _ _ | .ite _ _ _ _ | .con _ _ _ | .tuple _ _
     | .record _ _ | .field _ _ _ _ | .match_ _ _ _ => .divZero
+    -- `.opaque_` as the DIVISOR ITSELF (`10 / dbg(x)`, `10 / :tag(x)`, ...)
+    -- stays at "cannot judge", deliberately NOT joined into the `.divZero`
+    -- row above. All nine kinds really do land in march's arm-4 catch-all
+    -- today, so rejecting would be right — but this is a JUDGEMENT site, not
+    -- a collector, and the whole point of this slice is that `opaque_`
+    -- carries children WITHOUT modelling the node. Answering `unknown` keeps
+    -- the file's verdict exactly what it was before `opaque_` existed (the
+    -- enclosing decl's `hasUnsupported` sends it to exit 2 regardless), so
+    -- the slice adds detection only where it can also justify it. Tightening
+    -- this to `.divZero` is a separate, separately-verified change.
+    | .opaque_ _ _ => .unknown
     -- `.unsupported` is `decodeTerm`'s open catch-all for march `kind`s this
     -- fragment does not decode — including ones that do not exist yet. Every
     -- kind it currently covers IS in march's arm 4, but a future one need not
@@ -1099,6 +1166,24 @@ partial def divisionVerdict (facts : DivFacts) (path : DivPath) : Term → DivVe
             | none      => path'
           ((g.map (divisionVerdict facts' path')).getD .safe).join
             (divisionVerdict facts' bodyPath e))))
+  -- `.opaque_` RECURSES — but with BOTH channels EMPTIED, and that is the
+  -- load-bearing part of this arm. march's `iter_div_sites`
+  -- (`division_safety.ml:204-269`) walks all nine kinds too, but it walks
+  -- them KNOWING their shape: `ELetFn`/`ELetQ` retire the names they bind
+  -- (`under (n :: lam_param_names ps) body`, `under (pat_binders p) body`)
+  -- and `ECond` pushes each arm's condition onto `path`. `Term.opaque_`
+  -- records neither binders nor arm structure, so we cannot reproduce either.
+  -- Carrying the OUTER facts/path in unchanged would be unsound in the
+  -- false-REJECT direction: a stale `d = 0` fact surviving into an `ELetFn`
+  -- body that rebinds `d` would manufacture a `divZero` march never renders.
+  -- Emptying both channels is conservative on both sides — with no facts a
+  -- `var` divisor answers `unknown` (skip, never a fabricated reject), and
+  -- with no path nothing is fabricated as PROVEN non-zero either. What
+  -- survives is exactly the two judgements march makes unconditionally, with
+  -- no solver, no refinement escape and no path escape: a literal-zero
+  -- divisor (arm 1) and a complex divisor (arm 4). So `10 / 0` hidden in a
+  -- `cond` arm is now the reject march says it is, and nothing else moves.
+  | .opaque_ children _ => DivVerdict.joinAll (children.map (divisionVerdict [] []))
   | .unsupported _ => .safe
 
 /-- `no_panic`'s SECOND half (A3 slice (c) Task 3): a non-exhaustive `match`
@@ -1246,6 +1331,42 @@ partial def patCoveredCtors : Pattern → List String
   | .con name _ => [bareCtorName name]
   | .wild | .var _ _ | .tuple _ | .lit _ | .record _ | .unsupported => []
 
+/-- The scrutinee type names for which march's `find_missing_mc` takes its
+INFINITE-DOMAIN branch — `| TCon (("Int" | "Float" | "String" | "Char" |
+"Atom"), _) -> …` (`typecheck.ml:4375`), transcribed verbatim. That branch
+runs only AFTER the `has_first_wild` test above it has already failed, and it
+then reports the column as missing unconditionally: there is no finite
+constructor set to enumerate, so nothing but a wildcard row can cover such a
+scrutinee. -/
+def infiniteDomainTyNames : List String :=
+  ["Int", "Float", "String", "Char", "Atom"]
+
+/-- The boolean literals `p` covers, peeling `as` and unioning an `or_`'s
+alternatives exactly as `patCoveredCtors` does (and for the same reason:
+`norm_pat_all` expands a `PatOr` into one row per alternative, so
+`true | false` yields both `SPLit` rows). Only `Bool` needs this — it is the
+one type whose `find_missing_mc` branch enumerates LITERALS rather than
+constructors. -/
+partial def patCoveredBoolLits : Pattern → List Bool
+  | .as _ p => patCoveredBoolLits p
+  | .or_ alts => alts.flatMap patCoveredBoolLits
+  | .lit (.bool b) => [b]
+  | .wild | .var _ _ | .con _ _ | .tuple _ | .lit _ | .record _ | .unsupported => []
+
+/-- Is `p` a shape the `Bool` coverage test below actually models — a boolean
+literal, through any depth of `as`/`or_`? This is the `Bool` analogue of
+`isModeledArmPattern`: anything else on a guardless arm means this checker
+cannot account for what the arm covers, and per the safety-net rule its
+presence must read as "cannot judge" (⇒ exhaustive), never as "does not
+cover". At a `Bool` scrutinee no other shape is well-typed, so this should be
+unreachable; it is here so that a decoder change which ever makes it
+reachable fails CONSERVATIVE instead of manufacturing a reject. -/
+partial def isBoolLitPattern : Pattern → Bool
+  | .as _ p => isBoolLitPattern p
+  | .or_ alts => alts.all isBoolLitPattern
+  | .lit (.bool _) => true
+  | .wild | .var _ _ | .con _ _ | .tuple _ | .lit _ | .record _ | .unsupported => false
+
 /-- Is a `match_`'s arm list exhaustive over `scrutTy`, per march's
 `check_exhaustiveness` restricted to the guardless-coverage fragment it falls
 back to whenever any arm carries a `when` guard (`typecheck.ml:4546-4581`:
@@ -1311,25 +1432,34 @@ become reachable for `Option`/tuple-headed scrutinees the moment the
 Task 3` fixtures below) is ever closed and such matches stop being screened
 out upstream.
 
-**Known false-accept class (Finding I2, documented not fixed):** a
-`Pattern.lit` arm list over a non-ADT scrutinee (`Int`/`String`/`Float`) has
-no built-in/user ctor set to test against at all — but that mismatch is never
-even reached: `Pattern.lit` is not one of `isModeledArmPattern`'s recognized
-forms, so the SAFETY NET above fires FIRST on the unmodelled `.lit` pattern
-and short-circuits to "exhaustive" before `headTypeName`/`scrutTy` are
-consulted at all — this checker EXITS 0 on it either way. march, by
-contrast, DOES exhaustiveness-check literal patterns against a scrutinee's
-structure (`check_exhaustiveness`
-handles `PatLit` rows) and rejects `match n do 0 -> 1; 1 -> 2 end` (no
-catch-all) as non-exhaustive. This is therefore a live false-accept class,
-not merely a "skip" as an earlier draft of this docstring implied — `Int`/
-`String`/`Float` matches are otherwise fully in-fragment (they reach this
-gate at all, rather than being screened out by `hasUnsupported` upstream),
-so the unknown-type carve-out's conservatism here produces a genuine
-divergence from march, not an out-of-fragment skip. Left unfixed
-deliberately: narrowing the unknown-type rule to close this gap risks
-reintroducing a false reject elsewhere (the exact failure mode C1/C2 already
-demonstrated), which this differential oracle must never manufacture.
+**Finding I2 — FIXED (see the two branches at the head of the body below).**
+A `Pattern.lit` arm list over a non-ADT scrutinee used to reach nothing at
+all: `Pattern.lit` is not one of `isModeledArmPattern`'s recognized forms, so
+the SAFETY NET fired FIRST on the unmodelled `.lit` and short-circuited to
+"exhaustive" before `headTypeName`/`scrutTy` were consulted, and `Bool` — not
+registered in `builtinCtors` — fell through the `find?` to the unknown-type
+carve-out and got the same answer. march rejects both
+(`match n do 0 -> 1; 1 -> 2 end` on an `Int`, `match b do true -> 1 end` on a
+`Bool`; verified directly), so this was a live false-accept class, not a
+skip: such matches are fully in-fragment and reach this gate rather than
+being screened out by `hasUnsupported` upstream.
+
+The reason it is now safe to close — and why doing so does NOT contradict the
+general-conservatism rule below — is that these two scrutinee types are ones
+march decides OUTRIGHT. `find_missing_mc` needs no `env`, no module-scoped
+ctor resolution and no row budget for them: it tests `has_first_wild`, and
+then either reports missing unconditionally (`Int`/`Float`/`String`/`Char`/
+`Atom` — an infinite domain) or checks for both boolean literals (`Bool`).
+Neither the ctor universe nor the or-expansion policy — the two RECONSTRUCTED
+inputs that rule is about — is an input to that decision. The one input that
+is, the wildcard test, is the one this checker genuinely models
+(`isCatchAllPattern` ↔ `norm_pat`'s `SPWild`, a correspondence worked through
+in that function's docstring).
+
+Still open, and still deliberately not fixed, is Finding I1 above: coverage
+is compared only at the TOP level, so a `(Bool, Bool)` tuple scrutinee
+matched by `(true, true)` alone is judged exhaustive here and rejected by
+march. That one really does need the full pattern matrix.
 
 ---
 
@@ -1404,6 +1534,58 @@ def matchExhaustive (scrutTy : Ty) (userCtors : List (String × List String))
   let isCatchAll : Pattern × Option Term × Term → Bool := fun (p, g, _) =>
     g.isNone && isCatchAllPattern p
   if arms.any isCatchAll then true
+  -- FINDING I2, now FIXED. A non-ADT scrutinee is not an unresolvable type
+  -- this checker must decline on — it is a type whose coverage rule march
+  -- states OUTRIGHT, with no `env` lookup, no module-scoped ctor resolution
+  -- and no row budget to reconstruct. `find_missing_mc` tests
+  -- `has_first_wild` FIRST (a row starting `SPWild`, i.e. exactly what
+  -- `isCatchAllPattern` computes: `norm_pat`/`norm_pat_all` emit `SPWild`
+  -- for `PatWild`/`PatVar` and for nothing else, peeling `PatAs` and either
+  -- distributing or widening `PatOr` — see `isCatchAllPattern`'s docstring,
+  -- which already mirrors that correspondence for the ADT case). Only when
+  -- that fails does it dispatch on the scrutinee type, and for
+  -- `Int`/`Float`/`String`/`Char`/`Atom` it then reports the column missing
+  -- UNCONDITIONALLY (`typecheck.ml:4375-4381`). So past the catch-all test
+  -- above, march's answer for such a scrutinee is "non-exhaustive", full
+  -- stop — independent of the arm patterns' shapes, which is why the
+  -- `isModeledArmPattern` safety net is deliberately NOT consulted first
+  -- here: there is no shape whose meaning we could be getting wrong, only a
+  -- wildcard row that is either present or absent.
+  --
+  -- This closes a live FALSE-ACCEPT class, verified directly against march
+  -- inside `cap no_panic`: `match n do 0 -> ..; 1 -> .. end` on an `Int`,
+  -- `match s do "a" -> ..; "b" -> .. end` on a `String`, and
+  -- `match x do 1.0 -> ..; 2.0 -> .. end` on a `Float` are all rejected
+  -- ("contains a non-exhaustive `match`"), and all three were accepted here
+  -- because `Pattern.lit` is not an `isModeledArmPattern` shape, so the
+  -- safety net short-circuited to "exhaustive" before the scrutinee type was
+  -- ever consulted.
+  --
+  -- This does NOT violate the general-conservatism rule below. That rule
+  -- governs the two inputs this checker RECONSTRUCTS (the ctor universe and
+  -- the or-expansion policy); neither is an input here. The wildcard test is
+  -- the one input this checker genuinely models, and it is the only one this
+  -- branch depends on.
+  else if (headTypeName scrutTy).any infiniteDomainTyNames.contains then false
+  -- `Bool` is the other type `find_missing_mc` decides outright, and the only
+  -- one it decides by enumerating LITERALS: it has exactly two values, so
+  -- (past the catch-all test) the match is exhaustive iff both the `true` and
+  -- the `false` literal appear on a GUARDLESS arm (`typecheck.ml:4363-4374`).
+  -- `Bool` is deliberately absent from `builtinCtors` (see its docstring), so
+  -- before this branch a `Bool` scrutinee fell through the `find?` below to
+  -- the unknown-type carve-out and was always judged exhaustive — a false
+  -- accept for `match b do true -> 1 end`, verified against march.
+  --
+  -- Unlike the infinite-domain branch, this one DOES read arm shapes (it
+  -- counts which literals are present), so it keeps a safety net: if any
+  -- guardless arm is not a boolean literal, this checker cannot say what it
+  -- covers and declines (exhaustive) rather than guess.
+  else if headTypeName scrutTy == some "Bool" then
+    if arms.any (fun (p, g, _) => g.isNone && !isBoolLitPattern p) then true
+    else
+      let lits := arms.flatMap (fun (p, g, _) =>
+        if g.isSome then [] else patCoveredBoolLits p)
+      lits.contains true && lits.contains false
   else if arms.any (fun (p, g, _) => g.isNone && !isModeledArmPattern p) then true
   else
     let covered : List String :=
@@ -1442,6 +1624,16 @@ partial def matchesIn : Term → List (Ty × List (Pattern × Option Term × Ter
   | .match_ scrut arms _ =>
       (scrut.ty, arms) :: (matchesIn scrut ++ arms.flatMap (fun (_, g, e) =>
         (g.map matchesIn).getD [] ++ matchesIn e))
+  -- `.opaque_` RECURSES: a pure collector, and a non-exhaustive `match`
+  -- nested inside a `cond` arm or a `let?` continuation is exactly as much a
+  -- runtime-panic surface as a top-level one. march agrees — its
+  -- exhaustiveness diagnostic is recorded by the typechecker's own total
+  -- expression walk, which visits these nodes, and `check_no_panic_module`
+  -- then promotes the recorded span to an error. `matchExhaustive` remains
+  -- the judgement site and remains conservative (unsure ⇒ "exhaustive"), so
+  -- adding nodes here cannot manufacture a reject on a match this checker
+  -- cannot actually classify.
+  | .opaque_ children _ => children.flatMap matchesIn
   | .unsupported _ => []
 
 /-- Does `t` (a function body) contain any non-exhaustive `match_` at all,
@@ -1828,9 +2020,40 @@ def checkOneModule (modName : String) (decls : List Decl)
   -- errors on the definite one regardless of what it later decides about the
   -- other); only when no fn is definitely unsafe does an unresolvable divisor
   -- downgrade the module to `skip`.
+  --
+  -- **Scope is `dfn` bodies PLUS `dlet` bodies, unlike every other gate
+  -- above.** Division safety is a SEPARATE march pass
+  -- (`refinecheck/division_safety.ml`), and its declaration walk is
+  -- deliberately exhaustive with no wildcard (`:542-601`): alongside
+  -- `A.DFn` it names `A.DLet (_, b, _) -> expr b.bind_expr`, checking a
+  -- top-level binding's right-hand side with an EMPTY param list — exactly
+  -- `divisionVerdict [] []`. That arm exists because it was a live march bug
+  -- (`specs/lang/types/reject/t120`'s header: the walk "descended only into
+  -- `DFn` and `DMod` and ended in a `| _ -> ()`", so a division in a
+  -- top-level `let` "passed `--check` with exit 0 and then died at run
+  -- time"). Scanning only `dfns` here reproduced march's OLD bug, not its
+  -- current behavior, and was a verified FALSE ACCEPT: `mod M do cap
+  -- no_panic  let bad = 10 / 0  … end` is march exit 1 ("division by zero
+  -- literal in `cap no_panic` module.") and was exit 0 here.
+  --
+  -- The other behavioral gates correctly stay `dfn`-only: `check_pure_module`
+  -- / `check_deterministic_module` / `check_no_panic_module`
+  -- (`typecheck.ml:9127`) each `List.filter_map` over `Ast.DFn` alone, and
+  -- `refinecheck/no_alloc.ml` likewise — verified directly, march ACCEPTS a
+  -- `cap pure` module with `let bad = println("leak")` and a `cap no_alloc`
+  -- module with `let bad = (1, 2)`. Do NOT widen those to `dlet` to "match"
+  -- this one; that would be a false-reject source.
+  --
+  -- march's walk also covers `DImpl`/`DActor`/`DTest`/`DApp`/`DDescribe`/
+  -- `DSetup`/`DSetupAll` bodies, but every one of those decodes to
+  -- `Decl.unsupported` here, carrying no term at all — a residual false-SKIP
+  -- gap (march rejects, this checker exits 2), never a false accept.
   let divVerdicts :=
     if opts.contains "no_panic" then
-      dfns.map (fun (name, body) => (name, divisionVerdict [] [] body))
+      (dfns ++ decls.filterMap (fun d => match d with
+         | .dlet name rhs => some (name, rhs)
+         | _ => none)).map
+        (fun (name, body) => (name, divisionVerdict [] [] body))
     else []
   match divVerdicts.find? (fun (_, v) => v == DivVerdict.divZero) with
   | some (name, _) =>
@@ -4082,5 +4305,541 @@ def npOrPatternUnderCapStillNonExhaustive : Module := {
   schemes := [], insts := [], moduleCaps := [] }
 #eval checkCaps npOrPatternUnderCapStillNonExhaustive   -- expect: violation naming no_panic (non-exhaustive)
 example : (checkCaps npOrPatternUnderCapStillNonExhaustive).isViolation = true := by native_decide
+
+-- ---------------------------------------------------------------------
+-- `Term.opaque_`: the nine unmodelled-but-child-carrying march kinds.
+--
+-- The 242-file conformance corpus CANNOT regression-test any of this: a
+-- census found NO file combining a `cap` directive with a capability
+-- violation inside any of these constructors. A green harness run is
+-- therefore no evidence at all here, and these hand-built pins are the only
+-- coverage. Each fixture reproduces the exact CHILD-LIST ARRANGEMENT
+-- `Elab.decodeTerm` produces for that `kind` (see its docstring's table),
+-- since that arrangement — not the node's shape, which is not modelled — is
+-- the whole contract between the decoder and the cap layer.
+--
+-- Every violating shape below was verified end to end against the real
+-- march binary: march rejects it naming the capability, and
+-- `march --emit-core-ast | march-lean-check` now exits 1 (it exited 2
+-- before `Term.opaque_`). Every non-violating counterpart was verified to be
+-- ACCEPTED by march, and must NOT produce a violation here — a `violation`
+-- on one of those would be a false reject, the worst error class this
+-- oracle has.
+
+def opqSp : Span := ⟨"o", 0, 0, 0, 0⟩
+def opqUnitTy : Ty := Ty.con "Unit" []
+def opqIntTy : Ty := Ty.con "Int" []
+
+/-- `println("x")` — an `IO.Console` builtin, banned under `cap pure`. This is
+the violation every `*Violating` fixture below hides inside an `opaque_`. -/
+def opqBanned : Term :=
+  Term.app (Term.var "println" opqSp opqUnitTy)
+    [Term.lit (Lit.str "x") (Ty.con "String" [])] opqUnitTy
+
+/-- An inert child: no call, no allocation, no division. -/
+def opqInert : Term := Term.lit (Lit.int 1) opqIntTy
+
+/-- `mod P do cap pure ... fn f() do <body> end end`. -/
+def opqPureMod (body : Term) : Module := {
+  decls := [Decl.dmod "P" [Decl.dopts ["pure"], Decl.dfn "f" [] none body]],
+  schemes := [], insts := [], moduleCaps := [] }
+
+/-- The invariant the whole design rests on: an `opaque_` node is out of
+fragment REGARDLESS of its children, so `Compare.inferModule`'s whole-file
+skip gate still fires and `Infer`/`Linearity` never judge it. If this ever
+becomes `false`, every one of the nine fixtures below turns into a
+false-reject risk. -/
+example : (Term.opaque_ [] opqIntTy).hasUnsupported = true := by native_decide
+example : (Term.opaque_ [opqInert] opqIntTy).hasUnsupported = true := by native_decide
+
+/-- `ECond` — `match do c1 -> println("x") ... end`. Children are the arms
+flattened as `cond, body, cond, body, ...`; BOTH halves are expressions and
+march's `calls_in_expr` folds both. -/
+def opqCondViolating : Module := opqPureMod
+  (Term.opaque_ [Term.var "c1" opqSp (Ty.con "Bool" []), opqBanned,
+                 Term.var "c2" opqSp (Ty.con "Bool" []), opqInert] opqIntTy)
+#eval checkCaps opqCondViolating   -- expect: violation naming `pure`
+example : (checkCaps opqCondViolating).isViolation = true := by native_decide
+
+/-- `ECond` near-miss: same shape, no banned call anywhere. march ACCEPTS. -/
+def opqCondClean : Module := opqPureMod
+  (Term.opaque_ [Term.var "c1" opqSp (Ty.con "Bool" []), opqInert,
+                 Term.var "c2" opqSp (Ty.con "Bool" []), opqInert] opqIntTy)
+#eval checkCaps opqCondClean   -- expect: ok
+example : (checkCaps opqCondClean).isViolation = false := by native_decide
+
+/-- `ERecordUpdate` — `{ r with a: println("x") }`. Children are `base`
+followed by each field's `value`; the field NAMES carry no expression. -/
+def opqRecordUpdateViolating : Module := opqPureMod
+  (Term.opaque_ [Term.var "r" opqSp opqIntTy, opqBanned] opqIntTy)
+#eval checkCaps opqRecordUpdateViolating   -- expect: violation naming `pure`
+example : (checkCaps opqRecordUpdateViolating).isViolation = true := by native_decide
+
+def opqRecordUpdateClean : Module := opqPureMod
+  (Term.opaque_ [Term.var "r" opqSp opqIntTy, opqInert] opqIntTy)
+#eval checkCaps opqRecordUpdateClean   -- expect: ok
+example : (checkCaps opqRecordUpdateClean).isViolation = false := by native_decide
+
+/-- `EAtom` — `:tag(println("x"))`. Children are `args`; the atom itself is a
+bare string in the envelope, not an expression. -/
+def opqAtomViolating : Module := opqPureMod (Term.opaque_ [opqBanned] opqIntTy)
+#eval checkCaps opqAtomViolating   -- expect: violation naming `pure`
+example : (checkCaps opqAtomViolating).isViolation = true := by native_decide
+
+def opqAtomClean : Module := opqPureMod (Term.opaque_ [opqInert] opqIntTy)
+#eval checkCaps opqAtomClean   -- expect: ok
+example : (checkCaps opqAtomClean).isViolation = false := by native_decide
+
+/-- `EAssert` — `assert println("x") > 0`. One child, `expr`. -/
+def opqAssertViolating : Module := opqPureMod
+  (Term.opaque_ [Term.app (Term.var ">" opqSp (Ty.con "Bool" []))
+                   [opqBanned, opqInert] (Ty.con "Bool" [])] opqUnitTy)
+#eval checkCaps opqAssertViolating   -- expect: violation naming `pure`
+example : (checkCaps opqAssertViolating).isViolation = true := by native_decide
+
+def opqAssertClean : Module := opqPureMod
+  (Term.opaque_ [Term.app (Term.var ">" opqSp (Ty.con "Bool" []))
+                   [opqInert, opqInert] (Ty.con "Bool" [])] opqUnitTy)
+#eval checkCaps opqAssertClean   -- expect: ok
+example : (checkCaps opqAssertClean).isViolation = false := by native_decide
+
+/-- `EDbg` — `dbg(println("x"))`. One child when `expr` is present. -/
+def opqDbgViolating : Module := opqPureMod (Term.opaque_ [opqBanned] opqUnitTy)
+#eval checkCaps opqDbgViolating   -- expect: violation naming `pure`
+example : (checkCaps opqDbgViolating).isViolation = true := by native_decide
+
+/-- `EDbg` with NO expression — bare `dbg()` emits `"expr": null`, which
+decodes to an EMPTY child list (march's own `EDbg (None, _)` arm contributes
+nothing). Nothing to find, and no decode error either. -/
+def opqDbgNullaryClean : Module := opqPureMod (Term.opaque_ [] opqUnitTy)
+#eval checkCaps opqDbgNullaryClean   -- expect: ok
+example : (checkCaps opqDbgNullaryClean).isViolation = false := by native_decide
+
+/-- `ELetFn` — a nested `fn g() do println("x") end` inside a block. The child
+is `body` ONLY: `params` are `param_to_json` records (name/ty/lin) carrying no
+expression, and march's `ELetFn` arm of `calls_in_expr` walks only `body`. -/
+def opqLetFnViolating : Module := opqPureMod (Term.opaque_ [opqBanned] opqIntTy)
+#eval checkCaps opqLetFnViolating   -- expect: violation naming `pure`
+example : (checkCaps opqLetFnViolating).isViolation = true := by native_decide
+
+def opqLetFnClean : Module := opqPureMod (Term.opaque_ [opqInert] opqIntTy)
+#eval checkCaps opqLetFnClean   -- expect: ok
+example : (checkCaps opqLetFnClean).isViolation = false := by native_decide
+
+/-- `ELetQ` — `let? v = r` with the banned call in the CONTINUATION. Children
+are `value` then `cont`; the pattern binds names but carries no expression.
+The `cont` position is the one that matters: parser folding turns the rest of
+the enclosing block into it, so most real code puts its work there. -/
+def opqLetQViolating : Module := opqPureMod
+  (Term.opaque_ [Term.var "r" opqSp opqIntTy, opqBanned] opqIntTy)
+#eval checkCaps opqLetQViolating   -- expect: violation naming `pure`
+example : (checkCaps opqLetQViolating).isViolation = true := by native_decide
+
+def opqLetQClean : Module := opqPureMod
+  (Term.opaque_ [Term.var "r" opqSp opqIntTy, opqInert] opqIntTy)
+#eval checkCaps opqLetQClean   -- expect: ok
+example : (checkCaps opqLetQClean).isViolation = false := by native_decide
+
+/-- `ESend` — `send(p, println("x"))`. Children are `cap` then `msg`. -/
+def opqSendViolating : Module := opqPureMod
+  (Term.opaque_ [Term.var "p" opqSp opqIntTy, opqBanned] opqUnitTy)
+#eval checkCaps opqSendViolating   -- expect: violation naming `pure`
+example : (checkCaps opqSendViolating).isViolation = true := by native_decide
+
+def opqSendClean : Module := opqPureMod
+  (Term.opaque_ [Term.var "p" opqSp opqIntTy, opqInert] opqUnitTy)
+#eval checkCaps opqSendClean   -- expect: ok
+example : (checkCaps opqSendClean).isViolation = false := by native_decide
+
+/-- `ESpawn` — `spawn(<expr>)`. One child, `actor`. march additionally
+requires that child to be a bare actor name, so in WELL-TYPED code nothing can
+hide there; the arm exists because `calls_in_expr` walks it anyway and because
+`--emit-core-ast` still emits an AST for a program march rejects. -/
+def opqSpawnViolating : Module := opqPureMod (Term.opaque_ [opqBanned] opqUnitTy)
+#eval checkCaps opqSpawnViolating   -- expect: violation naming `pure`
+example : (checkCaps opqSpawnViolating).isViolation = true := by native_decide
+
+def opqSpawnClean : Module := opqPureMod
+  (Term.opaque_ [Term.var "Counter" opqSp opqIntTy] opqUnitTy)
+#eval checkCaps opqSpawnClean   -- expect: ok
+example : (checkCaps opqSpawnClean).isViolation = false := by native_decide
+
+/-- The other three cap-layer walks reach through `opaque_` too.
+
+`no_panic` / `divisionVerdict`: a LITERAL-ZERO divisor hidden in an
+`opaque_` child is a violation — march's arm 1 errors on it unconditionally,
+with no solver, no refinement escape and no path escape, so the emptied
+facts/path this arm recurses with cannot cost us the answer. -/
+def opqNoPanicDivZeroInChild : Module := {
+  decls := [Decl.dmod "NP" [
+    Decl.dopts ["no_panic"],
+    Decl.dfn "f" [] none
+      (Term.opaque_ [divTerm (Term.lit (Lit.int 10) divIntTy)
+                             (Term.lit (Lit.int 0) divIntTy)] divIntTy)]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps opqNoPanicDivZeroInChild   -- expect: violation naming no_panic
+example : (checkCaps opqNoPanicDivZeroInChild).isViolation = true := by native_decide
+
+/-- ...and a NON-zero literal divisor in the same position stays ok. -/
+def opqNoPanicDivNonZeroInChild : Module := {
+  decls := [Decl.dmod "NP" [
+    Decl.dopts ["no_panic"],
+    Decl.dfn "f" [] none
+      (Term.opaque_ [divTerm (Term.lit (Lit.int 10) divIntTy)
+                             (Term.lit (Lit.int 2) divIntTy)] divIntTy)]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps opqNoPanicDivNonZeroInChild   -- expect: ok
+example : (checkCaps opqNoPanicDivNonZeroInChild).isViolation = false := by native_decide
+
+/-- The emptied-channels choice, pinned. A `let d = 0` fact in scope OUTSIDE
+an `opaque_` must NOT be carried into its children: `opaque_` records no
+binders, so an `ELetFn`/`ELetQ` child that REBINDS `d` would be judged against
+a stale fact and false-reject a program march accepts. `divisionVerdict`
+recurses with empty facts AND empty path, so `10 / d` inside the child is an
+undischarged variable — `DivVerdict.unknown`, i.e. a SKIP, never a reject. -/
+def opqNoPanicStaleFactNotCarried : Module := {
+  decls := [Decl.dmod "NP" [
+    Decl.dopts ["no_panic"],
+    Decl.dfn "f" [] none
+      (Term.let_ "d" Lin.unrestricted none (Term.lit (Lit.int 0) divIntTy)
+        (Term.opaque_ [divTerm (Term.lit (Lit.int 10) divIntTy)
+                               (Term.var "d" divSp divIntTy)] divIntTy)
+        divIntTy)]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps opqNoPanicStaleFactNotCarried   -- expect: skip, NOT violation
+example : (checkCaps opqNoPanicStaleFactNotCarried).isViolation = false := by native_decide
+example : (checkCaps opqNoPanicStaleFactNotCarried).isSkip = true := by native_decide
+
+/-- `no_alloc` / `bodyAllocates`: an allocation NESTED in an `opaque_` child is
+found (march's `no_alloc.ml` recurses into all nine kinds)... -/
+def opqNoAllocTupleInChild : Module := {
+  decls := [Decl.dmod "NA" [
+    Decl.dopts ["no_alloc"],
+    Decl.dfn "f" [] none
+      (Term.opaque_ [Term.tuple [opqInert, opqInert] (Ty.tuple [opqIntTy, opqIntTy])]
+        opqIntTy)]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps opqNoAllocTupleInChild   -- expect: violation naming no_alloc
+example : (checkCaps opqNoAllocTupleInChild).isViolation = true := by native_decide
+
+/-- ...but the `opaque_` node itself allocates NOTHING. This matters most for
+`ERecordUpdate`: march flags `ERecord` as an allocation and does NOT flag
+`ERecordUpdate` (`no_alloc.ml:23` vs `:62`), so this arm must not copy
+`.record`'s unconditional `true`. -/
+def opqNoAllocNodeItselfIsNotAnAllocation : Module := {
+  decls := [Decl.dmod "NA" [
+    Decl.dopts ["no_alloc"],
+    Decl.dfn "f" [] none
+      (Term.opaque_ [Term.var "r" opqSp opqIntTy, opqInert] opqIntTy)]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps opqNoAllocNodeItselfIsNotAnAllocation   -- expect: ok
+example : (checkCaps opqNoAllocNodeItselfIsNotAnAllocation).isViolation = false := by native_decide
+
+/-- `no_panic` / `matchesIn`: a non-exhaustive `match` nested inside an
+`opaque_` child (e.g. inside a `cond` arm) is as much a runtime-panic surface
+as a top-level one, and is reached. -/
+def opqNoPanicNonExhaustiveMatchInChild : Module := {
+  decls := [
+  colorDType,
+  Decl.dmod "G" [
+    Decl.dopts ["no_panic"],
+    Decl.dfn "describe" [("c", Lin.unrestricted, none)] none
+      (Term.opaque_
+        [Term.match_ (Term.var "c" npSpan colorTy)
+          [(Pattern.con "Red" [], none, Term.lit (Lit.int 0) opqIntTy)]
+          opqIntTy]
+        opqIntTy)]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps opqNoPanicNonExhaustiveMatchInChild   -- expect: violation naming no_panic
+example : (checkCaps opqNoPanicNonExhaustiveMatchInChild).isViolation = true := by native_decide
+
+-- ---------------------------------------------------------------------
+-- TRAILING `ELet` (a `do` block's last/only statement).
+--
+-- ROOT CAUSE these pin: `Elab.decodeTerm` had NO `"ELet"` arm. march's
+-- emitter does not wrap a single-statement block in an `EBlock`, and
+-- `decodeBlockStmts` hands an `EBlock`'s FINAL element straight back to
+-- `decodeTerm` — so a trailing `let` hit the `| _ => Term.unsupported`
+-- fallback and its right-hand side was DISCARDED before any walk below ever
+-- saw it. Every cap walk went blind at once: `bodyCalls`, `bodyAllocates`,
+-- `divisionVerdict` and `matchesIn`. march rejected
+-- `fn f() : Unit do let q = println("leak") end`; we exited 2.
+--
+-- This was NOT an `opaque_` bug and NOT specific to the app-fn position that
+-- surfaced it (`{ p with x: println("leak") }` applied to `()`): `bodyCalls`'s
+-- generic `.app fn args` arm was always correct, it just never received a
+-- term. The shapes below are what the FIXED decoder now emits, so they pin
+-- the contract between decoder and cap layer, not the decoder's own dispatch
+-- (that is pinned by the `#eval`s in `Elab`'s `Test` namespace).
+--
+-- Every violating fixture was verified end to end against the real march
+-- binary (march exit 1 naming the cap; `--emit-core-ast | march-lean-check`
+-- exited 2 before this fix and exits 1 after). Every clean counterpart was
+-- verified ACCEPTED by march and must NOT produce a violation here.
+
+/-- A trailing `let` has no continuation, so `decodeTerm`'s `ELet` arm makes
+`Term.unsupported` the `let_`'s BODY. That is what keeps `hasUnsupported`
+true (the file still skips, `Infer`/`Linearity` still never judge it) while
+leaving the RHS on a real `let_` — so `divisionVerdict`'s fact/path
+retirement still applies to the bound name, which `opaque_` could not offer.
+If this ever becomes `false`, the trailing-let shape stops skipping and every
+fixture below turns into a false-reject risk. -/
+def trailingLet (rhs : Term) (ty : Ty) : Term :=
+  Term.let_ "q" Lin.unrestricted none rhs (Term.unsupported ty) ty
+
+example : (trailingLet opqInert opqIntTy).hasUnsupported = true := by native_decide
+
+/-- The reported reproducer, exactly: `let q = { p with x: println("leak") }`
+as a fn body, where march parses the record-update as the FN of a zero-arg
+`EApp`. Two previously-fatal layers at once — the trailing `let` (which used
+to drop everything) and the `opaque_` in app-fn position. -/
+def letAppFnOpaqueViolating : Module := opqPureMod
+  (trailingLet
+    (Term.app
+      (Term.opaque_ [Term.var "p" opqSp opqIntTy, opqBanned] opqIntTy) [] opqIntTy)
+    opqIntTy)
+#eval checkCaps letAppFnOpaqueViolating   -- expect: violation naming `pure`
+example : (checkCaps letAppFnOpaqueViolating).isViolation = true := by native_decide
+
+/-- Near-miss: same two layers, no banned call. march ACCEPTS — a violation
+here would be a false reject. -/
+def letAppFnOpaqueClean : Module := opqPureMod
+  (trailingLet
+    (Term.app
+      (Term.opaque_ [Term.var "p" opqSp opqIntTy, opqInert] opqIntTy) [] opqIntTy)
+    opqIntTy)
+#eval checkCaps letAppFnOpaqueClean   -- expect: ok
+example : (checkCaps letAppFnOpaqueClean).isViolation = false := by native_decide
+
+/-- The general case, with no `opaque_` involved at all: a banned call sitting
+DIRECTLY in a trailing let's RHS. This is the fixture that shows the bug was
+never about the app-fn position. -/
+def letTrailingBannedCall : Module := opqPureMod (trailingLet opqBanned opqUnitTy)
+#eval checkCaps letTrailingBannedCall   -- expect: violation naming `pure`
+example : (checkCaps letTrailingBannedCall).isViolation = true := by native_decide
+
+/-- Sibling walk `bodyAllocates`: a non-empty tuple in a trailing let's RHS. -/
+def letTrailingAllocates : Module := {
+  decls := [Decl.dmod "NA" [
+    Decl.dopts ["no_alloc"],
+    Decl.dfn "f" [] none
+      (trailingLet (Term.tuple [opqInert, opqInert] opqIntTy) opqIntTy)]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps letTrailingAllocates   -- expect: violation naming no_alloc
+example : (checkCaps letTrailingAllocates).isViolation = true := by native_decide
+
+/-- Sibling walk `divisionVerdict`: `let q = 10 / 0` as the whole body. -/
+def letTrailingDivZero : Module := {
+  decls := [Decl.dmod "NP" [
+    Decl.dopts ["no_panic"],
+    Decl.dfn "f" [] none
+      (trailingLet
+        (Term.app (Term.var "/" opqSp opqIntTy)
+          [Term.lit (Lit.int 10) opqIntTy, Term.lit (Lit.int 0) opqIntTy] opqIntTy)
+        opqIntTy)]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps letTrailingDivZero   -- expect: violation naming no_panic
+example : (checkCaps letTrailingDivZero).isViolation = true := by native_decide
+
+/-- Near-miss for the above: `let q = 10 / 2`. march ACCEPTS. -/
+def letTrailingDivNonZero : Module := {
+  decls := [Decl.dmod "NP" [
+    Decl.dopts ["no_panic"],
+    Decl.dfn "f" [] none
+      (trailingLet
+        (Term.app (Term.var "/" opqSp opqIntTy)
+          [Term.lit (Lit.int 10) opqIntTy, Term.lit (Lit.int 2) opqIntTy] opqIntTy)
+        opqIntTy)]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps letTrailingDivNonZero   -- expect: ok
+example : (checkCaps letTrailingDivNonZero).isViolation = false := by native_decide
+
+/-- Sibling walk `matchesIn`: a non-exhaustive `match` in a trailing let's
+RHS, over a user ADT whose constructors `matchExhaustive` can enumerate. -/
+def letTrailingNonExhaustiveMatch : Module := {
+  decls := [
+  colorDType,
+  Decl.dmod "G" [
+    Decl.dopts ["no_panic"],
+    Decl.dfn "describe" [("c", Lin.unrestricted, none)] none
+      (trailingLet
+        (Term.match_ (Term.var "c" npSpan colorTy)
+          [(Pattern.con "Red" [], none, Term.lit (Lit.int 0) opqIntTy)]
+          opqIntTy)
+        opqIntTy)]],
+  schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps letTrailingNonExhaustiveMatch   -- expect: violation naming no_panic
+example : (checkCaps letTrailingNonExhaustiveMatch).isViolation = true := by native_decide
+
+/-- SEPARATE SIBLING, same class: a NON-`PatVar`/`PatWild` `ELet` binder in
+NON-tail position. `decodeBlockStmts` used to answer `Term.unsupported` for
+the whole element, throwing away both the RHS and the entire remainder of the
+block; it now answers `Term.opaque_ [rhs, rest]`. Verified against march:
+`let (a, b) = (println("leak"), 1)` followed by `a` is a reject we skipped.
+`opaque_` (not a synthetic `let_ "_"`) is the right carrier here because it
+empties `divisionVerdict`'s channels, so a stale fact about a name the
+destructuring pattern rebinds cannot manufacture a false reject. -/
+def letDestructuringBinderViolating : Module := opqPureMod
+  (Term.opaque_
+    [Term.tuple [opqBanned, opqInert] opqIntTy, Term.var "a" opqSp opqIntTy]
+    opqIntTy)
+#eval checkCaps letDestructuringBinderViolating   -- expect: violation naming `pure`
+example : (checkCaps letDestructuringBinderViolating).isViolation = true := by native_decide
+
+/-- Near-miss for the above: `let (a, b) = (1, 2)` then `a`, under `cap pure`.
+march ACCEPTS. (This fixture is `cap pure`, not `no_alloc` — the tuple IS an
+allocation, so it would legitimately violate `no_alloc`.) -/
+def letDestructuringBinderClean : Module := opqPureMod
+  (Term.opaque_
+    [Term.tuple [opqInert, opqInert] opqIntTy, Term.var "a" opqSp opqIntTy]
+    opqIntTy)
+#eval checkCaps letDestructuringBinderClean   -- expect: ok
+example : (checkCaps letDestructuringBinderClean).isViolation = false := by native_decide
+
+-- ── Non-ADT scrutinee exhaustiveness (FINDING I2, fixed) ────────────────────
+--
+-- Every fixture below was run against march directly (`--check`, exit 0 =
+-- accept / 1 = reject) as the `mod P do cap no_panic … end` program its
+-- comment quotes; the `expect:` line records march's own verdict, not this
+-- checker's preference. Before the fix the four rejecting cases all ACCEPTED
+-- here, because `Pattern.lit` is not an `isModeledArmPattern` shape and the
+-- safety net short-circuited to "exhaustive" before the scrutinee type was
+-- consulted.
+
+/-- Build a `cap no_panic` module wrapping a single `match` on `x : ty`. -/
+def npMatchMod (ty : Ty) (arms : List (Pattern × Option Term × Term)) : Module := {
+  decls := [Decl.dmod "NE" [
+    Decl.dopts ["no_panic"],
+    Decl.dfn "f" [("x", Lin.unrestricted, none)] none
+      (Term.match_ (Term.var "x" opqSp ty) arms opqIntTy)]],
+  schemes := [], insts := [], moduleCaps := [] }
+
+def npArm (l : Lit) : Pattern × Option Term × Term := (Pattern.lit l, none, opqInert)
+
+/-- `match n do 0 -> ..; 1 -> .. end` on an `Int`. march REJECTS. -/
+def neIntLits : Module := npMatchMod opqIntTy [npArm (.int 0), npArm (.int 1)]
+#eval checkCaps neIntLits   -- expect: violation naming no_panic
+example : (checkCaps neIntLits).isViolation = true := by native_decide
+
+/-- Teeth: the SAME shape with a `_` catch-all. march ACCEPTS. -/
+def neIntWild : Module :=
+  npMatchMod opqIntTy [npArm (.int 0), (Pattern.wild, none, opqInert)]
+#eval checkCaps neIntWild   -- expect: ok
+example : (checkCaps neIntWild).isViolation = false := by native_decide
+
+/-- A bare VAR arm is march's other `SPWild` row (`norm_pat`'s `PatVar ->
+SPWild`), so it catches all just like `_`. march ACCEPTS. -/
+def neIntVar : Module :=
+  npMatchMod opqIntTy [npArm (.int 0), (Pattern.var "k" Lin.unrestricted, none, opqInert)]
+#eval checkCaps neIntVar   -- expect: ok
+example : (checkCaps neIntVar).isViolation = false := by native_decide
+
+/-- `match s do "a" -> ..; "b" -> .. end` on a `String`. march REJECTS. -/
+def neStringLits : Module :=
+  npMatchMod (Ty.con "String" []) [npArm (.str "a"), npArm (.str "b")]
+#eval checkCaps neStringLits   -- expect: violation naming no_panic
+example : (checkCaps neStringLits).isViolation = true := by native_decide
+
+/-- `match x do 1.0 -> ..; 2.0 -> .. end` on a `Float`. march REJECTS. -/
+def neFloatLits : Module :=
+  npMatchMod (Ty.con "Float" []) [npArm (.float "1.0"), npArm (.float "2.0")]
+#eval checkCaps neFloatLits   -- expect: violation naming no_panic
+example : (checkCaps neFloatLits).isViolation = true := by native_decide
+
+/-- `match b do true -> .. end` — one of `Bool`'s two values. march REJECTS. -/
+def neBoolOne : Module := npMatchMod (Ty.con "Bool" []) [npArm (.bool true)]
+#eval checkCaps neBoolOne   -- expect: violation naming no_panic
+example : (checkCaps neBoolOne).isViolation = true := by native_decide
+
+/-- Teeth: both `Bool` literals present is EXHAUSTIVE — the branch must count
+literals, not simply reject every `Bool` match. march ACCEPTS. -/
+def neBoolBoth : Module :=
+  npMatchMod (Ty.con "Bool" []) [npArm (.bool true), npArm (.bool false)]
+#eval checkCaps neBoolBoth   -- expect: ok
+example : (checkCaps neBoolBoth).isViolation = false := by native_decide
+
+/-- Both literals reached through one OR-pattern (`true | false`), which
+`norm_pat_all` expands into two `SPLit` rows. march ACCEPTS. -/
+def neBoolOr : Module :=
+  npMatchMod (Ty.con "Bool" [])
+    [(Pattern.or_ [Pattern.lit (.bool true), Pattern.lit (.bool false)], none, opqInert)]
+#eval checkCaps neBoolOr   -- expect: ok
+example : (checkCaps neBoolOr).isViolation = false := by native_decide
+
+/-- A GUARDED arm contributes nothing to guaranteed coverage, so `true` behind
+a guard plus a bare `false` still misses `true`. march REJECTS. -/
+def neBoolGuardedTrue : Module :=
+  npMatchMod (Ty.con "Bool" [])
+    [(Pattern.lit (.bool true), some (Term.lit (Lit.bool true) (Ty.con "Bool" [])), opqInert),
+     npArm (.bool false)]
+#eval checkCaps neBoolGuardedTrue   -- expect: violation naming no_panic
+example : (checkCaps neBoolGuardedTrue).isViolation = true := by native_decide
+
+/-- A scrutinee type this checker cannot name at all (a type VARIABLE) still
+declines — the new branches key off a head type NAME and must not widen the
+unknown-type carve-out. -/
+def neUnknownScrut : Module := npMatchMod (Ty.var 0) [npArm (.int 0)]
+#eval checkCaps neUnknownScrut   -- expect: ok
+example : (checkCaps neUnknownScrut).isViolation = false := by native_decide
+
+/-! ### Division safety reaches a top-level `let` (`Decl.dlet`)
+
+march's `division_safety.ml` walk is exhaustive over `A.decl` with NO
+wildcard and names `A.DLet (_, b, _) -> expr b.bind_expr` (`:574`) — that arm
+exists precisely because omitting it was a march bug that shipped
+(`specs/lang/types/reject/t120`'s header). Scanning `dfn` bodies only
+reproduced march's OLD behavior and was a verified FALSE ACCEPT:
+
+    mod M do  cap no_panic  let bad = 10 / 0  … end
+
+is march exit 1 ("division by zero literal in `cap no_panic` module.") and
+was exit 0 here.
+
+The near-misses below pin the boundary: every OTHER behavioral gate stays
+`dfn`-only, because march's own `check_pure_module` /
+`check_deterministic_module` / `check_no_panic_module` / `no_alloc.ml` each
+scan `Ast.DFn` alone — verified directly, march ACCEPTS a `cap pure` module
+with `let bad = println("leak")` and a `cap no_alloc` module with
+`let bad = (1, 2)`. Widening those to `dlet` would be a false-reject source.
+-/
+
+private def dlSp : Span := ⟨"d", 0, 0, 0, 0⟩
+private def dlIntTy : Ty := Ty.con "Int" []
+private def divBy (n : Int) : Term :=
+  Term.app (Term.var "/" dlSp (Ty.arrow dlIntTy (Ty.arrow dlIntTy dlIntTy)))
+    [Term.lit (Lit.int 10) dlIntTy, Term.lit (Lit.int n) dlIntTy] dlIntTy
+private def divLetMod (opt : String) (rhs : Term) : Module :=
+  { decls := [Decl.dopts [opt], Decl.dlet "bad" rhs], schemes := [], insts := [], moduleCaps := [] }
+
+/-- `cap no_panic` + `let bad = 10 / 0` — march REJECTS. -/
+def divTopLevelLetZero : Module := divLetMod "no_panic" (divBy 0)
+#eval checkCaps divTopLevelLetZero   -- expect: violation naming no_panic
+example : (checkCaps divTopLevelLetZero).isViolation = true := by native_decide
+
+/-- Near-miss: same shape, non-zero literal divisor. march ACCEPTS. -/
+def divTopLevelLetNonZero : Module := divLetMod "no_panic" (divBy 2)
+#eval checkCaps divTopLevelLetNonZero   -- expect: ok
+example : (checkCaps divTopLevelLetNonZero).isViolation = false := by native_decide
+
+/-- Near-miss: the same `10 / 0` in a top-level `let` WITHOUT `cap no_panic`.
+No cap is declared, so nothing is promised and march ACCEPTS. -/
+def divTopLevelLetNoCap : Module :=
+  { decls := [Decl.dlet "bad" (divBy 0)], schemes := [], insts := [], moduleCaps := [] }
+#eval checkCaps divTopLevelLetNoCap   -- expect: ok
+example : (checkCaps divTopLevelLetNoCap).isViolation = false := by native_decide
+
+/-- Near-miss pinning that the OTHER gates stay `dfn`-only: a `cap pure`
+module whose only side effect is in a top-level `let` RHS. march ACCEPTS
+(`check_pure_module` filters `Ast.DFn`), so this must NOT become a violation. -/
+def pureTopLevelLetSideEffect : Module := divLetMod "pure" opqBanned
+#eval checkCaps pureTopLevelLetSideEffect   -- expect: ok
+example : (checkCaps pureTopLevelLetSideEffect).isViolation = false := by native_decide
+
+/-- Same, for `no_alloc`: a tuple allocation in a top-level `let` RHS.
+march ACCEPTS. -/
+def noAllocTopLevelLetTuple : Module :=
+  divLetMod "no_alloc" (Term.tuple [opqInert, opqInert] dlIntTy)
+#eval checkCaps noAllocTopLevelLetTuple   -- expect: ok
+example : (checkCaps noAllocTopLevelLetTuple).isViolation = false := by native_decide
 
 end MarchLean.CapCheck

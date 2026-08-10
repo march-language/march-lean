@@ -203,6 +203,33 @@ inductive Term where
   -- march's `check_exhaustiveness` (`typecheck.ml:4546`), which computes
   -- coverage over the GUARDLESS branches only.
   | match_ (scrut : Term) (arms : List (Pattern × Option Term × Term)) (ty : Ty)
+  /-- **Out-of-fragment node that nonetheless CARRIES its child expressions.**
+
+  Decoded (`Elab.decodeTerm`) from the nine march `kind`s whose own shape this
+  fragment does not model but which can nest ARBITRARY sub-expressions:
+  `ECond`, `ERecordUpdate`, `EAtom`, `EAssert`, `EDbg`, `ELetFn`, `ELetQ`,
+  `ESend`, `ESpawn`. march's `calls_in_expr` (`typecheck.ml:7704`) is TOTAL
+  over `Ast.expr` and descends into every one of them, so a `cap pure` /
+  `cap deterministic` / `cap no_alloc` / `cap no_panic` violation can hide
+  inside one. Decoding them to `unsupported` DISCARDED those children, so the
+  capability layer could not see the violation and the file silently skipped
+  (exit 2) where march rejected (exit 1).
+
+  `children` is exactly the sub-expression list march's own walk descends
+  into, in march's order — see each new arm of `Elab.decodeTerm`, keyed field
+  by field to the emitter (`lib/dump/ast_json.ml`). NOTHING about the node's
+  own semantics is modelled: not its shape, not its binders, not its
+  evaluation order, not its arm structure. It is a bag of subterms.
+
+  **`Term.hasUnsupported` is hard-coded `true` for this constructor** (see
+  below), so a file containing one still trips `Compare.inferModule`'s
+  whole-file skip gate exactly as `unsupported` does. `Infer` and `Linearity`
+  therefore NEVER see an `opaque_` node, and this constructor carries ZERO
+  false-reject exposure: the only pass that can act on it is
+  `CapCheck.checkCaps`, which `MarchLeanCheck.run` invokes BEFORE that gate.
+  Named `opaque_` (not `opaque`) because `opaque` is a Lean keyword — same
+  trailing-underscore convention as `let_`/`match_`/`or_`. -/
+  | opaque_ (children : List Term) (ty : Ty)
   | unsupported (ty : Ty)
   deriving Repr, Inhabited
 
@@ -210,7 +237,8 @@ inductive Term where
 def Term.ty : Term → Ty
   | .lit _ t | .var _ _ t | .app _ _ t | .lam _ _ t | .let_ _ _ _ _ _ t
   | .letfn _ _ _ _ _ _ t | .ite _ _ _ t | .con _ _ t | .tuple _ t
-  | .record _ t | .field _ _ _ t | .match_ _ _ t | .unsupported t => t
+  | .record _ t | .field _ _ _ t | .match_ _ _ t | .opaque_ _ t
+  | .unsupported t => t
 
 /-- Does an optional surface annotation carry an out-of-fragment type? An
 absent annotation is always in-fragment; a present one is out of fragment iff
@@ -236,6 +264,15 @@ explicitly. Same result on every input; `.unsupported` still short-circuits
 before the `ty` check, and every other arm still tests `ty` first. -/
 def Term.hasUnsupported : Term → Bool
   | .unsupported _ => true
+  -- LOAD-BEARING, and deliberately NOT a recursion into `children`: an
+  -- `opaque_` node is out of fragment BY CONSTRUCTION (its own shape is
+  -- unmodelled), independent of whether its children happen to be modelled.
+  -- Hard-coding `true` is what keeps `Compare.inferModule`'s whole-file skip
+  -- gate firing on exactly the files it fired on before this constructor
+  -- existed, which is the entire reason carrying the children costs nothing
+  -- in false-reject exposure. Do not "improve" this to
+  -- `Term.anyHasUnsupported children`.
+  | .opaque_ _ _ => true
   | .lit _ ty => ty.hasUnsupported
   | .var _ _ ty => ty.hasUnsupported
   | .app f args ty =>
@@ -307,8 +344,11 @@ inductive Decl where
   — is always in fragment when present, because the decoder forces the whole
   declaration to `Decl.unsupported` when the return annotation is out of
   fragment. `CapCheck.capsInReturnSignature` scans it so Check 1 covers
-  `param_tys @ ret_tys` exactly as march's `check_module_needs` does; `Infer`
-  ignores it (it infers the body's type, not the annotation). -/
+  `param_tys @ ret_tys` exactly as march's `check_module_needs` does, and
+  `Infer.inferModule'`'s `dfn` arm unifies the inferred BODY type against it,
+  exactly as it already does for each param annotation — march checks a
+  clause's body against its declared return type, and leaving this
+  unconstrained was a live false-accept class (see that arm's comment). -/
   | dfn (name : String) (params : List (String × Lin × Option Ty)) (retAnnot : Option Ty) (body : Term)
   | dlet (name : String) (rhs : Term)
   | dtype (name : String) (params : List String) (ctors : List CtorSig)

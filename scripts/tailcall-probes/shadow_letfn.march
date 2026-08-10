@@ -1,0 +1,10 @@
+mod M do
+  fn other(n : Int) : Int do
+    if n == 0 do 0 else spin(n - 1) end
+  end
+  fn spin(n : Int) : Int do
+    fn other(x : Int) : Int do x + 1 end
+    other(n) + 1
+  end
+  fn main() do println(int_to_string(spin(3))) end
+end

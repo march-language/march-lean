@@ -278,15 +278,81 @@ mutual
 /-- Decode an expr node into a `Term`. Every arm reads the node's own
 `resolved_ty` first (via `decodeResolvedTy`) so it's threaded as `ty` on
 whichever constructor is produced, including the `unsupported` fallback for
-any `kind` not handled below (`ECond`/`EPipe`/`EAnnot`/`EHole`/`EAtom`/
-`ESend`/`ESpawn`/`EResultRef`/`EDbg`/`ELetFn`/`ELetQ`/`EAssert`/`ESigil` —
-none of these appear in the 8 real samples; `Term` has a dedicated `letfn`
-constructor for a future `ELetFn` decoder, but since no sample exercises it
-this task leaves it on the unsupported fallback rather than guessing at an
-undertested currying/sequencing shape). `ELet` is handled only via
-`decodeBlockStmts` (inside `EBlock`) — it never reaches this dispatch
-directly, since march's grammar only produces `ELet` as one element of an
-`EBlock`'s expr list. -/
+any `kind` not handled below (`EPipe`/`EHole`/`EResultRef`/`ESigil`
+— plus, by design, every march `kind` that does not exist yet). `Term` has a
+dedicated `letfn` constructor for a future `ELetFn` decoder, but since no
+sample exercises it this file does not guess at an undertested
+currying/sequencing shape: `ELetFn` decodes to `opaque_` (below) instead.
+**`ELet` reaches this dispatch directly, and MUST have an arm here.** An
+earlier revision of this docstring asserted the opposite ("march's grammar
+only produces `ELet` as one element of an `EBlock`'s expr list"), and that
+assertion was FALSE — it cost a whole class of false skips. march's emitter
+does not wrap a single-statement `do` block in an `EBlock` at all: a fn body
+that is one `ELet` is emitted as a bare `ELet` node, and `decodeBlockStmts`
+funnels an `EBlock`'s FINAL element straight back here too (`[last] =>
+decodeTerm last`). With no `ELet` arm, both shapes fell to the
+`| _ => Term.unsupported` fallback at the bottom of this match, DISCARDING the
+binding's right-hand side — and with it any `println` / allocation /
+`10 / 0` / non-exhaustive `match` hiding in it. march rejected
+`fn f() do let q = println("leak") end`; we exited 2. (The narrow symptom
+that surfaced this was an `EApp` whose `fn` is an `ERecordUpdate` — but the
+app-fn position was a red herring: `bodyCalls`'s generic `.app fn args` arm
+was always correct, it simply never got a term to walk.)
+
+A trailing `ELet` has no continuation to be the `Term.let_` body, so this arm
+supplies `Term.unsupported` as the body. That keeps the RHS structurally
+where every `CapCheck` walk already expects it (a real `let_`, so
+`divisionVerdict`'s fact/path retirement still applies to the bound name —
+unlike `opaque_`, which must empty both channels) while `hasUnsupported`
+stays `true` through the unsupported body, so `Compare.inferModule`'s step-(1)
+skip gate still fires and `Infer`/`Linearity` never judge the node. A
+non-`PatVar`/`PatWild` pattern cannot be curried into `Term.let_`'s
+plain-`String` binder, so it decodes to `Term.opaque_ [rhs]` instead: still
+cap-transparent, still out of fragment, and — because `opaque_` empties
+`divisionVerdict`'s channels — it cannot let a stale fact about a name the
+pattern rebinds manufacture a false reject.
+
+**The `opaque_` arms.** Nine `kind`s — `ECond`, `ERecordUpdate`, `EAtom`,
+`EAssert`, `EDbg`, `ELetFn`, `ELetQ`, `ESend`, `ESpawn` — are still not
+modelled, but each can NEST arbitrary sub-expressions, and march's
+`calls_in_expr` (`typecheck.ml:7704-7752`) walks into all of them. They
+therefore decode to `Term.opaque_ children ty`, carrying exactly the
+sub-expression list march's own walk descends into and in march's order, so
+`CapCheck`'s cap-layer walks can find a `cap pure`/`deterministic`/
+`no_alloc`/`no_panic` violation hiding inside one. `Term.opaque_` still
+reports `hasUnsupported = true`, so nothing else about these files changes —
+they still hit the whole-file skip gate. Child fields were read off the
+emitter (`lib/dump/ast_json.ml:379-503`), NOT guessed:
+
+| `kind`          | emitter fields                    | children (march order) |
+|-----------------|-----------------------------------|------------------------|
+| `ECond`         | `arms : [{cond, body}]`           | `cond`,`body` per arm, in order (`calls_in_expr`: `calls_in_expr (calls_in_expr a ce) be`) |
+| `ERecordUpdate` | `base`, `fields : [{name,value}]` | `base` then each `value` |
+| `EAtom`         | `atom`, `args`                    | `args` (`atom` is a bare string) |
+| `EAssert`       | `expr`                            | `expr` |
+| `EDbg`          | `expr` (NULLABLE — `dbg()`)       | `[]` when null, else `expr` |
+| `ELetFn`        | `name`,`params`,`ret_ty`,`body`   | `body` only — `params` are `param_to_json` records (`name`/`ty`/`lin`), no exprs, and march's `ELetFn` arm walks only `body` |
+| `ELetQ`         | `pattern`,`value`,`cont`          | `value` then `cont` |
+| `ESend`         | `cap`, `msg`                      | `cap` then `msg` |
+| `ESpawn`        | `actor`                           | `actor` |
+
+`EPipe`/`ESigil` are deliberately NOT here: `Desugar` eliminates both before
+emission (`lib/desugar/desugar.ml:543-586`, `:733-744`), so arms for them
+would be dead code — confirmed empirically by a sweep of all 490 emittable
+`.march` files under march's `specs/`, `examples/` and `stdlib/`: neither
+`kind` occurs once. `EHole`/`EResultRef` are excluded for a different and
+weaker reason — they are LEAVES, with no sub-expression a capability could
+hide in — and they too are absent from that sweep.
+
+**An earlier revision of this paragraph lumped `EAnnot` in with those three
+("no parser production reaches them here"). That was FALSE**, and false in
+the same way the old `ELet` docstring was: no parser production builds an
+`EAnnot`, but `Desugar` synthesizes one for every `app` block
+(`desugar.ml:929`) and the resulting `DFn __app_init__` IS emitted. `EAnnot`
+is in fact the only unhandled expression `kind` the corpus sweep found. It
+now has an `opaque_` arm below. The lesson generalizes: "no parser production
+reaches X" is not the same claim as "X is not emitted", because `Desugar`
+runs between them and manufactures nodes of its own. -/
 partial def decodeTerm (j : Json) : Except String Term := do
   let ty ← decodeResolvedTy j
   match ← kindOf j with
@@ -352,13 +418,110 @@ partial def decodeTerm (j : Json) : Except String Term := do
       let t ← decodeTerm (← field j "then_")
       let e ← decodeTerm (← field j "else_")
       .ok (Term.ite c t e ty)
+  -- ── The nine `opaque_` kinds (see this function's docstring for the
+  -- field-by-field emitter correspondence). Shape is NOT modelled; only the
+  -- child EXPRESSIONS march's `calls_in_expr` walks are carried.
+  | "ECond" =>
+      -- `arms : [{cond, body}]` — BOTH halves are expressions, and march's
+      -- `ECond` arm folds `cond` then `body` for each arm in order.
+      let armsJ ← (← field j "arms").getArr?.mapError (fun _ => "arms")
+      let kids ← armsJ.toList.mapM (fun a => do
+        let c ← decodeTerm (← field a "cond")
+        let b ← decodeTerm (← field a "body")
+        pure [c, b])
+      .ok (Term.opaque_ kids.flatten ty)
+  | "ERecordUpdate" =>
+      let base ← decodeTerm (← field j "base")
+      let fsJ ← (← field j "fields").getArr?.mapError (fun _ => "fields")
+      let vals ← fsJ.toList.mapM (fun f => do decodeTerm (← field f "value"))
+      .ok (Term.opaque_ (base :: vals) ty)
+  | "EAtom" =>
+      let argsJ ← (← field j "args").getArr?.mapError (fun _ => "args")
+      let args ← argsJ.toList.mapM decodeTerm
+      .ok (Term.opaque_ args ty)
+  | "EAssert" =>
+      let e ← decodeTerm (← field j "expr")
+      .ok (Term.opaque_ [e] ty)
+  | "EDbg" =>
+      -- `dbg()` emits `"expr": null` (`json_opt expr_to_json`); march's own
+      -- `EDbg (None, _)` arm contributes nothing, so an absent child is an
+      -- EMPTY child list, not a decode error.
+      let eJ ← field j "expr"
+      if eJ.isNull then .ok (Term.opaque_ [] ty)
+      else do .ok (Term.opaque_ [← decodeTerm eJ] ty)
+  | "ELetFn" =>
+      -- `params` carry no expressions (`param_to_json` = name/ty/lin) and
+      -- march's `ELetFn` arm walks only `body`.
+      let body ← decodeTerm (← field j "body")
+      .ok (Term.opaque_ [body] ty)
+  | "ELetQ" =>
+      let value ← decodeTerm (← field j "value")
+      let cont ← decodeTerm (← field j "cont")
+      .ok (Term.opaque_ [value, cont] ty)
+  | "ESend" =>
+      let cap ← decodeTerm (← field j "cap")
+      let msg ← decodeTerm (← field j "msg")
+      .ok (Term.opaque_ [cap, msg] ty)
+  | "ESpawn" =>
+      let actor ← decodeTerm (← field j "actor")
+      .ok (Term.opaque_ [actor] ty)
+  | "EAnnot" =>
+      -- A type ascription `(e : T)`. NO parser production builds one — but
+      -- `Desugar` does: `DApp` (an `app Name do … end` block) lowers to a
+      -- synthetic `fn __app_init__()` whose record's `spec` field is
+      -- `EAnnot (app_body, SupervisorSpec, _)` (`desugar/desugar.ml:929`), and
+      -- that `DFn` IS emitted. Verified against real emitter output for
+      -- `specs/lang/grammar/parse/p19_app_on_start_supervisor_spec.march`,
+      -- and it is the ONLY unhandled expression `kind` present anywhere in
+      -- the 490-file corpus sweep. march's `calls_in_expr` descends into it
+      -- (`typecheck.ml:7740`), so a `cap` violation in the app body is a real
+      -- march reject; decoding this to the bare `Term.unsupported` fallback
+      -- DISCARDED the child and hid it from every `CapCheck` walk. Verified
+      -- divergence: a `cap no_panic` module whose `app` body calls `panic`,
+      -- and a `cap pure` module whose `app` body calls `println` — march
+      -- rejects both (`__app_init__` … calls `panic` / `println`), and this
+      -- checker exited 2 instead of 1.
+      --
+      -- Only the child EXPRESSION is carried, never the ascribed type: an
+      -- `opaque_` models no typing rule, and `Term.hasUnsupported` is
+      -- hard-coded `true` for it, so `Infer`/`Linearity` still never see this
+      -- node and the fix carries ZERO false-reject exposure — same contract
+      -- as the nine `opaque_` kinds above.
+      let e ← decodeTerm (← field j "expr")
+      .ok (Term.opaque_ [e] ty)
+  -- A TRAILING `ELet` — a `do` block's last (or only) statement. See this
+  -- function's docstring: this arm's absence silently discarded the binding's
+  -- RHS, hiding `cap` violations from every `CapCheck` walk at once.
+  | "ELet" =>
+      let binding ← field j "binding"
+      let patJ ← field binding "pattern"
+      let rhs ← decodeTerm (← field binding "expr")
+      match ← kindOf patJ with
+      | "PatVar" =>
+          let (n, _) ← decodeName (← field patJ "name")
+          let lin ← decodeLin (← field binding "lin")
+          let annot ← decodeOptAnnot binding
+          .ok (Term.let_ n lin annot rhs (Term.unsupported ty) ty)
+      | "PatWild" =>
+          let lin ← decodeLin (← field binding "lin")
+          let annot ← decodeOptAnnot binding
+          .ok (Term.let_ "_" lin annot rhs (Term.unsupported ty) ty)
+      | _ => .ok (Term.opaque_ [rhs] ty)
   | _ => .ok (Term.unsupported ty)
 
 /-- Desugar an `EBlock`'s flat expr list into `Term`'s nested-`let_` shape.
-An `ELet` element binds its pattern (must be `PatVar`/`PatWild` — anything
-else can't be curried into `Term.let_`'s plain-`String` binder, so the whole
-block decodes to `Term.unsupported` rather than misrepresenting the
-binding) around the recursively-decoded rest of the block. A non-`ELet`
+An `ELet` element binds its pattern around the recursively-decoded rest of
+the block. The pattern must be `PatVar`/`PatWild` — anything else can't be
+curried into `Term.let_`'s plain-`String` binder, so rather than
+misrepresenting the binding the element decodes to
+`Term.opaque_ [rhs, rest]`. (It used to decode to a bare
+`Term.unsupported blockTy`, which threw away BOTH the binding's RHS and the
+entire remainder of the block: `let (a, b) = (println("leak"), 1); a` is a
+march reject that we skipped. `opaque_` keeps both children visible to the
+`CapCheck` walks while still reporting `hasUnsupported = true`, and — unlike
+a synthetic `let_ "_"` — it empties `divisionVerdict`'s fact/path channels,
+so a stale fact about a name the destructuring pattern rebinds cannot
+manufacture a false reject.) A non-`ELet`
 statement in non-tail position (e.g. a `print(..)` call whose result is
 discarded) is sequenced the same way, under a synthetic `"_"` binder — this
 is the standard let-sequencing encoding of `e; rest`, and is exactly the
@@ -384,7 +547,12 @@ partial def decodeBlockStmts (exprs : List Json) (blockTy : Ty) : Except String 
           | "PatWild" => pure (some "_")
           | _ => pure none : Except String (Option String))
         match nameOpt with
-        | none => .ok (Term.unsupported blockTy)
+        | none =>
+            -- Out-of-fragment BINDER, not an out-of-fragment block: keep both
+            -- the RHS and the rest of the block walkable (docstring above).
+            let rhs ← decodeTerm (← field binding "expr")
+            let body ← decodeBlockStmts rest blockTy
+            .ok (Term.opaque_ [rhs, body] blockTy)
         | some name =>
             let lin ← decodeLin (← field binding "lin")
             let annot ← decodeOptAnnot binding
@@ -511,6 +679,31 @@ partial def decodeDecl (j : Json) : Except String Decl := do
       let retUnsupported := match retTy with
         | some t => t.hasUnsupported
         | none => false
+      -- `fn.bounds` — the BRACKET-syntax explicit type-variable bound list
+      -- (`fn f[a : SomeADT](…)`, `parser.mly:386/414`, `Ast.fn_bounds`
+      -- `ast.ml:231`), emitted as `[{name, ty}]` (`ast_json.ml:830`). This
+      -- decoder models NO part of it, and march does NOT merely record it:
+      -- `typecheck.ml:6926-6959` VALIDATES every bound and raises a hard error
+      -- when it is neither a known ADT, a known interface, nor `Nat` —
+      -- "Bound `X` is not a known ADT or interface name." /
+      -- "Bound `X` on type variable `a` must be an ADT name, interface name,
+      -- or `Nat`." Both were verified directly as live march rejects
+      -- (`fn f[a : NoSuchThing](x : Int) : Int do x end` and
+      -- `fn f[a : Int -> Int](…)`), and both were FALSE ACCEPTS here while
+      -- this field went unread. A bound also pre-registers its type variable
+      -- so param annotations can reference it, which the A1 fragment (whose
+      -- `decodeSurfaceTy` maps every `TyVar` to `Ty.unsupported`) cannot
+      -- represent at all. So a bounded `fn` is out of fragment, exactly like a
+      -- guarded clause below: `Decl.unsupported` ⇒ honest whole-file skip.
+      -- Costs nothing in coverage — zero of the 490 emittable corpus files
+      -- under `specs/`, `examples/`, `stdlib/` carry a non-empty `bounds`.
+      let hasBounds : Bool :=
+        match fn.getObjVal? "bounds" with
+        | .error _ => false
+        | .ok v => match v.getArr? with
+          | .error _ => false
+          | .ok arr => !arr.isEmpty
+      if hasBounds then .ok Decl.unsupported else do
       let clausesJ ← (← field fn "clauses").getArr?.mapError (fun _ => "clauses")
       match clausesJ.toList with
       | [clause] => do
@@ -962,5 +1155,79 @@ private def collisionEnvelope (nestedName : String) : String :=
       | .ok none => IO.println "UNEXPECTED: none"
       | .ok (some t) => IO.println s!"decoded={repr t}, hasUnsupported={t.hasUnsupported}"
   -- expect: decoded=Ty.con "Tagged" [Ty.con "Int" [], Ty.con "Realtime" []], hasUnsupported=false
+
+-- A TRAILING `ELet` reaches `decodeTerm` directly (march emits a
+-- single-statement `do` block as a bare node, with no `EBlock` wrapper, and
+-- `decodeBlockStmts` routes an `EBlock`'s FINAL element back here too) and
+-- MUST keep its RHS. Before the `"ELet"` arm existed this fell to
+-- `| _ => Term.unsupported`, silently discarding the right-hand side and
+-- blinding `bodyCalls`/`bodyAllocates`/`divisionVerdict`/`matchesIn` at once.
+-- The `let_`'s BODY is `Term.unsupported` (there is no continuation), which
+-- is what keeps `hasUnsupported = true` and the file skipping.
+#eval show IO Unit from do
+  let j := Json.parse r#"{"kind":"ELet","resolved_ty":{"kind":"TCon","name":"Unit","args":[]},"binding":{"pattern":{"kind":"PatVar","name":{"txt":"q","span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}}},"lin":{"kind":"Unrestricted"},"expr":{"kind":"EVar","resolved_ty":{"kind":"TCon","name":"Unit","args":[]},"name":{"txt":"println","span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}}}}}"#
+  match j with
+  | .error e => IO.println s!"parse failed: {e}"
+  | .ok j    =>
+      match decodeTerm j with
+      | .error e => IO.println s!"decode failed: {e}"
+      | .ok t => IO.println s!"decoded={repr t}, hasUnsupported={t.hasUnsupported}"
+  -- expect: Term.let_ "q" .. (rhs = Term.var "println" ..) (body = Term.unsupported);
+  -- hasUnsupported=true
+
+-- A trailing `ELet` whose pattern is NOT `PatVar`/`PatWild` cannot be curried
+-- into `Term.let_`'s plain-`String` binder, so it decodes to
+-- `Term.opaque_ [rhs]` — still cap-transparent, still out of fragment.
+#eval show IO Unit from do
+  let j := Json.parse r#"{"kind":"ELet","resolved_ty":{"kind":"TCon","name":"Unit","args":[]},"binding":{"pattern":{"kind":"PatTuple","elements":[]},"lin":{"kind":"Unrestricted"},"expr":{"kind":"EVar","resolved_ty":{"kind":"TCon","name":"Unit","args":[]},"name":{"txt":"println","span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}}}}}"#
+  match j with
+  | .error e => IO.println s!"parse failed: {e}"
+  | .ok j    =>
+      match decodeTerm j with
+      | .error e => IO.println s!"decode failed: {e}"
+      | .ok t => IO.println s!"decoded={repr t}, hasUnsupported={t.hasUnsupported}"
+  -- expect: Term.opaque_ [Term.var "println" ..] (Ty.con "Unit" []); hasUnsupported=true
+
+-- `EAnnot` regression. No parser production builds one, but `Desugar` does
+-- (`desugar.ml:929`, every `app` block), and the resulting `DFn
+-- __app_init__` IS emitted — so the old "no parser production reaches
+-- `EAnnot`" docstring was false. Without an arm this fell to
+-- `| _ => Term.unsupported`, discarding the child expression and hiding a
+-- `cap` violation inside an `app` body from every `CapCheck` walk (march
+-- rejects `cap no_panic` + `app … panic("boom")`; this checker exited 2).
+-- The child MUST survive; `hasUnsupported` must stay `true` so `Infer` and
+-- `Linearity` still never see the node.
+#eval show IO Unit from do
+  let j := Json.parse r#"{"kind":"EAnnot","resolved_ty":{"kind":"TCon","name":"Unit","args":[]},"ty":{"kind":"TyCon","name":{"txt":"SupervisorSpec","span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}},"args":[]},"expr":{"kind":"EVar","resolved_ty":{"kind":"TCon","name":"Unit","args":[]},"name":{"txt":"panic","span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}}}}"#
+  match j with
+  | .error e => IO.println s!"parse failed: {e}"
+  | .ok j    =>
+      match decodeTerm j with
+      | .error e => IO.println s!"decode failed: {e}"
+      | .ok t => IO.println s!"eannot decoded={repr t}, hasUnsupported={t.hasUnsupported}"
+  -- expect: Term.opaque_ [Term.var "panic" ..] (Ty.con "Unit" []); hasUnsupported=true
+
+-- `fn.bounds` regression. A non-empty bracket-syntax bound list
+-- (`fn f[a : NoSuchThing]() do 0 end`) must force `Decl.unsupported`: march
+-- VALIDATES each bound (`typecheck.ml:6926-6959`) and rejects one that names
+-- neither a known ADT, a known interface, nor `Nat`, so leaving this field
+-- unread was a live FALSE ACCEPT (march exit 1, this checker exit 0 —
+-- verified directly for both `[a : NoSuchThing]` and `[a : Int -> Int]`).
+-- The two envelopes below differ ONLY in `bounds`.
+private def dfnBoundsEmpty : String :=
+  r#"{"kind":"DFn","fn":{"name":{"txt":"f","span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}},"ret_ty":null,"bounds":[],"clauses":[{"guard":null,"params":[],"body":{"kind":"ELit","literal":{"kind":"LitInt","value":0},"resolved_ty":{"kind":"TCon","name":"Int","args":[]}}}]}}"#
+private def dfnBoundsNonEmpty : String :=
+  r#"{"kind":"DFn","fn":{"name":{"txt":"f","span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}},"ret_ty":null,"bounds":[{"name":{"txt":"a","span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}},"ty":{"kind":"TyCon","name":{"txt":"NoSuchThing","span":{"file":"f","start_line":1,"start_col":1,"end_line":1,"end_col":2}},"args":[]}}],"clauses":[{"guard":null,"params":[],"body":{"kind":"ELit","literal":{"kind":"LitInt","value":0},"resolved_ty":{"kind":"TCon","name":"Int","args":[]}}}]}}"#
+
+#eval show IO Unit from do
+  for (label, src) in [("empty-bounds", dfnBoundsEmpty), ("nonempty-bounds", dfnBoundsNonEmpty)] do
+    match Json.parse src with
+    | .error e => IO.println s!"{label}: parse failed: {e}"
+    | .ok j =>
+        match decodeDecl j with
+        | .error e => IO.println s!"{label}: decode failed: {e}"
+        | .ok d => IO.println s!"{label}: unsupported={d.hasUnsupported}"
+  -- expected: empty-bounds: unsupported=false
+  -- expected: nonempty-bounds: unsupported=true
 
 end MarchLean.Elab.Test

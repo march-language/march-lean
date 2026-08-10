@@ -1,0 +1,6 @@
+mod M do
+  fn go(n : Int) : Int do
+    if n == 0 do 0 else go(n + 1) + 1 end
+  end
+  fn main() do println(int_to_string(go(0))) end
+end

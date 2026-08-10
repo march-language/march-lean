@@ -1,0 +1,12 @@
+mod M do
+  type Box = Wrap(Int -> Int)
+  fn other(n : Int) : Int do
+    if n == 0 do 0 else spin(n - 1) end
+  end
+  fn spin(n : Int) : Int do
+    match Wrap(fn x -> x + 1) do
+      Wrap(other) -> other(n) + 1
+    end
+  end
+  fn main() do println(int_to_string(spin(3))) end
+end

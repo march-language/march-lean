@@ -218,6 +218,15 @@ partial def termSpanTys (env : TyEnv) (isCallee : Bool) : Term → List (Span ×
   | .match_ scrut arms _ =>
       termSpanTys env false scrut ++
         (arms.map (fun (_, _, body) => termSpanTys env false body)).foldl (· ++ ·) []
+  -- `.opaque_` is grouped with `.unsupported` and yields NO cross-check
+  -- targets. This walk runs only inside `inferModule` step (3), i.e. AFTER
+  -- the step-(1) whole-file skip gate — and `Term.hasUnsupported` hard-codes
+  -- `true` for `opaque_`, so any module containing one has already returned
+  -- `.skip`. The arm is unreachable; mirroring `.unsupported` is the choice
+  -- that provably changes nothing. (Recursing would also be harmless, but it
+  -- would suggest these spans participate in the resolved_ty cross-check,
+  -- and they never can: their children are never inferred.)
+  | .opaque_ _ _ => []
   | .unsupported _ => []
 
 /-- `termSpanTys`, dispatched over one declaration (`dtype` carries no
