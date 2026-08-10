@@ -64,12 +64,24 @@ directly against the real binary, two ways:
   → march exits **1**.
 - A nested structural recursion emits no `structurally recursive but not
   tail-recursive` warning, where the identical flat function emits one — so it
-  is Pass 3 as a whole that never reaches inside, not just the error path.
+  is Pass 3 as a whole that finds nothing inside, not just its error path.
 
-(A blatant type error inside a nested `mod` is also not reported, so the inner
-decls appear not to be checked at all in this path.) Recursing here would
-reject `scripts/tailcall-probes/nested_mod.march`, which march accepts — a
-false reject. This is the reason that probe exists.
+Nested `mod` bodies ARE otherwise typechecked normally (a type error inside one
+is reported) — it is specifically Pass 3 that comes up empty.
+
+Recursing here would reject `scripts/tailcall-probes/nested_mod.march`, which
+march accepts — a false reject. This is the reason that probe exists.
+
+**Root cause, since traced upstream:** `Desugar.qualify_module_refs`
+(`desugar.ml:3046`) rewrites bare intra-module CALL SITES inside every nested
+`DMod` to `Prefix.name` (`EVar "boom"` → `EVar "Inner.boom"`) and leaves the
+DECLARATION name bare, so Pass 3 searched a post-desugar body for a pre-desugar
+name and concluded nothing was recursive. That is a march bug, fixed upstream in
+`fix/tailcall-nested-mod-qualified-names`. **When march-lean re-pins to a march
+that carries that fix, `nested_mod` flips from `clean` to `tailcall` and this
+section must be rewritten to model the prefix.** The probe failing is the
+intended signal — it is why march is modelled as it behaves rather than as its
+source reads.
 -/
 
 namespace MarchLean.TailCall

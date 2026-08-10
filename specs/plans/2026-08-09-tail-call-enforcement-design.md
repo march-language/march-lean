@@ -206,20 +206,31 @@ march accepts a non-tail unbounded recursion nested inside `mod Inner do … end
 rejecting the identical function at top level. Two follow-ups pinned it down:
 
 - A nested *structural* recursion emits no "structurally recursive but not
-  tail-recursive" warning either, so it is Pass 3 as a whole that never reaches inside,
+  tail-recursive" warning either, so it is Pass 3 as a whole that finds nothing inside,
   not just its error path.
-- A blatant type error inside a nested `mod` is also not reported, so those decls
-  appear not to be checked at all in the `--check` path.
 
-Reading the source would not have found this: the `DMod` arm is right there in
-`enforce_tail_calls_in_decls` and looks load-bearing. It is dead in this path.
+Nested `mod` bodies are otherwise typechecked normally — a type error inside one *is*
+reported. (An earlier revision of this section claimed otherwise. That was wrong, and
+wrong in an embarrassing way: the measurement piped march through `head` and read `$?`,
+which reports `head`'s status, not march's. The Pass 3 findings above used `grep -c` on
+the output and are unaffected.)
 
-A second, independent mechanism reinforces it, found while mutation-testing the first:
-inside a nested module the emitter writes the recursive call as `EVar "Inner.boom"` —
-**qualified** — while the declaration is named `boom`. So even a version of this pass
-that *did* recurse would form no call-graph edge. `scripts/tailcall-probes/nested_mod.march`
-is therefore protected twice over, which is why breaking one mechanism alone does not
-turn it red.
+Reading the source would not have found the Pass 3 gap either way: the `DMod` arm is
+right there in `enforce_tail_calls_in_decls` and looks load-bearing. It runs — and finds
+nothing.
+
+**Why it finds nothing**, traced upstream afterwards: `Desugar.qualify_module_refs`
+(`desugar.ml:3046`) rewrites bare intra-module *call sites* inside every nested `DMod`
+to `Prefix.name` (`EVar "boom"` → `EVar "Inner.boom"`) and deliberately leaves the
+*declaration* name bare. Pass 3 built `fn_names` from the bare `def.fn_name.txt`, so
+`collect_direct_fn_calls` searched a post-desugar body for a pre-desugar name, matched
+nothing, and concluded the function was not recursive.
+
+That is a march bug, and it is fixed upstream on
+`fix/tailcall-nested-mod-qualified-names`. **When this repo re-pins to a march carrying
+that fix, `nested_mod` flips from `clean` to `tailcall`** and §5.5 must be rewritten to
+model the prefix. The probe going red is the intended signal — it is the whole reason
+march is modelled as it behaves rather than as its source reads.
 
 ### 5.6 Shared helpers
 
