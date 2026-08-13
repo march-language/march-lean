@@ -226,6 +226,10 @@ accept/t146_root_cap_in_test_body.march                           # out-of-fragm
 accept/t149_cap_interface_impl_covered.march                      # out-of-fragment construct in a declaration
 accept/t150_actor_cap_flow.march                                  # out-of-fragment construct in a declaration
 accept/t151_ordinary_payload_through_all_send_paths.march         # out-of-fragment construct in a declaration
+accept/t173_simd_extract_last_legal_lane.march                    # out of modeled fragment: SKIP: unbound variable `Simd.make_f32x4`
+accept/t174_fn_grant_proven_narrow.march                          # out of modeled fragment: SKIP: unbound variable `file_write`
+accept/t175_main_grant_fix_applied.march                          # out of modeled fragment: SKIP: unbound variable `file_write`
+accept/t176_main_multi_cap_grant.march                            # out of modeled fragment: SKIP: unbound variable `file_write`
 accept/t49_transitive_use_covered.march                           # REGRESSION (was MATCH): march#209 rewrote this file to add `Vault.new("t")`, the reference the new per-function Check 4 requires. march ACCEPTS it but emits resolved_ty TError for that stdlib call, and H3 honest-skips on TError. See specs/march-findings.md section 4.
 reject/t142_refine_nth_out_of_range.march                         # out of modeled fragment: SKIP: unbound variable `List.nth`
 reject/t143_cap_from_json_deferred_zonk.march                     # out of modeled fragment: SKIP: unbound variable `from_json`
@@ -244,6 +248,13 @@ reject/t162_actor_call_qualified_bypasses_sendable_check.march    # out-of-fragm
 reject/t163_actor_call_bare_bypasses_sendable_check.march         # out-of-fragment construct in a declaration
 reject/t164_native_int_arr_not_sendable.march                     # out-of-fragment construct in a declaration
 reject/t165_native_float_arr_not_sendable.march                   # out-of-fragment construct in a declaration
+reject/t166_grant_narrow_violated_by_helper.march                 # out of modeled fragment: SKIP: unbound variable `file_write` (R1 stage A/B grant-narrow violation still unmodeled in CapCheck.lean — see specs/march-findings.md)
+reject/t169_native_f32_arr_not_sendable.march                     # out-of-fragment construct in a declaration
+reject/t170_native_u8_arr_not_sendable.march                      # out-of-fragment construct in a declaration
+reject/t171_simd_extract_f32x4_lane_out_of_range.march            # out of modeled fragment: SKIP: unbound variable `Simd.make_f32x4`
+reject/t172_simd_extract_u8x16_lane_out_of_range.march            # out of modeled fragment: SKIP: unbound variable `Simd.splat_u8x16`
+reject/t174_fn_grant_violated_by_helper.march                     # out of modeled fragment: SKIP: unbound variable `file_write` (R1 stage C per-function grant violation still unmodeled in CapCheck.lean — see specs/march-findings.md)
+reject/t176_main_no_grant_does_io.march                           # out of modeled fragment: SKIP: unbound variable `file_write` (R1 stage D missing-grant check still unmodeled in CapCheck.lean — see specs/march-findings.md)
 # --- grammar/parse side (21) ---
 # specs/lang/grammar/parse: 34 files, all march-ACCEPT (a parse-shape
 # corpus). 13 are judged (accept/accept); the 21 below skip.
