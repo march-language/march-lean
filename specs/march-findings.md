@@ -397,8 +397,15 @@ witness R1 stages A–D (`t166`, `t174_fn_grant_violated_by_helper`,
 neighbors — SIMD landed alongside grant-checking in the same window) uses a
 builtin (`file_write`, `Simd.make_f32x4`, `Simd.splat_u8x16`) this checker's
 `Infer.lean` does not type at all, so every one of them SKIPs with `unbound
-variable` before the missing grant check would ever matter. Ledgered in
-`scripts/expected-skips.txt`.
+variable` before the missing grant check would ever matter. **Not** ledgered
+in `scripts/expected-skips.txt`: this repo's CI (`conformance.yml:139`)
+still pins march at `6867c783`, which predates every one of these fixtures
+(`t166`–`t177` don't exist in that checkout at all), so adding ledger
+entries for them is a stale-entry SKIP-LEDGER MISMATCH against CI's actual
+corpus — confirmed the hard way, in
+[march-lean#24](https://github.com/march-language/march-lean/pull/24)'s
+first CI run. Re-add them (and re-verify this whole entry) when that pin
+bumps past the R1 stage A–D commits.
 
 **But the full-corpus run this predicate ran under DID find a real,
 different hard MISMATCH**: `reject/t177_main_mixed_param_list.march`
