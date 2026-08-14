@@ -381,3 +381,100 @@ The self-declaration exemption applies here too: march tests
 
 **Status.** reported upstream: N/A (march is correct here; this checker is
 behind). NOT YET FIXED in march-lean.
+
+### 6. No grant check at all — confirmed live false-accept, one instance fixed, the transitive-reach core is not
+
+The 2026-08-10 sync-drift note (below the corpus this checker runs against
+was rebuilt against march main HEAD `9d481cb3`, well past the CI pin —
+see "Status" for what that means for THIS repo's gate) predicted that
+`reject/t166_grant_narrow_violated_by_helper` and a since-renumbered sibling
+would be hard MISMATCHes: march rejects a grant-narrowing violation,
+`CapCheck.lean` has no grant-tracking at all, so it would accept. That
+specific prediction was **verified false** — checked directly against a
+march binary built from origin/main HEAD. Every corpus fixture built to
+witness R1 stages A–D (`t166`, `t174_fn_grant_violated_by_helper`,
+`t176_main_no_grant_does_io`, and their `t173`/`t175` SIMD/accept
+neighbors — SIMD landed alongside grant-checking in the same window) uses a
+builtin (`file_write`, `Simd.make_f32x4`, `Simd.splat_u8x16`) this checker's
+`Infer.lean` does not type at all, so every one of them SKIPs with `unbound
+variable` before the missing grant check would ever matter. **Not** ledgered
+in `scripts/expected-skips.txt`: this repo's CI (`conformance.yml:139`)
+still pins march at `6867c783`, which predates every one of these fixtures
+(`t166`–`t177` don't exist in that checkout at all), so adding ledger
+entries for them is a stale-entry SKIP-LEDGER MISMATCH against CI's actual
+corpus — confirmed the hard way, in
+[march-lean#24](https://github.com/march-language/march-lean/pull/24)'s
+first CI run. Re-add them (and re-verify this whole entry) when that pin
+bumps past the R1 stage A–D commits.
+
+**But the full-corpus run this predicate ran under DID find a real,
+different hard MISMATCH**: `reject/t177_main_mixed_param_list.march`
+(`fn main(cap : Cap(IO), n : Int)`) — R1 stage D's rule that `main`'s
+parameter list is zero-or-more capabilities, never a mix. march rejects it
+outright, at signature-validation time, before grant-tracking runs at all.
+`CapCheck.lean` had nothing checking `main`'s signature shape, so it fell
+through every existing check to `.ok`. **Fixed**: `mainMixedParamsViolation`
+(`MarchLean/CapCheck.lean`, wired into `checkOneModule` as `R1-D`) mirrors
+`Desugar.check_main_signature` — reuses the existing `concreteLatticeCap`
+IO-lattice predicate per parameter, `none`/non-`Cap(IO...)` counts as
+non-capability. Verified: `t177` now correctly rejects, and the stage-D
+multi-cap accept fixtures (`t174`–`t176` accept-side) are unaffected (they
+still skip on `file_write`, unchanged).
+
+**What is NOT fixed, and is a live false-accept: the transitive grant-reach
+check itself** (R1 stages A/B/C — "the whole program's IO reach is held
+under the union of `main`'s (or a function's) `Cap(...)` parameters").
+`CapCheck.lean` has zero code implementing this — no call-graph closure, no
+per-function grant discharge, nothing. It is invisible to the corpus purely
+because every corpus witness happens to reach the violation through an
+untyped builtin. It is NOT invisible in general — hand-built probe, run
+directly against march origin/main HEAD and this checker:
+
+```march
+mod Main do
+  needs IO.Clock
+  needs IO.Console
+
+  fn helper() : () do
+    println("leak")
+  end
+
+  fn main(cap : Cap(IO.Clock)) : () do
+    helper()
+  end
+end
+```
+
+`println` IS a typed builtin (`Infer.lean:941`, required cap
+`IO.Console` per `CapCheck.builtinCaps`) — no `unbound variable` skip fires.
+march rejects: `` `main` is granted `Cap(IO.Clock)`, but the program reaches
+`IO.Console` (reached in `helper`) ``. `march-lean-check` exits 0 (accept).
+This is the exact false-accept class the sync-drift finding warned about,
+just witnessed through `println`/`IO.Console` rather than the corpus's
+`file_write`/`IO.FileWrite` fixtures, because `println`/`print` are the
+only two IO builtins `Infer.lean` types at all (every other entry in
+`CapCheck.builtinCaps` — the `file_*`/`tcp_*`/`process_*`/... families
+— is `unbound variable` to `Infer.lean` and skips first).
+
+**Fix shape**, not attempted here: mirroring `check_main_grant` /
+`check_fn_grants` (`typecheck.ml:12921-` onward) needs a call-graph closure
+over which builtins/needs each function transitively reaches, held against
+each grant point (`main`'s parameter union for stage A/B, each
+`Cap`-parameter function's own parameters for stage C), plus stage D's
+"performs IO but `main` takes no capability parameter" rule. This is
+comparable in size to `CapCheck.lean`'s existing Check 1/4/5/8 machinery
+combined, not a small addition, and a rushed version of a soundness-relevant
+check risks trading a false-accept for a false-reject (see finding 5's three
+hazards for the shape of that risk). Tracked as an open gap, not attempted
+in this pass.
+
+**Status.** reported upstream: N/A (march is correct; this checker is
+behind). `t177`'s specific MISMATCH: **fixed in march-lean**. The general
+transitive grant-reach check: **NOT YET FIXED**, confirmed live via the
+probe above. Separately: **this repo's CI (`conformance.yml:139`) still
+pins march at `6867c783`**, which predates the grant check entirely (R1
+stages A/B landed in `78143049`/`759368b4`/`fb9a8c90`, all after that pin) —
+so today's CI corpus doesn't contain `t166`–`t177` at all and this whole
+finding is invisible to it either way. Bumping that pin is a separate,
+larger action (full-corpus revalidation against everything march landed
+since `6867c783`, not just the grant fixtures) and was not attempted here.

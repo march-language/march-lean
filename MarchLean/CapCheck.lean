@@ -1645,6 +1645,35 @@ def bodyHasNonExhaustiveMatch (userCtors : List (String × List String)) (t : Te
 def covered (declared : List String) (used : String) : Bool :=
   declared.any (fun need => capSubsumes need used)
 
+/-- R1 stage D (`specs/2026-08-10-r1-stage-d-grant-required-design.md`,
+mirrors `Desugar.check_main_signature`): `main` may take zero parameters, or
+ANY NUMBER of capability parameters (the grant is their union), but never a
+MIXED list — a parameter with no `Cap(IO...)` type has no erased value for
+the runtime to supply and no meaning in the grant, so a signature naming one
+alongside real capabilities is rejected outright, before grant-tracking ever
+runs. `reject/t177_main_mixed_param_list` (`fn main(cap : Cap(IO), n : Int)`)
+is exactly this: every other check in this fragment passes, so without this
+gate the file was a hard MISMATCH (march rejects, this checker fell through
+to `.ok`) rather than the honest skip a genuinely unmodeled construct earns.
+
+Reuses `concreteLatticeCap` for the per-parameter test, so it accepts
+precisely the IO-lattice points `Desugar.is_cap_io_ty` does (`Cap(IO)` and
+its narrower points) and nothing else — an unannotated parameter (`none`)
+counts as non-capability, matching `is_cap_io_ty None = false`. -/
+def mainMixedParamsViolation (decls : List Decl) : Option (Nat × Nat) :=
+  decls.findSome? (fun d =>
+    match d with
+    | .dfn "main" params _ _ =>
+        let isCapParam : String × Lin × Option Ty → Bool := fun (_, _, tyOpt) =>
+          match tyOpt with
+          | some ty => (concreteLatticeCap ty).isSome
+          | none    => false
+        if params.isEmpty then none
+        else
+          let nCaps := (params.filter isCapParam).length
+          if nCaps == params.length then none else some (params.length, nCaps)
+    | _ => none)
+
 /-- Check one module (not recursing into nested modules — the caller does
 that, since each module is checked against its OWN declared needs).
 `selfDeclaredCaps` is the list of fully-qualified cap paths (e.g.
@@ -2062,6 +2091,13 @@ def checkOneModule (modName : String) (decls : List Decl)
   match divVerdicts.find? (fun (_, v) => v == DivVerdict.unknown) with
   | some (name, _) =>
       .skip s!"cap no_panic: fn `{name}` in module `{modName}` divides by an expression this checker cannot resolve — march's policy is reject-unless-proven-non-zero, but a refinement type or a Z3 discharge may still prove it non-zero, so no verdict is rendered"
+  | none =>
+  match mainMixedParamsViolation decls with
+  | some (n, nCaps) =>
+      let nNonCap := n - nCaps
+      let plural := if n == 1 then "" else "s"
+      let verb := if nNonCap == 1 then "is" else "are"
+      .violation s!"R1-D: `main` in module `{modName}` must take zero arguments, or only arguments of type `Cap(IO)` (or a narrower IO-lattice point) — found {n} parameter{plural}, {nNonCap} of which {verb} not a capability"
   | none => .ok
 
 /-- The behavioral caps march inherits down into a nested `dmod` (Finding
