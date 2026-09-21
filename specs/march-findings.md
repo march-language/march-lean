@@ -478,3 +478,112 @@ so today's CI corpus doesn't contain `t166`–`t177` at all and this whole
 finding is invisible to it either way. Bumping that pin is a separate,
 larger action (full-corpus revalidation against everything march landed
 since `6867c783`, not just the grant fixtures) and was not attempted here.
+
+---
+
+## Finding: `--emit-core-ast`'s own `verdict` field disagrees with `--check` on capability/allocation rejections
+
+**What was found.** march's `--emit-core-ast` computes its JSON `"verdict"`
+field from a snapshot of the diagnostic set taken *before* the `--check` path
+lowers to TIR to judge allocation contracts (`cap no_alloc`) and the
+stdlib-mediated capability-ceiling checks. Three reject-corpus files therefore
+carry `"verdict": "accept"` in the emitted Core AST while `march --check` on
+the same file prints an ERROR and rejects. This is march disagreeing with
+itself across its own two flags — exactly the class the conformance harness's
+step-4 self-consistency cross-check exists to catch, and it fires as
+`MARCH_SELF_INCONSISTENT` (a hard failure, with no ledger to absorb it).
+
+**Reproducer.** Against march main `3ebe6c17` (2026-09-21):
+
+```
+$ march --check specs/lang/types/reject/t43_cap_no_alloc_tuple.march
+-- ERROR -- ...
+`make_pair` is in `cap no_alloc` module `NoAllocPair` but allocates.
+$ march --emit-core-ast specs/lang/types/reject/t43_cap_no_alloc_tuple.march | jq -r .verdict
+accept
+```
+
+The other two are `reject/t180_ceiling_stdlib_mediated_under_check.march` and
+`reject/t182_ceiling_module_let_stdlib_mediated.march`, both the same shape
+(`--check`=reject, emitted `verdict`=accept).
+
+**march's source location.** `bin/main.ml` — `has_user_errors` is bound from
+`diags` and handed to `Emit_core_ast.run` as `~rejected:` (around the
+`if !emit_core_ast_file <> None then` branch, ~line 2052), while the
+allocation-contract / ceiling judgements that produce these three rejections
+run later, in the `--check` branch further down. The hoist comment at that
+binding claims it is "the same accept/reject condition `--check` uses below";
+for these three files it is not.
+
+**Which side is wrong.** march. `march-lean-check` is not involved — the
+divergence is internal to march, between two of its own flags.
+
+**How it was found.** A full-corpus conformance run against march main HEAD
+(`3ebe6c17`), made while mirroring the choreography/endpoints fixtures below.
+It is invisible to CI, which still pins `6867c783`.
+
+**Status.** reported upstream: NOT YET.
+
+---
+
+## Sync drift: the choreography/endpoints fixtures cannot be ledgered until the CI pin bumps
+
+**What was found.** march landed a run of choreography/endpoints corpus
+fixtures (labelled protocol steps, message labels, crash branches) that the
+two-repo rule in march's `specs/lang/types/INDEX.md` says must be accounted
+for on this side. They cannot be added to `scripts/expected-skips.txt` today,
+for the same reason recorded in finding 6 above and confirmed the hard way in
+[march-lean#24](https://github.com/march-language/march-lean/pull/24)'s first
+CI run: `conformance.yml` pins march (binary **and** corpus) at `6867c783`
+(2026-08-08), which none of these files exist in, so a ledger entry for any of
+them is a stale-entry SKIP-LEDGER MISMATCH against CI's actual corpus.
+
+**What was verified anyway.** A full harness run against march main HEAD
+`3ebe6c17` (local march built from that tree, `march-lean-check` at this
+repo's HEAD) confirms every one of them SKIPs cleanly — none is a MISMATCH,
+and none needs a `known-limitations.txt` entry. Ready to paste into the ledger
+when the pin bumps:
+
+```
+accept/t270_endpoints_labelled_steps.march                        # out-of-fragment construct in a declaration
+accept/t273_crash_branches_logging.march                          # out-of-fragment construct in a declaration
+reject/t271_endpoints_label_on_branch_head.march                  # out-of-fragment construct in a declaration
+reject/t272_endpoints_label_msg_prefix.march                      # out-of-fragment construct in a declaration
+reject/t274_crash_receive_without_branch.march                    # out-of-fragment construct in a declaration
+reject/t275_crash_branch_on_reliable_sender.march                 # out-of-fragment construct in a declaration
+reject/t276_crashed_role_in_own_crash_branch.march                # out-of-fragment construct in a declaration
+reject/t277_crash_third_party_not_told.march                      # out-of-fragment construct in a declaration
+reject/t278_crash_choose_two_detectors.march                      # out-of-fragment construct in a declaration
+reject/t279_may_crash_unknown_role.march                          # out-of-fragment construct in a declaration
+reject/t263_endpoints_payload_without_json_codec.march            # out-of-fragment construct in a declaration
+grammar/parse/p38_protocol_labelled_message_step.march            # out-of-fragment construct in a declaration
+grammar/reject/r17_protocol_label_after_arrow.march               # no module (parse failure)
+```
+
+(There is no `accept/t263_…` payload-codec fixture; `t263` on the accept side
+is `t263_linear_opt_in_second_param`, which is unrelated and already a
+post-pin file. The payload-codec fixture is the reject-side one listed above.)
+
+**What a pin bump to HEAD would cost, measured.** The same run reports
+498 files / MATCH 97 / MISMATCH 1 / ERROR 0 / SKIP 396 / KNOWN_LIMITATION 3 /
+MARCH_SELF_INCONSISTENT 3 / CORPUS_VIOLATION 0, with a skip-ledger delta of
+**+125 newly-skipping files and 1 stale entry**
+(`accept/t77_refine_hof_bypass_limitation.march`, which march renamed to
+`accept/t77_refine_hof_pass_site_rejected.march`). The 13 choreography files
+above are a small slice of that +125; the rest is everything else march landed
+in the 1057 commits since the pin. Two things beyond the ledger block a green
+bump today:
+
+1. **`reject/t262_toplevel_let_annotation_mismatch.march` — hard MISMATCH**
+   (march=reject, lean=accept). march now checks a *module-level* `let`'s type
+   annotation against its RHS (`let x : Int = "hello"`); this checker's
+   inference does not. The annotation is present in the Core AST, so this is
+   **not** a `known-limitations.txt` candidate (that file is gated to
+   rejections *erased* from the Core AST) — it is a real checker gap to fix.
+2. **The three `MARCH_SELF_INCONSISTENT` files** of the finding immediately
+   above. There is no ledger for that category, and the cause is march-side,
+   so no change in this repo can clear them.
+
+**Status.** Not a march bug and not fixed here: recorded so the mirroring
+obligation is discharged in writing and the pin bump has a measured cost and a
+named blocker list.
