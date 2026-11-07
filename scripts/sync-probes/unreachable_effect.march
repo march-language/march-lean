@@ -1,0 +1,5 @@
+mod Main do
+  needs IO.Console
+  fn unused() : () do println("unreachable") end
+  fn main() : () do () end
+end

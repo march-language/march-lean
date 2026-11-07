@@ -1,0 +1,5 @@
+mod Main do
+  needs IO.Console, IO.Clock
+  fn helper() : () do println("hello") end
+  fn main(_cap : Cap(IO.Clock)) : () do helper() end
+end

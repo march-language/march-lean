@@ -185,45 +185,65 @@ capture). A captured linear/affine param skips the whole file. -/
 def enforceParams (ps : List (String × Lin × Option Ty)) (body : Term) : CheckResult :=
   ps.foldl (fun acc (p, l, _) => match acc with | .ok => bindCheck p l body | o => o) .ok
 
-/-- Walk a term enforcing every linear/affine binder it introduces. -/
-partial def checkTerm : Term → CheckResult
+/-- Lexical linearity is necessary when a plain-typed linear binder moves
+through `let alias = value`; the RHS type alone does not carry its obligation. -/
+abbrev LinEnv := List (String × Lin)
+
+def paramEnv (ps : List (String × Lin × Option Ty)) : LinEnv :=
+  ps.map (fun (n, l, _) => (n, l))
+
+def movedLin (env : LinEnv) (rhs : Term) : Lin :=
+  match rhs with
+  | .var n _ _ => ((env.find? (fun p => p.1 == n)).map Prod.snd).getD .unrestricted
+  | _ => .unrestricted
+
+/-- Walk a term enforcing every binder, retaining moved obligations. -/
+partial def checkTermWith (env : LinEnv) : Term → CheckResult
   | .lam ps b _ =>
       match enforceParams ps b with
-      | .ok => checkTerm b
+      | .ok => checkTermWith (paramEnv ps ++ env) b
       | other => other
   | .let_ n l annot r b _ =>
-      match checkTerm r with
-      | .ok => match bindCheck n (effLin l annot r) b with
-               | .ok => checkTerm b
+      let effective := match effLin l annot r with
+        | .unrestricted => movedLin env r
+        | effective => effective
+      match checkTermWith env r with
+      | .ok => match bindCheck n effective b with
+               | .ok => checkTermWith ((n, effective) :: env) b
                | other => other
       | other => other
-  | .letfn _ p l _ fb b _ =>
+  | .letfn n p l _ fb b _ =>
       match bindCheck p l fb with
-      | .ok => match checkTerm fb with | .ok => checkTerm b | o => o
+      | .ok => match checkTermWith ((p, l) :: (n, .unrestricted) :: env) fb with
+        | .ok => checkTermWith ((n, .unrestricted) :: env) b
+        | o => o
       | other => other
   | .app f args _ =>
-      (f :: args).foldl (fun acc t => match acc with | .ok => checkTerm t | o => o) .ok
-  | .ite c u v _ => match checkTerm c with | .ok => (match checkTerm u with | .ok => checkTerm v | o => o) | o => o
-  | .con _ args _ => args.foldl (fun acc t => match acc with | .ok => checkTerm t | o => o) .ok
-  | .tuple es _ => es.foldl (fun acc t => match acc with | .ok => checkTerm t | o => o) .ok
-  | .record fs _ => fs.foldl (fun acc (_, t) => match acc with | .ok => checkTerm t | o => o) .ok
-  | .field r _ _ _ => checkTerm r
-  | .match_ s arms _ => match checkTerm s with
-      | .ok => arms.foldl (fun acc (_, g, e) => match acc with
-          | .ok => (match g with
-              | some gt => (match checkTerm gt with | .ok => checkTerm e | o => o)
-              | none => checkTerm e)
+      (f :: args).foldl (fun acc t => match acc with | .ok => checkTermWith env t | o => o) .ok
+  | .ite c u v _ => match checkTermWith env c with
+      | .ok => (match checkTermWith env u with | .ok => checkTermWith env v | o => o)
+      | o => o
+  | .con _ args _ | .tuple args _ =>
+      args.foldl (fun acc t => match acc with | .ok => checkTermWith env t | o => o) .ok
+  | .record fs _ => fs.foldl (fun acc (_, t) => match acc with | .ok => checkTermWith env t | o => o) .ok
+  | .field r _ _ _ => checkTermWith env r
+  | .match_ s arms _ => match checkTermWith env s with
+      | .ok => arms.foldl (fun acc (p, g, e) => match acc with
+          | .ok =>
+            let armEnv := p.boundNames.map (fun n => (n, Lin.unrestricted)) ++ env
+            (match g with
+              | some gt => (match checkTermWith armEnv gt with | .ok => checkTermWith armEnv e | o => o)
+              | none => checkTermWith armEnv e)
           | o => o) .ok
       | o => o
-  -- `.opaque_` with `.unsupported`: unreachable behind the skip gate (see
-  -- `uses`). `.ok` is the behavior-preserving answer and cannot mask
-  -- anything — the file exits 2 before this pass runs either way.
   | .lit _ _ | .var _ _ _ | .opaque_ _ _ | .unsupported _ => .ok
+
+def checkTerm (t : Term) : CheckResult := checkTermWith [] t
 
 def checkDecl : Decl → CheckResult
   | .dfn _ ps _ body =>
       match enforceParams ps body with
-      | .ok => checkTerm body
+      | .ok => checkTermWith (paramEnv ps) body
       | other => other
   | .dlet _ body => checkTerm body
   | .dtype _ _ _ => .ok

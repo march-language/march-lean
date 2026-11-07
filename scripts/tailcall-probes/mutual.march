@@ -10,5 +10,5 @@ mod M do
   fn helper(k : Int) : Int do
     if k <= 0 do 0 else walk(Branch(k - 1)) + 1 end
   end
-  fn main() do println(int_to_string(walk(Branch(3)))) end
+  fn main(_cap : Cap(IO.Console)) do println(int_to_string(walk(Branch(3)))) end
 end

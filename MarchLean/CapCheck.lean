@@ -10,15 +10,14 @@ in `CapLattice`; Check 7 (realtime exclusion) and Check 8 (migrate-state
 IO-freedom) are signature/body-shaped scans documented at their own
 definitions below.
 
-**Checks 1b and 1c are deliberately absent.** They are WARNING-only in march
-(`core-march-types.md` §2.8.6), so a checker that rejected on them would
-manufacture false MISMATCHes against a march that accepts. The cost is real
-and inherited on purpose: for an ORDINARY (non-migrate) function, this
-checker will not catch a function body calling a builtin that needs an
-undeclared capability. Check 8 is the one exception carved out of that cost:
-a `*_migrate_state` fn's body IS scanned (`bodyCallsIO`), because march's own
-Check 8 scans it too (via `env.own_cap_closures`) — see that check's
-docstring for the fidelity gaps that remain even there.
+**Check 1b is an error on current March.** The independent body-reference
+and main-grant analysis lives in `CapabilityReach.lean`, composed with this
+pass by the executable. Check 1c (extern implies IO.Foreign) is an error on current main; extern
+declarations remain outside the reach fragment.
+Check 4 now defers when only a whole imported manifest is available: current
+March charges referenced function rows, not every declared imported capability.
+Check 8 retains its own migration-specific signature/body scan.
+
 -/
 namespace MarchLean.CapCheck
 open MarchLean.Syntax
@@ -62,21 +61,8 @@ def CapResult.andThen : CapResult → CapResult → CapResult
 
 /-- Every capability named by a `Cap(X)` type anywhere inside a type.
 
-**`Tagged` is deliberately NOT descended into**, mirroring march's own
-extractor: `cap_paths_in_surface_ty` (`typecheck.ml`) has an explicit arm
-`| Ast.TyCon (con, _) when con.txt = "Tagged" -> []` — an applied `Tagged(X,
-T)` is a phantom/policy tag, not a capability position, so march skips its
-arguments entirely rather than looking for `Cap(_)` inside `X`. Before this
-arm existed, an applied `Tagged` decoded to `Ty.unsupported` here (see
-`Elab.lean`'s `decodeSurfaceTy`), which this function's catch-all mapped to
-`[]` — the same `[]` result, but by accident: once `Tagged` started decoding
-to a real `Ty.con "Tagged" args` (to let Check 7 read the realtime marker),
-the generic `.con _ args => args.flatMap capsInTy` arm below would have
-started descending into `Tagged`'s payload and manufacturing false Check
-1/Check 8 rejects on any `Cap(_)` nested there (e.g.
-`Tagged(Cap(IO.Network), Realtime)`) even when march accepts, because march
-never looks inside `Tagged` at all. This arm must stay ahead of the generic
-`.con` arm below.
+`Tagged` payloads are traversed, matching March main's
+`Cap_surface_ty.caps_in_ty` (the old special-case omission is gone).
 
 **The `Cap` MARKER ITSELF requires EXACTLY ONE type argument**, mirroring
 march's `cap_paths_in_surface_ty`, which only recognizes the capability
@@ -111,7 +97,6 @@ the nullary-match arm above it) is required for this: without it, a
 non-nullary single argument would fall through to the generic
 `.con _ args => args.flatMap capsInTy` arm and wrongly recurse into it. -/
 partial def capsInTy : Ty → List String
-  | .con "Tagged" _ => []
   | .con "Cap" [.con x []] => [x]
   | .con "Cap" [_] => []
   | .con _ args => args.flatMap capsInTy
@@ -1773,7 +1758,9 @@ def checkOneModule (modName : String) (decls : List Decl)
   | some bad =>
       .violation s!"Check 5: extern in module `{modName}` requires `Cap({bad})` but `{bad}` is not declared in `needs`"
   | none =>
-  -- Check 4 — transitive `use` coverage
+  -- Check 4 is demand-driven on current March. module_caps carries only
+  -- each imported module's whole manifest, not the rows of referenced
+  -- functions. An uncovered upper bound cannot justify a rejection.
   let usedMods := decls.flatMap (fun d =>
     match d with | .duse p => [p] | _ => [])
   let unmet := usedMods.flatMap (fun m =>
@@ -1782,7 +1769,7 @@ def checkOneModule (modName : String) (decls : List Decl)
     | none => [])
   match unmet.head? with
   | some (m, r) =>
-      .violation s!"Check 4: module `{modName}` imports `{m}` which requires `Cap({r})`, but `{r}` is not declared in `needs`"
+      .skip s!"Check 4: demand-driven import rows unavailable for `{m}` (`{r}` is not covered in `{modName}`)"
   | none =>
   -- Check 7 — realtime exclusion (typecheck.ml:7162-7182). A fn whose
   -- PARAMETER signature carries BOTH a `Tagged(_, Realtime)` type and a
@@ -1790,8 +1777,8 @@ def checkOneModule (modName : String) (decls : List Decl)
   -- sub-caps like `IO.Network`) is rejected: realtime functions may not also
   -- hold allocation-, IO-, or panic-capable capabilities. Signature-level
   -- only (`dfn` param annotations) — this checker does not scan bodies
-  -- (that is Check 1b, warning-only in march and deliberately not modelled;
-  -- see the module docstring above). Also, as with Check 8 (see
+  -- (Check 1b is handled separately in CapabilityReach; see the module
+  -- docstring above). Also, as with Check 8 (see
   -- `bodyCallsIO`'s docstring), a multi-clause fn (0 or 2+ clauses) whose
   -- name would otherwise match decodes to `Decl.unsupported`, never a
   -- `dfn` — it is never seen by this scan and escapes Check 7 entirely;
@@ -2169,6 +2156,23 @@ partial def checkDecls (moduleCaps : List (String × List String))
           (checkDecls moduleCaps inherited userCtors rest))          -- siblings never see what `inner` declared
   | _ :: rest => checkDecls moduleCaps inherited userCtors rest
 
+/-- Scope checks use the preserved authority manifest. Type-only needs and
+entry grants remain capability checks: their requirements contain no path. -/
+def checkScopeFacts (facts : List ScopeFacts) : CapResult := Id.run do
+  for f in facts do
+    for a in f.declared do
+      match a.scope with
+      | .unbounded => pure ()
+      | .path absolute _ =>
+        if !["IO.FileRead", "IO.FileWrite", "IO.FileSystem"].contains a.cap || !absolute then
+          return .violation s!"invalid filesystem scope on `{a.cap}` in `{f.name}`"
+    for (builtin, path) in f.literalUses do
+      if let some (_, cap) := builtinCaps.find? (fun p => p.1 == builtin) then
+        let relevant := f.scopeEnv.filter (fun a => CapLattice.capSubsumes a.cap cap)
+        if !relevant.isEmpty && !CapScope.covered relevant {cap, scope := CapScope.Scope.ofPath path} then
+          return .violation s!"`{cap}` path `{path}` is outside declared scopes in `{f.name}`"
+  return .ok
+
 /-- Entry point. Also checks the top level as an implicit module, so a file
 with `needs`/`Cap(X)` outside any `mod` block is still checked.
 
@@ -2203,6 +2207,7 @@ def checkCaps (m : Module) : CapResult :=
   -- recursive `checkDecls`/`checkOneModule` call below — see `checkDecls`'s
   -- docstring for why this table, unlike `inherited`, is not positional.
   let userCtors := dtypeCtorSets m.decls
+  (checkScopeFacts m.scopeFacts).andThen <|
   (checkOneModule "<top-level>" m.decls m.moduleCaps selfDeclaredCaps (userCtors := userCtors)).andThen
     -- Finding I3: the top-level (entry) module is threaded through the SAME
     -- env-based, SEQUENTIAL `check_decl` fold march uses for a nested `dmod`,
@@ -2428,7 +2433,7 @@ def useUncovered : Module := {
   decls := [Decl.dmod "Main" [Decl.duse "Vault"]],
   schemes := [], insts := [], moduleCaps := [("Vault", ["IO.Mut"])] }
 #eval checkCaps useUncovered
-  -- expect: violation — Check 4, IO.Mut not covered
+  -- expect: skip — the imported manifest does not identify demanded IO.Mut
 
 /-- accept/t49: same, but the importer declares `needs IO.Mut`. -/
 def useCoveredExact : Module := {
@@ -2870,30 +2875,22 @@ def capArityTwoViolation : Module := {
   -- expect: violation — Check 1, IO.Network uncovered (no `needs` at all)
 example : (checkCaps capArityTwoViolation).isViolation = true := by native_decide
 
-/-- Finding 4 pin: `capsInTy` must NOT descend into an applied `Tagged`'s
-payload at all — mirroring march's `cap_paths_in_surface_ty`, whose `Tagged`
-arm returns `[]` unconditionally rather than falling through to generic
-recursion. Direct unit on the extractor itself: a `Cap(IO.Network)` nested
-inside `Tagged(_, Realtime)` must extract to `[]`, not `["IO.Network"]`. -/
+/-- March main now extracts capabilities nested in Tagged payloads. -/
 example :
-    capsInTy (Ty.con "Tagged" [Ty.con "Cap" [Ty.con "IO.Network" []], Ty.con "Realtime" []]) = []
+    capsInTy (Ty.con "Tagged" [Ty.con "Cap" [Ty.con "IO.Network" []], Ty.con "Realtime" []]) = ["IO.Network"]
   := by native_decide
 
-/-- Finding 4 pin, `checkCaps`-level: a module declaring NO `needs` at all,
-whose only `Cap(_)` mention is nested inside a `Tagged(_, Realtime)` param,
-must be `ok` — if `capsInTy` were ever changed to descend into `Tagged`
-again, this fixture's `Cap(IO.Network)` would surface as an uncovered Check 1
-violation (there is no `needs` to cover it) and this guard would fail. -/
-def tagPayloadCapIgnored : Module := {
+/-- A nested capability still requires a declaration. -/
+def tagPayloadCapRequired : Module := {
   decls := [Decl.dmod "M" [
     Decl.dfn "f"
       [("_x", Lin.unrestricted,
         some (Ty.con "Tagged" [Ty.con "Cap" [Ty.con "IO.Network" []], Ty.con "Realtime" []]))]
       none (Term.lit (Lit.int 1) (Ty.con "Int" []))]],
   schemes := [], insts := [], moduleCaps := [] }
-#eval checkCaps tagPayloadCapIgnored
-  -- expect: ok — the nested Cap(IO.Network) is never extracted from inside Tagged
-example : (checkCaps tagPayloadCapIgnored).isViolation = false := by native_decide
+#eval checkCaps tagPayloadCapRequired
+  -- expect: violation — the nested Cap(IO.Network) is uncovered
+example : (checkCaps tagPayloadCapRequired).isViolation = true := by native_decide
 
 -- ---------------------------------------------------------------------
 -- A3 slice (c), Task 1 (infrastructure): `builtinCaps` carries caps; the name

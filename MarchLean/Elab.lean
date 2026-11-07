@@ -753,8 +753,17 @@ partial def decodeDecl (j : Json) : Except String Decl := do
       let patJ ← field binding "pattern"
       match ← kindOf patJ with
       | "PatVar" =>
-          let (name, _) ← decodeName (← field patJ "name")
+          let (name, sp) ← decodeName (← field patJ "name")
           let rhs ← decodeTerm (← field binding "expr")
+          let annot ← match binding.getObjVal? "ty" with
+            | .ok t => if t.isNull then pure none else some <$> decodeSurfaceTy [] t
+            | .error _ => pure none
+          -- Reuse the modeled annotated-let rule without inventing a new
+          -- declaration form. The local identity body preserves the value;
+          -- inference checks the annotation before generalizing the outer let.
+          let rhs := match annot with
+            | none => rhs
+            | some _ => Term.let_ name .unrestricted annot rhs (.var name sp rhs.ty) rhs.ty
           .ok (Decl.dlet name rhs)
       | _ => .ok Decl.unsupported
   | "DType" => do
@@ -886,6 +895,87 @@ def decodeInstantiation (j : Json) : Except String Instantiation := do
   let args ← (← (← field j "args").getArr?.mapError (fun _ => "args")).toList.mapM decodeTy
   .ok { useSpan := sp, ids, args }
 
+/-- Path argument positions from March's `path_arg_builtins`. -/
+def pathArgPositions (name : String) : List Nat :=
+  if ["file_rename", "file_copy"].contains name then [0, 1]
+  else if ["file_read", "file_open", "file_exists", "file_stat", "dir_list",
+    "dir_exists", "file_write", "file_append", "file_delete", "dir_mkdir",
+    "dir_mkdir_p", "dir_rmdir", "dir_rm_rf", "csv_open"].contains name then [0]
+  else []
+
+private def jsonArray (j : Json) (key : String) : Except String (List Json) := do
+  pure (← (← field j key).getArr?.mapError (fun _ => s!"{key}: expected array")).toList
+
+/-- Mirror the source check's literal-only walk BEFORE annotation erasure.
+March intentionally does not scan match guards or ECond in this pass. Bare
+builtin spelling (including shadowed names) is the current source rule. -/
+partial def literalPathUses (j : Json) : Except String (List (String × String)) := do
+  let k ← kindOf j
+  let mut own := []
+  if k == "EApp" then
+    let f ← field j "fn"
+    if (← kindOf f) == "EVar" then
+      let (name, _) ← decodeName (← field f "name")
+      let args ← jsonArray j "args"
+      for i in pathArgPositions name do
+        if let some arg := args[i]? then
+          if (← kindOf arg) == "ELit" then
+            if let some (.str path) ← decodeLit (← field arg "literal") then
+              own := own ++ [(name, path)]
+  let children ← match k with
+    | "EApp" => do pure ((← field j "fn") :: (← jsonArray j "args"))
+    | "ECon" | "EAtom" => jsonArray j "args"
+    | "EBlock" => jsonArray j "exprs"
+    | "ETuple" => jsonArray j "elements"
+    | "ELet" => do pure [← field (← field j "binding") "expr"]
+    | "EMatch" => do
+        let bodies ← (← jsonArray j "branches").mapM (fun b => field b "body")
+        pure ((← field j "scrutinee") :: bodies)
+    | "EIf" => ["cond", "then_", "else_"].mapM (field j)
+    | "EPipe" => ["lhs", "rhs"].mapM (field j)
+    | "ESend" => ["cap", "msg"].mapM (field j)
+    | "ERecord" => do (← jsonArray j "fields").mapM (fun f => field f "value")
+    | "ERecordUpdate" => do
+        let fs ← (← jsonArray j "fields").mapM (fun f => field f "value")
+        pure ((← field j "base") :: fs)
+    | "EField" => do pure [← field j "target"]
+    | "EAnnot" | "EAssert" => do pure [← field j "expr"]
+    | "ESpawn" => do pure [← field j "actor"]
+    | "ELam" | "ELetFn" => do pure [← field j "body"]
+    | _ => pure []
+  let nested ← children.mapM literalPathUses
+  pure (own ++ nested.flatten)
+
+/-- Preserve own declarations separately from March's effective scope environment.
+Nested modules use the preceding outer environment; the entry uses its final
+manifest. The empty export string denotes an
+unbounded declaration; a nonempty path is lexically canonicalized. -/
+partial def decodeScopeFacts (name : String) (ds : List Json)
+    (outer : Option (List CapScope.Authority) := none) : Except String (List ScopeFacts) := do
+  let mut declared := []
+  let mut uses := []
+  let mut nested := []
+  for d in ds do
+    match ← kindOf d with
+    | "DNeeds" =>
+      let decoded ← decodeDecl d
+      let paths := match decoded with | .dneeds ps => ps | _ => []
+      let scopes ← (← jsonArray d "scopes").mapM (fun s => s.getStr?)
+      if paths.length != scopes.length then throw "DNeeds paths/scopes length mismatch"
+      declared := declared ++ (paths.zip scopes).map (fun (cap, raw) =>
+        { cap, scope := if raw == "" then .unbounded else CapScope.Scope.ofPath raw })
+    | "DFn" =>
+      let cs ← jsonArray (← field d "fn") "clauses"
+      for c in cs do
+        uses := uses ++ (← literalPathUses (← field c "body"))
+    | "DLet" => uses := uses ++ (← literalPathUses (← field (← field d "binding") "expr"))
+    | "DMod" =>
+      let (child, _) ← decodeName (← field d "name")
+      nested := nested ++ (← decodeScopeFacts (name ++ "." ++ child) (← jsonArray d "decls")
+        (some (declared ++ outer.getD [])))
+    | _ => pure ()
+  pure ({ name, declared, scopeEnv := outer.getD declared, literalUses := uses } :: nested)
+
 /-- Top-level: decode the whole envelope's `module` + witness tables. Real
 shape (verified against `bin/main.ml`'s envelope-building code and all 8
 samples — NOT the brief's guessed `module.mod_decls` path): the module's
@@ -893,10 +983,8 @@ decl list is at `module.decls`, and `schemes`/`instantiations` are siblings
 of `module` at the envelope's top level (not nested inside it). -/
 def decodeModule (envelope : Json) : Except String Module := do
   let modJson ← field envelope "module"
-  -- The entry module's own bare name (`module.name.txt`, e.g. `"Db"` for a
-  -- file whose whole content is `mod Db do … end`). Carried on `Module` only
-  -- to key `CapCheck`'s proof-cap self-declaration exemption (Finding I1) —
-  -- nothing else consumes it.
+  -- The entry module's own bare name (`module.name.txt`, e.g. `"Db"`). Used by proof-cap exemptions,
+  -- capability name resolution and per-module scope diagnostics.
   let (entryName, _) ← decodeName (← field modJson "name")
   let declsJ ← (← field modJson "decls").getArr?.mapError (fun _ => "decls")
   let decls ← declsJ.toList.mapM decodeDecl
@@ -923,7 +1011,8 @@ def decodeModule (envelope : Json) : Except String Module := do
     let needs ← needsJ.toList.mapM (fun n =>
       n.getStr?.mapError (fun _ => "module_caps.needs entry"))
     pure (m, needs))
-  .ok { decls, schemes, insts, moduleCaps, entryName }
+  let scopeFacts ← decodeScopeFacts entryName declsJ.toList
+  .ok { decls, schemes, insts, moduleCaps, entryName, scopeFacts }
 
 end MarchLean.Elab
 

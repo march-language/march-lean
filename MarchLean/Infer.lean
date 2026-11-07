@@ -950,6 +950,8 @@ def builtins (s : Supply) : InferM (List (String × EnvEntry)) := do
     mono "not" (arr b b),
     mono "++" (arr str (arr str str)), mono "string_concat" (arr str (arr str str)),
     mono "string_length" (arr str i),
+    -- March typecheck_builtins: literal scope probes also need type inference.
+    mono "file_exists" (arr str b),
     -- `print` is NOT prelude-shadowed (stdlib/prelude.march defines no
     -- `fn print`), so it keeps march's builtin `Mono (String → ())`
     -- (`typecheck.ml:1950`) — verified directly: `print(1)` is rejected by

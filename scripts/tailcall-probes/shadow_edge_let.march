@@ -8,5 +8,5 @@ mod M do
     let peer = helper
     peer(n)
   end
-  fn main() do println(int_to_string(spin(1))) end
+  fn main(_cap : Cap(IO.Console)) do println(int_to_string(spin(1))) end
 end

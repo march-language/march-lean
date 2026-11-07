@@ -3,5 +3,5 @@ mod Inner do
   fn boom(n : Int) : Int do
     if n == 0 do 0 else boom(n + 1) + 1 end
   end
-  fn main() do println("hi") end
+  fn main(_cap : Cap(IO.Console)) do println("hi") end
 end

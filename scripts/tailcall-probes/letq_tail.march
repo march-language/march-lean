@@ -11,7 +11,7 @@ mod M do
       spin(a)
     end
   end
-  fn main() do
+  fn main(_cap : Cap(IO.Console)) do
     match spin(3) do
       Ok(v)  -> println(int_to_string(v))
       Err(e) -> println(e)

@@ -14,12 +14,13 @@ give wrong subsumption for those two, so this port is taken from the OCaml
 source, not the prose.
 
 Since P0 (`specs/plans/2026-08-08-calculus-proof-capabilities-design.md`),
-each operation here is the specialization of its abstract counterpart in
-`MarchLean.Calculus.Lattice` to `hierarchy` — definitionally, so behavior is
-unchanged. The metatheory (subsumption is a partial order, `normalize` is
-idempotent and coverage-preserving, fuel `hierarchy.length` is adequate) is
-proved there for any well-formed table; `MarchLean.Calculus.Concrete`
-discharges `hierarchy`'s well-formedness by `decide`.
+the hierarchy operations specialize `MarchLean.Calculus.Lattice` to
+`hierarchy`. Concrete normalization additionally deduplicates first, keeping
+first occurrences, as March does; the older abstract normalizer preserves
+duplicates. The abstract metatheory proves subsumption is a partial order
+and fuel `hierarchy.length` is adequate. `MarchLean.Calculus.Concrete`
+discharges `hierarchy`'s well-formedness by `decide` and proves the concrete
+normalizer duplicate-free, order-preserving, idempotent and coverage-preserving.
 -/
 namespace MarchLean.CapLattice
 
@@ -78,11 +79,12 @@ reverse). Two siblings never subsume each other. -/
 def capSubsumes (parent child : String) : Bool :=
   MarchLean.Calculus.subsumesIn hierarchy parent child
 
-/-- Drop any cap subsumed by another cap already present, preserving the
+/-- Deduplicate first (keeping first occurrences), then drop any cap
+subsumed by another cap already present, preserving the
 relative order of the survivors: `normalize ["IO", "IO.FileRead"] = ["IO"]`
 regardless of the order they were given in. -/
 def normalize (caps : List String) : List String :=
-  MarchLean.Calculus.normalizeIn hierarchy caps
+  MarchLean.Calculus.normalizeIn hierarchy caps.eraseDups
 
 end MarchLean.CapLattice
 

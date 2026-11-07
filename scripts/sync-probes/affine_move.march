@@ -1,0 +1,6 @@
+mod T do
+ fn f(linear x : Int) : Int do
+ affine let y = x
+ 0
+ end
+end

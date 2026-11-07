@@ -52,36 +52,13 @@ accept standing but cannot manufacture a false reject): a missing edge only
 shrinks an SCC, and the envelope omits the injected prelude, which can only
 shrink `fnNames`.
 
-## Nested `mod` is NOT checked — verified, not assumed
+## Qualified recursion
 
-`enforce_tail_calls_in_decls` has a `DMod` arm (`typecheck.ml:10968-10969`)
-that recurses into a nested module's decls. **It does not fire in the
-`--check` path**, and this file deliberately does not model it. Verified
-directly against the real binary, two ways:
+March main checks nested modules using both module-relative and file-qualified
+call-site names. The graph stays keyed by bare declarations; SCC members expand
+back to both spellings when checking tail positions. `@[lemma]` bodies, like
+`@[no_warn_recursion]` bodies, are exempt in the current compiler.
 
-- `mod M do mod Inner do fn boom(n : Int) : Int do if n == 0 do 0 else boom(n + 1) + 1 end end end … end`
-  → march exits **0**. The same function at top level (`scripts/tailcall-probes/nested_mod_flat.march`)
-  → march exits **1**.
-- A nested structural recursion emits no `structurally recursive but not
-  tail-recursive` warning, where the identical flat function emits one — so it
-  is Pass 3 as a whole that finds nothing inside, not just its error path.
-
-Nested `mod` bodies ARE otherwise typechecked normally (a type error inside one
-is reported) — it is specifically Pass 3 that comes up empty.
-
-Recursing here would reject `scripts/tailcall-probes/nested_mod.march`, which
-march accepts — a false reject. This is the reason that probe exists.
-
-**Root cause, since traced upstream:** `Desugar.qualify_module_refs`
-(`desugar.ml:3046`) rewrites bare intra-module CALL SITES inside every nested
-`DMod` to `Prefix.name` (`EVar "boom"` → `EVar "Inner.boom"`) and leaves the
-DECLARATION name bare, so Pass 3 searched a post-desugar body for a pre-desugar
-name and concluded nothing was recursive. That is a march bug, fixed upstream in
-`fix/tailcall-nested-mod-qualified-names`. **When march-lean re-pins to a march
-that carries that fix, `nested_mod` flips from `clean` to `tailcall` and this
-section must be rewritten to model the prefix.** The probe failing is the
-intended signal — it is why march is modelled as it behaves rather than as its
-source reads.
 -/
 
 namespace MarchLean.TailCall
@@ -552,9 +529,8 @@ def clauseParams (clause : Json) : Option NameSet := do
 
 def declKind (d : Json) : Option String := kind? d
 
-/-- Check one decl level. Does NOT recurse into `DMod` — see this module's
-docstring for the empirical reason. -/
-def checkDecls (decls : List Json) : Option String := Id.run do
+/-- Check each module using March's two call-site qualification conventions. -/
+partial def checkDecls (decls : List Json) (fileMod : String := "") (modPath : String := "") : Option String := Id.run do
   -- An extern has no body and cannot recurse; march subtracts these so a bare
   -- call to one is not resolved against a same-named ordinary function
   -- (`typecheck.ml:10903-10915`).
@@ -573,11 +549,15 @@ def checkDecls (decls : List Json) : Option String := Id.run do
     | some n => nsAdd acc n
     | none => acc) []) externNames
 
+  let prefixes := [modPath, fileMod ++ "." ++ modPath]
+  let aliases := fnNames.flatMap (fun n => prefixes.map (fun p => (p ++ n, n)))
+  let callNames := aliases.map Prod.fst
   let adj : List (String × NameSet) := fnDecls.filterMap (fun d => do
     let name ← fieldName? (← get? d "fn") "name"
     let clause ← soleClause d
-    let cs ← calls fnNames (← get? clause "body")
-    pure (name, cs))
+    let cs ← calls callNames (← get? clause "body")
+    let bare := cs.filterMap (fun c => (aliases.find? (fun a => a.1 == c)).map Prod.snd)
+    pure (name, bare))
 
   for d in fnDecls do
     match (do
@@ -590,23 +570,32 @@ def checkDecls (decls : List Json) : Option String := Id.run do
       pure (name, body, params, attrs) : Option _) with
     | none => pure ()
     | some (name, body, params, attrs) =>
-        let optedOut := attrs.any (fun a => str? a == some "no_warn_recursion")
+        let optedOut := attrs.any (fun a => str? a == some "no_warn_recursion" || str? a == some "lemma")
         let scc := sccOf adj name
         let isRecursive := scc.length > 1 || nsMem (neighbors adj name) name
         if isRecursive && !optedOut then
-          let r := chk name params true scc [] "" body
+          let recNames := scc.flatMap (fun n => prefixes.map (· ++ n))
+          let r := chk name params true recNames [] "" body
           -- Bail beats error: an unmodelled node anywhere in this body could
           -- have retracted the finding, so report nothing for this function.
           if !r.bailed then
             if let some msg := r.err then
               return some msg
+  for d in decls do
+    if kind? d == some "DMod" then
+      if let some name := fieldName? d "name" then
+        if let some ds := arr? d "decls" then
+          if let some msg := checkDecls ds fileMod (modPath ++ name ++ ".") then
+            return some msg
   return none
 
 /-- Entry point. Reads `envelope.module.decls`. A malformed or absent module is
 `ok`, never an error: this pass must never be the reason a file changes verdict
 for a non-tail-call reason. -/
 def check (envelope : Json) : TailResult :=
-  match (do checkDecls (← arr? (← get? envelope "module") "decls") : Option String) with
+  match (do
+    let m ← get? envelope "module"
+    checkDecls (← arr? m "decls") ((fieldName? m "name").getD "") : Option String) with
   | some msg => .violation msg
   | none => .ok
 

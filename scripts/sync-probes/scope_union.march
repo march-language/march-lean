@@ -1,0 +1,4 @@
+mod Main do
+  needs IO.FileRead("/etc"), IO.FileRead("/srv")
+  fn check_path() : Bool do file_exists("/srv/a") end
+end

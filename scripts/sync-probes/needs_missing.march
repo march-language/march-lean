@@ -1,0 +1,3 @@
+mod Main do
+  fn helper() : () do println("hello") end
+end

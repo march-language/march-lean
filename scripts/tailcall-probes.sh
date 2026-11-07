@@ -70,7 +70,7 @@ PROBES=(
   "lambda_body      clean     chk: march does not descend into a lambda at all"
   "lambda_edge      clean     calls: a lambda body must not forge a call-graph edge"
   "letfn_edge       clean     calls: an inner \`fn\` body must not forge a call-graph edge"
-  "nested_mod       clean     march's Pass 3 does NOT reach inside a nested \`mod\`"
+  "nested_mod       tailcall     march's Pass 3 reaches qualified calls inside a nested \`mod\`"
 
   # Shadowing is enforced at TWO sites, and a probe only ever exercises one of
   # them. The `shadow_*` trio pins the walk (`chk`): the offending call is the

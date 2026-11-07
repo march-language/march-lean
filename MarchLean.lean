@@ -13,3 +13,10 @@ import MarchLean.TailCall
 import MarchLean.Calculus.Verdicts
 import MarchLean.Calculus.Concrete
 import MarchLean.Calculus.CheckCaps
+import MarchLean.SyncTests
+import MarchLean.Calculus.Reachability
+import MarchLean.Calculus.Grants
+import MarchLean.EffectGraphTests
+
+import MarchLean.Calculus.Scopes
+import MarchLean.ScopeTests
