@@ -1,0 +1,7 @@
+mod T do
+ needs IO.Console
+ fn main() : () do
+ let f = fn (cap : Cap(IO.Console)) -> 0
+ ()
+ end
+end

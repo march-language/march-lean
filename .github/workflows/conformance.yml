@@ -53,8 +53,7 @@ jobs:
 
       # Installs elan + the toolchain pinned in lean-toolchain, then runs
       # `lake build MarchLean march-lean-check`. This repo's lakefile.toml has
-      # no defaultTargets, so a bare `lake build` (lean-action's default)
-      # reports "0 jobs" and silently builds nothing — build-args names the
+      # defaultTargets now include both; build-args also names the
       # targets explicitly. use-mathlib-cache: false skips the (inapplicable)
       # cache-restore step rather than silently no-op'ing through
       # auto-detection (this repo has no Mathlib dependency).
@@ -83,60 +82,16 @@ jobs:
             echo "::error::sorry/admit found in Lean sources (see matches above)"; exit 1
           fi
 
-      # Pinned to a march main SHA (not a branch) for reproducibility. This
-      # pin (6867c783) is march main HEAD as of the capability resync
-      # (2026-08-08); its corpus has grown to 277 files. It supersedes
-      # 7c1d701c, which was 71 commits behind.
-      #
-      # Drift from 7c1d701c was assessed before bumping. Unlike the previous
-      # two bumps this one was NOT inert — it surfaced five real divergences,
-      # four of them false ACCEPTS, all fixed in the commits that accompany
-      # this pin:
-      #   - lib/dump/ast_json.ml: CHANGED, but compatibly. format_version is
-      #     still 3 (bin/main.ml:1934), and DNeeds.paths still emits the same
-      #     array of dotted paths. What is NEW is a parallel `scopes` array
-      #     (see below).
-      #   - Check 1 now reaches TYPE DECLARATIONS (caps_in_type_def, via the
-      #     new lib/caps/cap_surface_ty.ml) and FUNCTION BODIES
-      #     (cap_annots_in_expr). Both were holes here; both are now modeled.
-      #   - R2: root_cap is no longer an ambient global (typecheck.ml:5118).
-      #   - R4a: cap_narrow is now polymorphic and subsumption moved to a
-      #     deferred sweep (check_cap_narrow_sites); modeled by
-      #     CapCheck.capNarrowViolation.
-      #
-      # THREE KNOWN GAPS remain against this pin. None is corpus-visible, so
-      # a green run is NOT evidence about them — each needs a hand-built
-      # probe (see specs/march-findings.md):
-      #   - PATH-SCOPED CAPABILITIES. march added `needs IO.FileRead("/etc")`
-      #     and emits the scope in a new `scopes` array; Elab's DNeeds
-      #     decoder reads only `paths` and drops it. Since scope_subsumes
-      #     says a scope never subsumes unscoped, a narrow declaration
-      #     decodes here as broad — a FALSE ACCEPT by construction. Zero
-      #     corpus files use the syntax today, which is exactly why this is
-      #     dangerous rather than reassuring.
-      #   - Tagged: march's caps_in_ty now RECURSES into Tagged (its old
-      #     `| Tagged -> []` arm is gone, deliberately: skipping it blinded
-      #     the walk to Tagged(R, Cap(IO))). CapCheck.capsInTy still mirrors
-      #     the old behavior. No corpus witness.
-      #   - normalize: march's now dedupes before filtering; ours does not,
-      #     so the two differ on duplicate cap lists. Latent only because
-      #     normalize is not on this checker's verdict path.
-      #
-      # Corpus grew 242 -> 277 (+35, heavily capability-focused). The ledger
-      # delta is NOT purely additive this time: accept/t49_transitive_use_
-      # covered regressed from MATCH to SKIP, and the four CORPUS_VIOLATION
-      # entries seen against the old local march 0.2.0 were artifacts of that
-      # stale binary and are gone.
-      #
-      # Bump periodically; no need to chase every push. setup-march builds
-      # march from source and caches the result keyed on this SHA (actions/
-      # cache under the hood), so repeat runs at the same pin skip the OCaml
-      # build entirely.
+      - name: Audit capability theorem axioms
+        run: lake env lean scripts/check-closure-axioms.lean
+
+      # March main audited on 2026-11-07. Keep binary and corpora at one SHA.
+      # See specs/progress/2026-11-07-scoped-authority.md for validation and limits.
       - name: Set up March
         id: setup-march
         uses: march-language/setup-march@main
         with:
-          march-version: 6867c783fbde7fb8ab58bae4b4fbe36703b626a1
+          march-version: e6b528f6f410d97f038cfe54e1b9817a466acb6e
 
       # Only the conformance corpora are needed from march's own repo (the
       # binary itself came from setup-march above); pinned to the exact
@@ -182,6 +137,12 @@ jobs:
       - name: Run tail-call probes
         run: |
           scripts/tailcall-probes.sh \
+            --march-bin "$(command -v march)" \
+            --march-lean-check-bin "$GITHUB_WORKSPACE/.lake/build/bin/march-lean-check"
+
+      - name: Run main-sync regression probes
+        run: |
+          python3 scripts/sync-probes.py \
             --march-bin "$(command -v march)" \
             --march-lean-check-bin "$GITHUB_WORKSPACE/.lake/build/bin/march-lean-check"
 

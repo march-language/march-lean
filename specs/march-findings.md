@@ -1,5 +1,10 @@
 # march findings
 
+> Current audit: [2026-11-06 main resync](plans/2026-11-06-march-main-resync.md).
+> Entries below retain their historical reproductions and statuses. The new
+> audit records which gaps are now fixed, explicitly skipped, or still open.
+
+
 `march-lean-check` is a differential oracle: it independently re-implements
 march's ERROR-level static checks and re-checks march's own compiler output.
 Any disagreement between the two sides is a finding about *one* side or the

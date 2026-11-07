@@ -7,5 +7,5 @@ mod M do
       Node(l, r) -> size(Leaf) + 1
     end
   end
-  fn main() do println(int_to_string(size(Leaf))) end
+  fn main(_cap : Cap(IO.Console)) do println(int_to_string(size(Leaf))) end
 end

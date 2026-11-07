@@ -1,0 +1,4 @@
+mod Main do
+  fn file_read(n : Int) : Int do n end
+  fn main() : Int do file_read(1) end
+end

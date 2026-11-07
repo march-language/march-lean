@@ -1,0 +1,4 @@
+mod Main do
+  needs IO.FileRead("/etc")
+  fn value() : Int do 1 end
+end

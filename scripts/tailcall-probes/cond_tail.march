@@ -7,5 +7,5 @@ mod M do
       true   -> spin(dec(n))
     end
   end
-  fn main() do println(int_to_string(spin(3))) end
+  fn main(_cap : Cap(IO.Console)) do println(int_to_string(spin(3))) end
 end

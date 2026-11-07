@@ -1,5 +1,6 @@
 name = "march-lean"
 version = "0.1.0"
+defaultTargets = ["MarchLean", "march-lean-check"]
 
 [[lean_lib]]
 name = "MarchLean"

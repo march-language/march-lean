@@ -19,6 +19,7 @@
 # program A2 (correctly, independently) accepts. Detecting these would require
 # reading march's own verdict/diagnostics, which would defeat A2's purpose as
 # an INDEPENDENT oracle.
-reject/t23_derive_unknown_interface.march   # rejection reason erased by march's desugarer: `derive Frobnicate for Color` (unknown interface) expands to nothing; emitted Core AST is just `type Color` + `fn main`, well-typed. Invisible to the core AST A2 checks.
 reject/t49_derive_unknown_type.march   # rejection reason erased by march's desugarer: `derive Show for NoSuchType` (unknown type) expands to nothing; emitted Core AST is just `fn main`, well-typed. Invisible to the core AST A2 checks.
-reject/t144_cap_derive_json_variant_arg.march   # rejection reason erased by march's desugarer: march rejects `derive Json` for a type with a capability position (desugar.ml `| "Json" when caps_in_type_def td <> []`), but the derive expands to nothing, so the emitted Core AST is just `needs IO` + `type Loot = Loot(Cap(IO))` + `fn main`. That residual IS well-typed and its `Cap(IO)` IS covered by `needs IO`, so A2 correctly accepts it. Same mechanism as t23/t49 above.
+# Retired in the 2026-11-06 sync: t23 and t144 now independently reject
+# through main's missing IO grant. Their erased derive errors remain invisible,
+# but these particular residual programs are no longer false accepts.

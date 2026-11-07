@@ -1,0 +1,4 @@
+mod Main do
+  needs IO.FileRead("/a/../etc")
+  fn check_path() : Bool do file_exists("/etc/x/../a") end
+end

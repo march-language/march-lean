@@ -1,0 +1,7 @@
+mod Main do
+  needs IO.FileRead("/etc")
+  mod Inner do
+    needs IO.FileRead("/srv")
+    fn check_path() : Bool do file_exists("/srv/a") end
+  end
+end

@@ -1,3 +1,5 @@
+import MarchLean.CapScope
+
 /-!
 # `MarchLean.Syntax`
 
@@ -463,7 +465,19 @@ structure Instantiation where
   args : List Ty
   deriving Inhabited
 
+/-- Per-module authority facts preserved from the raw export before term erasure. -/
+structure ScopeFacts where
+  name : String
+  declared : List CapScope.Authority
+  /-- Effective environment used by March: own final manifest at entry,
+  preceding outer environment for a nested module. -/
+  scopeEnv : List CapScope.Authority
+  /-- (builtin name, raw literal path); normalization happens during checking. -/
+  literalUses : List (String × String)
+  deriving Inhabited
+
 structure Module where
+  scopeFacts : List ScopeFacts := []
   decls : List Decl
   schemes : List Scheme
   insts : List Instantiation
@@ -478,7 +492,8 @@ structure Module where
   moduleCaps : List (String × List String) := []
   /-- The bare name of the FILE'S OWN entry module (the envelope's
   `module.name`, e.g. `"Db"` for a file whose entire content is `mod Db do …
-  end`). Used ONLY by `CapCheck.checkCaps` to key the proof-cap
+  end`). Used for capability resolution and scope diagnostics, and by
+  `CapCheck.checkCaps` to key the proof-cap
   self-declaration exemption (Finding I1) at the top level — see that
   function's docstring for why the exemption is narrower than "same bare
   module name" and applies ONLY at this outermost level, never to a nested

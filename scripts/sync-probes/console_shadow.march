@@ -1,0 +1,4 @@
+mod Main do
+  fn println(n : Int) : Int do n end
+  fn main() : Int do println(1) end
+end

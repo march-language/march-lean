@@ -1,0 +1,5 @@
+mod Main do
+  needs IO.Console
+  fn helper() : () do println("hello") end
+  fn main() : () do helper() end
+end

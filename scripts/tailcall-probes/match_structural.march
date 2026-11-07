@@ -7,5 +7,5 @@ mod M do
       Node(l, r) -> depth(l) + depth(r)
     end
   end
-  fn main() do println(int_to_string(depth(Node(Leaf, Leaf)))) end
+  fn main(_cap : Cap(IO.Console)) do println(int_to_string(depth(Node(Leaf, Leaf)))) end
 end

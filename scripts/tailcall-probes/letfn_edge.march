@@ -7,5 +7,5 @@ mod M do
     fn inner(x : Int) : Int do peer(x) end
     0
   end
-  fn main() do println(int_to_string(spin(1))) end
+  fn main(_cap : Cap(IO.Console)) do println(int_to_string(spin(1))) end
 end

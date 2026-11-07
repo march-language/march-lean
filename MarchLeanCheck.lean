@@ -1,6 +1,7 @@
 import MarchLean.Json
 import MarchLean.Elab
 import MarchLean.CapCheck
+import MarchLean.CapabilityReach
 import MarchLean.Compare
 import MarchLean.Linearity
 import MarchLean.TailCall
@@ -70,7 +71,7 @@ def run (input : String) : IO UInt32 := do
           -- passes and only becomes exit 2 once nothing else has rendered a
           -- verdict — at which point it must beat the accept, since the
           -- unjudged division is exactly what an accept would be claiming.
-          let capRes := MarchLean.CapCheck.checkCaps m
+          let capRes := (MarchLean.CapCheck.checkCaps m).andThen (MarchLean.CapabilityReach.check m)
           match capRes with
           | .violation msg => IO.eprintln s!"reject (capability): {msg}"; pure 1
           | _ =>
@@ -136,7 +137,7 @@ in fragment and the return-cap scan fires — see the gate in
 the param `Cap(IO.Console)` IS covered, so the sole defect is the return cap.
 Before the fix `checkCaps` returned `.ok`; now it must return a `.violation`. -/
 def retCapEnvelope : String :=
-  r#"{"diagnostics":[],"format_version":3,"instantiations":[],"module":{"decls":[{"kind":"DNeeds","paths":[[{"span":{"end_col":2,"end_line":1,"file":"f","start_col":1,"start_line":1},"txt":"IO"},{"span":{"end_col":2,"end_line":1,"file":"f","start_col":1,"start_line":1},"txt":"Console"}]],"span":{"end_col":2,"end_line":1,"file":"f","start_col":1,"start_line":1}},{"fn":{"attrs":[],"bounds":[],"clauses":[{"body":{"kind":"ELit","literal":{"kind":"LitInt","value":0},"resolved_ty":{"kind":"TCon","name":"Int","args":[]}},"guard":null,"params":[{"kind":"FPNamed","param":{"lin":{"kind":"Unrestricted"},"name":{"span":{"end_col":2,"end_line":1,"file":"f","start_col":1,"start_line":1},"txt":"cap"},"ty":{"args":[{"args":[],"kind":"TyCon","name":{"span":{"end_col":2,"end_line":1,"file":"f","start_col":1,"start_line":1},"txt":"IO.Console"}}],"kind":"TyCon","name":{"span":{"end_col":2,"end_line":1,"file":"f","start_col":1,"start_line":1},"txt":"Cap"}}}}],"span":{"end_col":2,"end_line":1,"file":"f","start_col":1,"start_line":1}}],"doc":null,"name":{"span":{"end_col":2,"end_line":1,"file":"f","start_col":1,"start_line":1},"txt":"get_net"},"ret_ty":{"args":[{"args":[],"kind":"TyCon","name":{"span":{"end_col":2,"end_line":1,"file":"f","start_col":1,"start_line":1},"txt":"IO.Network"}}],"kind":"TyCon","name":{"span":{"end_col":2,"end_line":1,"file":"f","start_col":1,"start_line":1},"txt":"Cap"}},"vis":{"kind":"Public"}},"kind":"DFn","span":{"end_col":2,"end_line":1,"file":"f","start_col":1,"start_line":1}}],"name":{"span":{"end_col":2,"end_line":1,"file":"f","start_col":1,"start_line":1},"txt":"Server"}},"module_caps":[],"schemes":[],"verdict":"reject"}"#
+  r#"{"diagnostics":[],"format_version":3,"instantiations":[],"module":{"decls":[{"kind":"DNeeds","scopes":[""],"paths":[[{"span":{"end_col":2,"end_line":1,"file":"f","start_col":1,"start_line":1},"txt":"IO"},{"span":{"end_col":2,"end_line":1,"file":"f","start_col":1,"start_line":1},"txt":"Console"}]],"span":{"end_col":2,"end_line":1,"file":"f","start_col":1,"start_line":1}},{"fn":{"attrs":[],"bounds":[],"clauses":[{"body":{"kind":"ELit","literal":{"kind":"LitInt","value":0},"resolved_ty":{"kind":"TCon","name":"Int","args":[]}},"guard":null,"params":[{"kind":"FPNamed","param":{"lin":{"kind":"Unrestricted"},"name":{"span":{"end_col":2,"end_line":1,"file":"f","start_col":1,"start_line":1},"txt":"cap"},"ty":{"args":[{"args":[],"kind":"TyCon","name":{"span":{"end_col":2,"end_line":1,"file":"f","start_col":1,"start_line":1},"txt":"IO.Console"}}],"kind":"TyCon","name":{"span":{"end_col":2,"end_line":1,"file":"f","start_col":1,"start_line":1},"txt":"Cap"}}}}],"span":{"end_col":2,"end_line":1,"file":"f","start_col":1,"start_line":1}}],"doc":null,"name":{"span":{"end_col":2,"end_line":1,"file":"f","start_col":1,"start_line":1},"txt":"get_net"},"ret_ty":{"args":[{"args":[],"kind":"TyCon","name":{"span":{"end_col":2,"end_line":1,"file":"f","start_col":1,"start_line":1},"txt":"IO.Network"}}],"kind":"TyCon","name":{"span":{"end_col":2,"end_line":1,"file":"f","start_col":1,"start_line":1},"txt":"Cap"}},"vis":{"kind":"Public"}},"kind":"DFn","span":{"end_col":2,"end_line":1,"file":"f","start_col":1,"start_line":1}}],"name":{"span":{"end_col":2,"end_line":1,"file":"f","start_col":1,"start_line":1},"txt":"Server"}},"module_caps":[],"schemes":[],"verdict":"reject"}"#
 
 #eval show IO Unit from do
   match Lean.Json.parse retCapEnvelope with

@@ -1,0 +1,7 @@
+mod Main do
+  needs IO.Console
+  fn third() : () do println("reachable") end
+  fn second() : () do third() end
+  fn first() : () do second() end
+  fn main() : () do first() end
+end

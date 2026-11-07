@@ -1,0 +1,4 @@
+mod Main do
+  let x : Int = 1
+  fn main() : Int do x end
+end
